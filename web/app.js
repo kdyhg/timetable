@@ -16,6 +16,10 @@ const state = {
   validatedAiConfig: null,
   sessionAiConfig: null,
   solveLaunchContext: "workspace",
+  solveInProgress: false,
+  pendingMovePreview: null,
+  pendingScheduleProposal: null,
+  pendingPreviewKind: "",
 };
 
 const STORAGE_KEYS = {
@@ -55,6 +59,10 @@ const els = {
   solvePreferenceCancel: document.querySelector("#solvePreferenceCancel"),
   solvePreferenceConfirm: document.querySelector("#solvePreferenceConfirm"),
   solveOverlay: document.querySelector("#solveOverlay"),
+  solveFailureBox: document.querySelector("#solveFailureBox"),
+  solveFailureMessage: document.querySelector("#solveFailureMessage"),
+  retrySolveButton: document.querySelector("#retrySolveButton"),
+  editSolvePreferenceButton: document.querySelector("#editSolvePreferenceButton"),
   solveStatus: document.querySelector("#solveStatus"),
   excelExport: document.querySelector("#excelExport"),
   neisExport: document.querySelector("#neisExport"),
@@ -79,6 +87,8 @@ const els = {
   moveToPeriod: document.querySelector("#moveToPeriod"),
   moveButton: document.querySelector("#moveButton"),
   aiProvider: document.querySelector("#aiProvider"),
+  aiModelSelect: document.querySelector("#aiModelSelect"),
+  aiModelCustom: document.querySelector("#aiModelCustom"),
   aiModel: document.querySelector("#aiModel"),
   aiBaseUrl: document.querySelector("#aiBaseUrl"),
   aiBaseUrlLabel: document.querySelector("#aiBaseUrlLabel"),
@@ -97,6 +107,14 @@ const els = {
   initialConstraintStatus: document.querySelector("#initialConstraintStatus"),
   skipConstraintButton: document.querySelector("#skipConstraintButton"),
   systemLog: document.querySelector("#systemLog"),
+  recentLogsButton: document.querySelector("#recentLogsButton"),
+  downloadLogsLink: document.querySelector("#downloadLogsLink"),
+  changePreviewModal: document.querySelector("#changePreviewModal"),
+  changePreviewClose: document.querySelector("#changePreviewClose"),
+  changePreviewCancel: document.querySelector("#changePreviewCancel"),
+  changePreviewConfirm: document.querySelector("#changePreviewConfirm"),
+  changePreviewTitle: document.querySelector("#changePreviewTitle"),
+  changePreviewBody: document.querySelector("#changePreviewBody"),
 };
 
 const metricLabels = {
@@ -112,10 +130,20 @@ const metricLabels = {
   coTeacherCount: "복수교사",
 };
 
+const CUSTOM_MODEL_VALUE = "__custom_model__";
+
 const providerDefaults = {
-  openai: { label: "OpenAI", model: "gpt-5.2" },
-  gemini: { label: "Gemini", model: "gemini-2.5-flash" },
-  custom: { label: "Custom", model: "" },
+  openai: {
+    label: "OpenAI",
+    model: "gpt-5.5",
+    models: ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.2", "gpt-5.2-chat-latest", "gpt-5-mini", "gpt-5-nano", "gpt-5.2-pro"],
+  },
+  gemini: {
+    label: "Gemini",
+    model: "gemini-3.5-flash",
+    models: ["gemini-3.5-flash", "gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-3.1-flash-lite"],
+  },
+  custom: { label: "Custom", model: "", models: [] },
 };
 
 function escapeHtml(value) {
@@ -156,7 +184,67 @@ function setSelectedFile(file) {
   els.uploadButton.disabled = !state.selectedFile;
 }
 
+function syncModelValueFromControls() {
+  if (!els.aiModelSelect || !els.aiModel) return;
+  const provider = els.aiProvider.value;
+  if (provider === "custom" || els.aiModelSelect.value === CUSTOM_MODEL_VALUE) {
+    els.aiModel.value = els.aiModelCustom?.value.trim() || "";
+  } else {
+    els.aiModel.value = els.aiModelSelect.value || "";
+  }
+}
+
+function renderModelOptions(forceDefault = false) {
+  if (!els.aiModelSelect) return;
+  const provider = els.aiProvider.value;
+  const defaults = providerDefaults[provider] || providerDefaults.openai;
+  const previous = els.aiModel.value.trim();
+  const models = defaults.models || [];
+  els.aiModelSelect.innerHTML = "";
+  if (models.length) {
+    for (const model of models) {
+      const option = document.createElement("option");
+      option.value = model;
+      option.textContent = model;
+      els.aiModelSelect.append(option);
+    }
+  }
+  const customOption = document.createElement("option");
+  customOption.value = CUSTOM_MODEL_VALUE;
+  customOption.textContent = "기타 직접 입력";
+  els.aiModelSelect.append(customOption);
+
+  const nextModel = forceDefault ? defaults.model : previous || defaults.model;
+  if (models.includes(nextModel)) {
+    els.aiModelSelect.value = nextModel;
+    if (els.aiModelCustom) {
+      els.aiModelCustom.value = "";
+      els.aiModelCustom.classList.add("hidden");
+    }
+    els.aiModel.value = nextModel;
+  } else {
+    els.aiModelSelect.value = CUSTOM_MODEL_VALUE;
+    if (els.aiModelCustom) {
+      els.aiModelCustom.value = nextModel;
+      els.aiModelCustom.classList.remove("hidden");
+    }
+    els.aiModel.value = nextModel;
+  }
+  if (provider === "custom" && els.aiModelCustom) {
+    els.aiModelSelect.value = CUSTOM_MODEL_VALUE;
+    els.aiModelCustom.classList.remove("hidden");
+    els.aiModel.value = els.aiModelCustom.value.trim();
+  }
+}
+
+function handleModelSelectionChange() {
+  const custom = els.aiProvider.value === "custom" || els.aiModelSelect?.value === CUSTOM_MODEL_VALUE;
+  els.aiModelCustom?.classList.toggle("hidden", !custom);
+  syncModelValueFromControls();
+}
+
 function readAiConfig() {
+  syncModelValueFromControls();
   return {
     provider: els.aiProvider.value,
     model: els.aiModel.value.trim(),
@@ -189,6 +277,7 @@ function getSolveOptions() {
     allowRelaxForUnassigned: els.allowRelaxForUnassigned.checked ? "Y" : "N",
     protectLunch: els.protectLunch.checked ? "Y" : "N",
     teacherDayMaxEnabled: els.teacherDayMaxEnabled.checked ? "Y" : "N",
+    timeBudgetSeconds: 55,
     teacherDayMax: {
       월: els.teacherMaxMon.value.trim(),
       화: els.teacherMaxTue.value.trim(),
@@ -221,9 +310,7 @@ function updateProviderFields(forceDefault = false) {
   const defaults = providerDefaults[provider] || providerDefaults.openai;
   els.aiBaseUrl.classList.toggle("hidden", provider !== "custom");
   els.aiBaseUrlLabel.classList.toggle("hidden", provider !== "custom");
-  if (forceDefault || !els.aiModel.value.trim()) {
-    els.aiModel.value = defaults.model;
-  }
+  renderModelOptions(forceDefault || !els.aiModel.value.trim());
   resetApiValidation(`${defaults.label} API 키를 검증하세요.`);
 }
 
@@ -296,6 +383,10 @@ function updateSolveAvailability() {
     status = "배정 가능";
     enabled = true;
   }
+  if (state.solveInProgress) {
+    status = "배정 진행 중";
+    enabled = false;
+  }
   els.solveButton.disabled = !enabled;
   els.solveButton.title = enabled ? "" : status;
   if (els.startSolveButton) {
@@ -333,7 +424,12 @@ async function api(path, options = {}) {
   const contentType = response.headers.get("Content-Type") || "";
   const data = contentType.includes("application/json") ? await response.json() : await response.text();
   if (!response.ok) {
-    throw new Error(data.error || data || `요청 실패: ${response.status}`);
+    const rawMessage = data?.error || data?.message || data || `요청 실패: ${response.status}`;
+    let message = String(rawMessage);
+    if (message.includes("FUNCTION_INVOCATION_TIMEOUT")) {
+      message = "자동배정이 Vercel 실행 시간 제한을 넘겼습니다. 탐색 강도를 낮추거나 다시 시도하세요.";
+    }
+    throw new Error(message);
   }
   return data;
 }
@@ -592,6 +688,7 @@ function applyScheduleResult(result, message = "시간표 반영 완료", option
 }
 
 function openSolvePreferences(context = "workspace") {
+  if (state.solveInProgress) return;
   state.solveLaunchContext = context;
   if (els.solvePreferenceModal?.showModal) {
     els.solvePreferenceModal.showModal();
@@ -611,6 +708,8 @@ function closeSolvePreferences() {
 }
 
 function showSolveProgress(context) {
+  els.solveFailureBox?.classList.add("hidden");
+  if (els.solveFailureMessage) els.solveFailureMessage.textContent = "";
   if (context === "setup") {
     setStartStep("solving");
   } else {
@@ -622,12 +721,29 @@ function hideSolveProgress() {
   els.solveOverlay?.classList.add("hidden");
 }
 
+function showSolveFailure(error, context) {
+  const message = error?.message || "자동배정 요청을 처리하지 못했습니다.";
+  if (context === "setup" && !state.setupComplete) {
+    setStartStep("solving");
+    els.solveFailureBox?.classList.remove("hidden");
+    if (els.solveFailureMessage) els.solveFailureMessage.textContent = message;
+  } else {
+    hideSolveProgress();
+    appendChat("assistant", `자동배정 요청 실패: ${message}`);
+  }
+  log(message);
+}
+
 async function solveSchedule(context = "workspace") {
+  if (state.solveInProgress) return false;
   getActiveImport();
+  state.solveInProgress = true;
   els.solveButton.disabled = true;
   els.solveButton.textContent = "배정 중";
+  if (els.startSolveButton) els.startSolveButton.disabled = true;
   if (els.solvePreferenceConfirm) els.solvePreferenceConfirm.disabled = true;
   showSolveProgress(context);
+  updateSolveAvailability();
   try {
     const result = await api("/schedules/solve", {
       method: "POST",
@@ -640,6 +756,9 @@ async function solveSchedule(context = "workspace") {
       }),
     });
     applyScheduleResult(result, `자동배정 완료: ${strategyName(result.bestStrategy)} 선택`);
+    if (result.progressMessage) {
+      log(`${result.progressMessage}${result.timedOut ? " (시간 제한 내 최선 후보)" : ""}`);
+    }
     if (result.aiAdvisor?.advice) {
       const advice = result.aiAdvisor.advice;
       const remote = result.aiAdvisor.remote || {};
@@ -656,13 +775,14 @@ async function solveSchedule(context = "workspace") {
     }
     return true;
   } catch (error) {
-    log(error.message);
-    appendChat("assistant", `자동배정 요청 실패: ${error.message}`);
+    showSolveFailure(error, context);
     return false;
   } finally {
+    state.solveInProgress = false;
     els.solveButton.textContent = "▶ AI 자동배정";
+    if (els.startSolveButton) els.startSolveButton.disabled = false;
     if (els.solvePreferenceConfirm) els.solvePreferenceConfirm.disabled = false;
-    hideSolveProgress();
+    if (!(context === "setup" && !state.setupComplete)) hideSolveProgress();
     updateSolveAvailability();
   }
 }
@@ -674,10 +794,7 @@ async function solveScheduleFromSetup() {
 async function confirmSolvePreferences() {
   const context = state.solveLaunchContext || "workspace";
   closeSolvePreferences();
-  const ok = await solveSchedule(context);
-  if (!ok && !state.setupComplete) {
-    setStartStep("preferences");
-  }
+  await solveSchedule(context);
 }
 
 function renderSchedule(schedule) {
@@ -712,7 +829,13 @@ function buildTeacherViews(schedule) {
             grid: Object.fromEntries(schedule.days.map((item) => [item, Object.fromEntries(schedule.periods.map((p) => [String(p), []]))])),
           };
         }
-        teachers[cell.teacherCode].grid[day][String(period)].push({ ...cell, className: classData.name || classCode });
+        teachers[cell.teacherCode].grid[day][String(period)].push({
+          ...cell,
+          classCode,
+          className: classData.name || classCode,
+          day,
+          period: Number(period),
+        });
       }
     }
   }
@@ -816,11 +939,14 @@ function drawSelectedSchedule() {
           }
           const raw = entityData.grid[day][String(period)];
           const cell = Array.isArray(raw) ? raw[0] : raw;
-          const option = mode === "class" ? findQuickMoveOption(day, period) : null;
+          const sourceClassCode = mode === "teacher" ? cell?.classCode : entityCode;
+          const option = findQuickMoveOption(day, period);
           const cellClasses = [];
-          if (mode === "class" && isQuickMoveSource(entityCode, day, period)) cellClasses.push("quick-source");
+          if (sourceClassCode && isQuickMoveSource(sourceClassCode, day, period)) cellClasses.push("quick-source");
           if (option) cellClasses.push("quick-option", `quick-${option.grade || "ok"}`);
-          const attrs = mode === "class" ? `data-day="${escapeHtml(day)}" data-period="${period}" data-class-code="${escapeHtml(entityCode)}" data-has-cell="${cell ? "1" : "0"}" data-source="${escapeHtml(cell?.source || "")}"` : "";
+          const attrs = sourceClassCode || option
+            ? `data-day="${escapeHtml(day)}" data-period="${period}" data-class-code="${escapeHtml(sourceClassCode || state.quickMoveSource?.classCode || "")}" data-teacher-code="${escapeHtml(mode === "teacher" ? entityCode : cell?.teacherCode || "")}" data-has-cell="${cell ? "1" : "0"}" data-source="${escapeHtml(cell?.source || "")}"`
+            : "";
           const note = option ? `<div class="move-option-note">${escapeHtml(option.grade === "good" ? "좋음" : option.grade === "warn" ? "주의" : option.grade === "bad" ? "불가" : "가능")}</div>` : "";
           return `<td class="${cellClasses.join(" ")}" ${attrs}>${renderCellContent(cell, mode)}${note}</td>`;
         })
@@ -852,12 +978,15 @@ function populateMoveControls(schedule) {
 }
 
 async function handleScheduleCellClick(event) {
-  if (els.viewMode.value !== "class") return;
   const cell = event.target.closest("td[data-day]");
   if (!cell || cell.dataset.source === "fixed") return;
   const quickOption = state.quickMoveActive ? findQuickMoveOption(cell.dataset.day, Number(cell.dataset.period)) : null;
   if (quickOption) {
     await applyQuickMoveOption(quickOption);
+    return;
+  }
+  if (!cell.dataset.classCode) {
+    setQuickEditStatus("교사표의 빈 칸은 수업을 선택한 뒤 후보로 사용할 수 있습니다.", "error");
     return;
   }
   els.moveClass.value = cell.dataset.classCode;
@@ -971,6 +1100,205 @@ async function submitManualMove(move) {
   }
 }
 
+function closeChangePreview() {
+  state.pendingMovePreview = null;
+  state.pendingScheduleProposal = null;
+  state.pendingPreviewKind = "";
+  if (els.changePreviewModal?.close) {
+    els.changePreviewModal.close();
+  } else {
+    els.changePreviewModal?.classList.add("hidden");
+    els.changePreviewModal?.removeAttribute("open");
+  }
+}
+
+function cellKey(cell) {
+  return `${cell.day}::${Number(cell.period)}`;
+}
+
+function collectTeacherCells(schedule, teacherCode) {
+  const cells = [];
+  for (const [classCode, classData] of Object.entries(schedule?.classes || {})) {
+    for (const day of schedule?.days || []) {
+      for (const period of schedule?.periods || []) {
+        const cell = classData.grid?.[day]?.[String(period)];
+        if (!cell || cell.teacherCode !== teacherCode) continue;
+        cells.push({
+          classCode,
+          className: classData.name || classCode,
+          day,
+          period: Number(period),
+          subjectName: cell.subjectName || cell.subjectCode || "",
+          label: `${cell.subjectName || cell.subjectCode || ""} ${classData.name || classCode}`.trim(),
+        });
+      }
+    }
+  }
+  return cells;
+}
+
+function collectTeacherNames(schedule) {
+  const names = {};
+  for (const classData of Object.values(schedule?.classes || {})) {
+    for (const day of schedule?.days || []) {
+      for (const period of schedule?.periods || []) {
+        const cell = classData.grid?.[day]?.[String(period)];
+        if (cell?.teacherCode) names[cell.teacherCode] = cell.teacherName || cell.teacherCode;
+      }
+    }
+  }
+  return names;
+}
+
+function buildProposalPreview(scheduleResult) {
+  const beforeSchedule = state.selectedCandidate?.schedule || null;
+  const afterSchedule = scheduleResult?.selected?.schedule || null;
+  if (!beforeSchedule || !afterSchedule) {
+    return {
+      message: "AI가 시간표 변경안을 만들었습니다. 승인하면 현재 후보 시간표로 반영됩니다.",
+      affectedTeachers: [],
+    };
+  }
+  const names = { ...collectTeacherNames(beforeSchedule), ...collectTeacherNames(afterSchedule) };
+  const teacherCodes = new Set(Object.keys(names));
+  const affectedTeachers = [];
+  for (const teacherCode of teacherCodes) {
+    const beforeCells = collectTeacherCells(beforeSchedule, teacherCode);
+    const afterCells = collectTeacherCells(afterSchedule, teacherCode);
+    const beforeSig = JSON.stringify(beforeCells.map((item) => `${cellKey(item)}:${item.label}`).sort());
+    const afterSig = JSON.stringify(afterCells.map((item) => `${cellKey(item)}:${item.label}`).sort());
+    if (beforeSig !== afterSig) {
+      affectedTeachers.push({
+        teacherCode,
+        teacherName: names[teacherCode] || teacherCode,
+        beforeCells,
+        afterCells,
+      });
+    }
+  }
+  return {
+    message: `AI 변경안입니다. 영향 교사 ${affectedTeachers.length}명, 승인 후 적용됩니다.`,
+    affectedTeachers: affectedTeachers.slice(0, 8),
+  };
+}
+
+function renderPreviewTable(cells = [], changedKeys = new Set()) {
+  const schedule = state.selectedCandidate?.schedule;
+  const days = schedule?.days || ["월", "화", "수", "목", "금"];
+  const periods = schedule?.periods || [1, 2, 3, 4, 5, 6, 7];
+  const byKey = new Map(cells.map((cell) => [cellKey(cell), cell]));
+  const header = `<tr><th>교시</th>${days.map((day) => `<th>${escapeHtml(day)}</th>`).join("")}</tr>`;
+  const rows = periods
+    .map((period) => {
+      const tds = days
+        .map((day) => {
+          const key = `${day}::${Number(period)}`;
+          const cell = byKey.get(key);
+          const changed = changedKeys.has(key) ? "changed" : "";
+          return `<td class="${changed}">${escapeHtml(cell?.label || "")}</td>`;
+        })
+        .join("");
+      return `<tr><th>${period}</th>${tds}</tr>`;
+    })
+    .join("");
+  return `<table class="preview-table">${header}${rows}</table>`;
+}
+
+function renderAffectedTeachers(teachers = []) {
+  if (!teachers.length) {
+    return `<div class="empty-state compact">비교할 교사 변경 내역이 없습니다. 승인하면 후보 시간표가 반영됩니다.</div>`;
+  }
+  return `<div class="preview-teacher-grid">${teachers
+    .map((teacher) => {
+      const beforeMap = new Map((teacher.beforeCells || []).map((cell) => [cellKey(cell), cell.label]));
+      const afterMap = new Map((teacher.afterCells || []).map((cell) => [cellKey(cell), cell.label]));
+      const keys = new Set([...beforeMap.keys(), ...afterMap.keys()]);
+      const changedKeys = new Set([...keys].filter((key) => beforeMap.get(key) !== afterMap.get(key)));
+      return `
+        <div class="preview-teacher">
+          <strong>${escapeHtml(teacher.teacherName || teacher.teacherCode)}</strong>
+          <span class="status-line">수정 전</span>
+          ${renderPreviewTable(teacher.beforeCells || [], changedKeys)}
+          <span class="status-line">수정 후</span>
+          ${renderPreviewTable(teacher.afterCells || [], changedKeys)}
+        </div>
+      `;
+    })
+    .join("")}</div>`;
+}
+
+function openChangePreview({ title, preview, kind, proposal = null }) {
+  state.pendingPreviewKind = kind;
+  if (kind === "proposal") state.pendingScheduleProposal = proposal;
+  const validation = preview?.validation || {};
+  const errors = (validation.violations || []).filter((item) => item.severity === "error").length;
+  const summary = `
+    <div class="preview-summary">
+      <strong>${escapeHtml(preview?.message || "변경안을 확인하세요.")}</strong>
+      <span>검증 오류 ${errors}건 · 승인 전에는 시간표에 저장되지 않습니다.</span>
+    </div>
+  `;
+  els.changePreviewTitle.textContent = title || "변경 미리보기";
+  els.changePreviewBody.innerHTML = `${summary}${renderAffectedTeachers(preview?.affectedTeachers || [])}`;
+  if (els.changePreviewModal?.showModal) {
+    els.changePreviewModal.showModal();
+  } else {
+    els.changePreviewModal?.classList.remove("hidden");
+    els.changePreviewModal?.setAttribute("open", "open");
+  }
+}
+
+async function previewManualMove(move) {
+  if (!(await ensureScheduleForManual())) return;
+  setQuickEditStatus("변경 미리보기 계산 중");
+  try {
+    const preview = await api("/schedules/move-preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ...requestBasePayload(),
+        schedule: state.selectedCandidate.schedule,
+        move,
+      }),
+    });
+    state.pendingMovePreview = { move, preview };
+    openChangePreview({ title: "수동수정 미리보기", preview, kind: "manual" });
+    setQuickEditStatus("미리보기를 확인하고 승인하세요", preview.ok ? "ok" : "error");
+  } catch (error) {
+    setQuickEditStatus(error.message, "error");
+    log(error.message);
+  }
+}
+
+async function confirmChangePreview() {
+  if (state.pendingPreviewKind === "proposal" && state.pendingScheduleProposal) {
+    try {
+      const result = await api("/schedules/proposals/apply", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...requestBasePayload(),
+          proposal: state.pendingScheduleProposal,
+        }),
+      });
+      if (result.scheduleResult) {
+        applyScheduleResult(result.scheduleResult, "AI 변경안을 승인 적용했습니다.");
+        appendChat("assistant", "승인한 AI 변경안을 시간표에 반영했습니다.");
+      }
+      closeChangePreview();
+    } catch (error) {
+      log(error.message);
+      alert(error.message);
+    }
+    return;
+  }
+  if (state.pendingMovePreview?.move) {
+    const move = state.pendingMovePreview.move;
+    closeChangePreview();
+    await submitManualMove(move);
+  }
+}
+
 async function applyQuickMoveOption(option) {
   if (!state.quickMoveSource || !option) return;
   const move = {
@@ -981,7 +1309,7 @@ async function applyQuickMoveOption(option) {
       period: Number(option.period),
     },
   };
-  await submitManualMove(move);
+  await previewManualMove(move);
 }
 
 async function applyManualMove() {
@@ -997,7 +1325,7 @@ async function applyManualMove() {
       period: Number(els.moveToPeriod.value),
     },
   };
-  await submitManualMove(move);
+  await previewManualMove(move);
 }
 
 function handleQuickEditKeydown(event) {
@@ -1014,6 +1342,9 @@ function handleQuickEditKeydown(event) {
 }
 
 function constraintLabel(item) {
+  if (item.engineSupported === false) {
+    return `${item.description || item.rawText || "메모형 제약"} · 메모형 제약, 엔진 미반영`;
+  }
   const dayText = (item.days || []).join(",") || "전체요일";
   const periodText = item.periodsText || (item.periods || []).join(",") || "전체교시";
   return `${item.targetName || item.targetCode} · ${item.conditionType} · ${dayText} ${periodText}교시`;
@@ -1026,6 +1357,9 @@ function sameConstraint(a, b) {
     "conditionType",
     "periodsText",
     "strength",
+    "rawText",
+    "description",
+    "engineSupported",
   ].every((key) => String(a[key] || "") === String(b[key] || "")) && JSON.stringify(a.days || []) === JSON.stringify(b.days || []);
 }
 
@@ -1039,9 +1373,9 @@ function renderChatConstraints() {
   }
   const pendingHtml = pending
     .map((item, index) => `
-      <div class="constraint-draft pending">
+      <div class="constraint-draft pending ${item.engineSupported === false ? "memo" : ""}">
         <span>${escapeHtml(constraintLabel(item))}</span>
-        <button class="mini-button" type="button" data-apply-constraint="${index}">적용</button>
+        <button class="mini-button ${item.engineSupported === false ? "ghost" : ""}" type="button" data-apply-constraint="${index}">${item.engineSupported === false ? "메모" : "적용"}</button>
       </div>
     `)
     .join("");
@@ -1068,6 +1402,11 @@ async function applyConstraintDraft(index) {
   state.pendingConstraintDrafts.splice(index, 1);
   renderChatConstraints();
   updateSolveAvailability();
+  if (draft.engineSupported === false) {
+    log(`메모형 제약 저장: ${constraintLabel(draft)}`);
+    appendChat("assistant", `이 조건은 메모형으로 저장했습니다. 아직 배정 엔진에는 직접 반영되지 않습니다.\n${constraintLabel(draft)}`);
+    return;
+  }
   log(`대화 제약 적용: ${constraintLabel(draft)}`);
   if (state.selectedCandidate) {
     appendChat("assistant", `제약조건을 적용했습니다. ${constraintLabel(draft)} 조건으로 다시 배정합니다.`);
@@ -1167,9 +1506,12 @@ async function sendChat() {
       renderChatConstraints();
       setActiveTab("diagnostics");
     }
-    if (response.scheduleResult) {
-      applyScheduleResult(response.scheduleResult, response.scheduleAction?.message || "AI 대화로 시간표를 수정했습니다.");
-      appendChat("assistant", response.scheduleAction?.message || "시간표를 새 후보로 바로 반영했습니다.");
+    if (response.scheduleProposal?.scheduleResult) {
+      const proposal = response.scheduleProposal;
+      const preview = buildProposalPreview(proposal.scheduleResult);
+      if (proposal.message) preview.message = proposal.message;
+      openChangePreview({ title: "AI 변경안 미리보기", preview, kind: "proposal", proposal });
+      appendChat("assistant", "AI 변경안을 만들었습니다. 변경 미리보기에서 승인하면 시간표에 반영됩니다.");
     }
     log("AI 제안 생성 완료");
   } catch (error) {
@@ -1193,7 +1535,7 @@ async function validateApiKey() {
     state.apiValidated = Boolean(result.ok);
     state.validatedAiConfig = result.aiConfig || null;
     state.sessionAiConfig = result.ok ? { ...inputConfig, validated: true } : null;
-    els.apiStatus.textContent = result.message;
+    els.apiStatus.textContent = result.ok ? result.message : `${result.message} (${providerLabel(inputConfig.provider)} / ${inputConfig.model || "모델코드 없음"})`;
     els.apiStatus.classList.toggle("ok", Boolean(result.ok));
     els.apiStatus.classList.toggle("error", !result.ok);
     els.apiProviderBadge.textContent = result.ok ? `${providerLabel()} 연결됨` : "미검증";
@@ -1207,7 +1549,7 @@ async function validateApiKey() {
   } catch (error) {
     state.apiValidated = false;
     state.sessionAiConfig = null;
-    els.apiStatus.textContent = error.message;
+    els.apiStatus.textContent = `${error.message} (${providerLabel(inputConfig.provider)} / ${inputConfig.model || "모델코드 없음"})`;
     els.apiStatus.classList.remove("ok");
     els.apiStatus.classList.add("error");
     els.apiProviderBadge.textContent = "미검증";
@@ -1217,6 +1559,24 @@ async function validateApiKey() {
     updateSolveAvailability();
   } finally {
     els.apiCheckButton.disabled = false;
+  }
+}
+
+async function loadRecentLogs() {
+  try {
+    const response = await api("/logs/recent");
+    const logs = response.logs || [];
+    if (!logs.length) {
+      log("최근 오류 로그가 없습니다.");
+      return;
+    }
+    for (const item of logs.slice(-12).reverse()) {
+      const payload = item.payload || {};
+      const summary = payload.message || payload.path || payload.provider || payload.runId || JSON.stringify(payload);
+      log(`[${item.event}] ${summary}`);
+    }
+  } catch (error) {
+    log(error.message);
   }
 }
 
@@ -1267,6 +1627,11 @@ function wireEvents() {
   els.solvePreferenceClose?.addEventListener("click", closeSolvePreferences);
   els.solvePreferenceCancel?.addEventListener("click", closeSolvePreferences);
   els.solvePreferenceConfirm?.addEventListener("click", confirmSolvePreferences);
+  els.retrySolveButton?.addEventListener("click", () => solveSchedule(state.solveLaunchContext || "setup"));
+  els.editSolvePreferenceButton?.addEventListener("click", () => openSolvePreferences(state.solveLaunchContext || "setup"));
+  els.changePreviewClose?.addEventListener("click", closeChangePreview);
+  els.changePreviewCancel?.addEventListener("click", closeChangePreview);
+  els.changePreviewConfirm?.addEventListener("click", confirmChangePreview);
   els.initialConstraintButton?.addEventListener("click", createInitialConstraintDraft);
   els.skipConstraintButton?.addEventListener("click", () => setStartStep("preferences"));
   els.importList.addEventListener("click", (event) => {
@@ -1323,9 +1688,18 @@ function wireEvents() {
   document.addEventListener("keydown", handleQuickEditKeydown);
   els.apiCheckButton.addEventListener("click", validateApiKey);
   els.aiProvider.addEventListener("change", () => updateProviderFields(true));
-  for (const input of [els.apiKey, els.aiModel, els.aiBaseUrl]) {
+  els.aiModelSelect?.addEventListener("change", () => {
+    handleModelSelectionChange();
+    resetApiValidation(`${providerLabel()} API 키를 다시 검증하세요.`);
+  });
+  els.aiModelCustom?.addEventListener("input", () => {
+    syncModelValueFromControls();
+    resetApiValidation(`${providerLabel()} API 키를 다시 검증하세요.`);
+  });
+  for (const input of [els.apiKey, els.aiBaseUrl]) {
     input.addEventListener("input", () => resetApiValidation(`${providerLabel()} API 키를 다시 검증하세요.`));
   }
+  els.recentLogsButton?.addEventListener("click", loadRecentLogs);
   els.chatButton.addEventListener("click", sendChat);
   els.chatMessage.addEventListener("keydown", (event) => {
     if (event.ctrlKey && event.key === "Enter") {

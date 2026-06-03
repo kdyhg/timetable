@@ -10,6 +10,7 @@ import os
 import random
 import re
 import sys
+import time
 import uuid
 from collections import Counter, defaultdict
 from copy import deepcopy
@@ -35,6 +36,7 @@ if not RUNTIME_DATA_DIR and os.environ.get("VERCEL"):
 DATA_DIR = Path(RUNTIME_DATA_DIR).resolve() if RUNTIME_DATA_DIR else ROOT / "data"
 IMPORT_DIR = DATA_DIR / "imports"
 LAST_SCHEDULE_FILE = DATA_DIR / "last_schedule.json"
+OPERATION_LOG_FILE = DATA_DIR / "operation_log.jsonl"
 
 DEFAULT_DAYS = ["월", "화", "수", "목", "금"]
 DEFAULT_MAX_PERIOD = 7
@@ -220,6 +222,9 @@ def ensure_dirs() -> None:
     IMPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 
+SENSITIVE_LOG_KEYS = {"apiKey", "api_key", "authorization", "Authorization", "x-goog-api-key", "token", "secret"}
+
+
 def safe_log(text: str) -> None:
     try:
         if sys.stdout:
@@ -229,6 +234,58 @@ def safe_log(text: str) -> None:
             sys.stdout.flush()
     except Exception:
         pass
+
+
+def sanitized_for_log(value):
+    if isinstance(value, dict):
+        return {
+            key: ("[redacted]" if key in SENSITIVE_LOG_KEYS else sanitized_for_log(item))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [sanitized_for_log(item) for item in value]
+    if isinstance(value, str):
+        if re.search(r"(sk-|AIza|key-|token)", value, flags=re.IGNORECASE):
+            return "[redacted]"
+        return value[:500]
+    return value
+
+
+def append_operation_log(event: str, payload: dict | None = None) -> None:
+    try:
+        ensure_dirs()
+        entry = {
+            "time": now_iso(),
+            "event": event,
+            "payload": sanitized_for_log(payload or {}),
+        }
+        with OPERATION_LOG_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def read_operation_logs(limit: int = 80) -> list[dict]:
+    if not OPERATION_LOG_FILE.exists():
+        return []
+    try:
+        lines = OPERATION_LOG_FILE.read_text(encoding="utf-8").splitlines()
+        output = []
+        for line in lines[-max(1, min(limit, 500)):]:
+            try:
+                output.append(json.loads(line))
+            except json.JSONDecodeError:
+                output.append({"time": "", "event": "raw", "payload": {"message": line[:500]}})
+        return output
+    except OSError:
+        return []
+
+
+def operation_logs_text(limit: int = 500) -> bytes:
+    lines = []
+    for item in read_operation_logs(limit):
+        lines.append(json.dumps(item, ensure_ascii=False))
+    return ("\n".join(lines) + ("\n" if lines else "")).encode("utf-8")
 
 
 def now_iso() -> str:
@@ -513,6 +570,22 @@ def find_entity_in_text(records: dict, text: str) -> tuple[str, str, str] | None
         return None
     _, target_type, code, name = max(candidates, key=lambda item: item[0])
     return target_type, code, name
+
+
+def find_entities_in_text(records: dict, text: str) -> list[tuple[str, str, str]]:
+    candidates = []
+    seen = set()
+    for target_type, collection in ENTITY_COLLECTION_BY_TYPE.items():
+        for code, item in records.get(collection, {}).items():
+            name = item.get(ENTITY_NAME_FIELDS[collection]) or item.get("displayName") or code
+            for token in {code, name}:
+                token = as_text(token)
+                if token and token in text:
+                    key = (target_type, code)
+                    if key not in seen:
+                        seen.add(key)
+                        candidates.append((len(token), target_type, code, name))
+    return [(target_type, code, name) for _, target_type, code, name in sorted(candidates, key=lambda item: item[0], reverse=True)]
 
 
 def make_workbook_bytes(workbook: Workbook) -> bytes:
@@ -1679,6 +1752,8 @@ def records_with_config(records: dict, updates: dict | None) -> dict:
 
 
 def normalized_chat_constraint(records: dict, constraint: dict, index: int) -> dict | None:
+    if constraint.get("engineSupported") is False:
+        return None
     target_type = as_text(constraint.get("targetType"))
     target_code = as_text(constraint.get("targetCode"))
     target_name = as_text(constraint.get("targetName"))
@@ -1842,6 +1917,19 @@ def solve_run_seed(solve_options: dict | None) -> int:
     if explicit:
         return explicit
     return random.SystemRandom().randint(1, 2_147_483_647)
+
+
+def solve_time_budget_seconds(solve_options: dict | None) -> int:
+    explicit = parse_positive_int((solve_options or {}).get("timeBudgetSeconds"))
+    if explicit:
+        return max(5, min(explicit, 280))
+    if os.environ.get("VERCEL"):
+        return 55
+    return 0
+
+
+def deadline_reached(deadline: float | None) -> bool:
+    return bool(deadline and time.monotonic() >= deadline)
 
 
 def preference_weights(settings: dict) -> dict:
@@ -2688,7 +2776,7 @@ def crossover_gene(parent_a: dict, parent_b: dict, rng: random.Random, generatio
     }
 
 
-def solve_metaheuristic(records: dict, include_relaxations: bool = True, seed: int | None = None, search_strength: str = "strong", return_stats: bool = False):
+def solve_metaheuristic(records: dict, include_relaxations: bool = True, seed: int | None = None, search_strength: str = "strong", return_stats: bool = False, deadline: float | None = None):
     settings = constraint_settings(records)
     iterations = search_iteration_budget(settings, normalize_search_strength(search_strength))
     seed = seed or solve_run_seed(None)
@@ -2697,15 +2785,32 @@ def solve_metaheuristic(records: dict, include_relaxations: bool = True, seed: i
     genes = initial_genes(records, rng=rng, seed_base=seed, search_strength=normalize_search_strength(search_strength), iterations=iterations)
     population = []
     attempt_count = 0
+    timed_out = False
     for gene in genes[: max(10, min(len(genes), iterations))]:
         for profile in profiles:
+            if deadline_reached(deadline):
+                timed_out = True
+                break
             population.append(solve_gene(records, gene, profile))
             attempt_count += 1
+        if timed_out:
+            break
+    if not population:
+        population = [
+            solve_gene(records, genes[0] if genes else {"seed": seed, "strategy": "balanced", "randomness": 0.0}, profiles[0])
+        ]
+        attempt_count += 1
     generations = search_generation_budget(iterations, normalize_search_strength(search_strength))
     for generation in range(generations):
+        if timed_out or deadline_reached(deadline):
+            timed_out = True
+            break
         elites = sorted(population, key=candidate_rank, reverse=True)[: max(4, min(10, len(population)))]
         children = []
         for index in range(max(6, iterations // 8)):
+            if deadline_reached(deadline):
+                timed_out = True
+                break
             parent_a = elites[index % len(elites)].get("gene", {})
             parent_b = elites[(index * 3 + 1) % len(elites)].get("gene", {})
             child_gene = crossover_gene(parent_a, parent_b, rng, generation)
@@ -2716,6 +2821,8 @@ def solve_metaheuristic(records: dict, include_relaxations: bool = True, seed: i
             children.append(solve_gene(records, child_gene, profile))
             attempt_count += 1
         population = elites + children
+        if timed_out:
+            break
         if any(candidate_unassigned_count(candidate) == 0 and candidate_error_count(candidate) == 0 for candidate in elites):
             if generation >= (2 if normalize_search_strength(search_strength) != "strong" else 4):
                 break
@@ -2732,6 +2839,7 @@ def solve_metaheuristic(records: dict, include_relaxations: bool = True, seed: i
         "uniqueCandidateCount": len(unique),
         "profileCount": len(profiles),
         "searchStrength": normalize_search_strength(search_strength),
+        "timedOut": timed_out,
     }
     return (candidates, stats) if return_stats else candidates
 
@@ -2952,8 +3060,8 @@ AI_PROVIDER_LABELS = {
 }
 
 AI_DEFAULT_MODELS = {
-    "openai": os.environ.get("OPENAI_MODEL", "gpt-5.2"),
-    "gemini": os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
+    "openai": os.environ.get("OPENAI_MODEL", "gpt-5.5"),
+    "gemini": os.environ.get("GEMINI_MODEL", "gemini-3.5-flash"),
     "custom": "",
 }
 
@@ -3017,9 +3125,22 @@ def ai_prompt(task: str, context: dict) -> str:
     return json.dumps({"task": task, "context": context}, ensure_ascii=False)
 
 
+def extract_json_text(text: str) -> str:
+    value = as_text(text).strip()
+    fence = re.search(r"```(?:json)?\s*(.*?)```", value, flags=re.IGNORECASE | re.DOTALL)
+    if fence:
+        return fence.group(1).strip()
+    start = value.find("{")
+    end = value.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return value[start:end + 1].strip()
+    return value
+
+
 def parse_advice_json(text: str, provider_label: str) -> dict:
+    cleaned = extract_json_text(text)
     try:
-        advice = json.loads(as_text(text))
+        advice = json.loads(cleaned)
     except json.JSONDecodeError:
         return {
             "ok": False,
@@ -3028,6 +3149,16 @@ def parse_advice_json(text: str, provider_label: str) -> dict:
             "message": f"{provider_label} 응답을 구조화된 제안으로 해석하지 못했습니다.",
             "rawText": as_text(text)[:1000],
         }
+    if not isinstance(advice, dict):
+        return {
+            "ok": False,
+            "status": "parse_error",
+            "provider": provider_label,
+            "message": f"{provider_label} 응답 형식이 올바르지 않습니다.",
+            "rawText": as_text(text)[:1000],
+        }
+    advice.setdefault("summary", "")
+    advice.setdefault("suggestions", [])
     return {"ok": True, "advice": advice}
 
 
@@ -3269,7 +3400,7 @@ def local_solve_advice(ai_summary: dict) -> dict:
     }
 
 
-def build_ai_solve_advisor(records: dict, ai_summary: dict, ai_config=None) -> dict:
+def build_ai_solve_advisor(records: dict, ai_summary: dict, ai_config=None, allow_remote: bool = True) -> dict:
     config = normalize_ai_config(ai_config)
     context = {
         "maskedRecords": mask_records_for_ai(records),
@@ -3278,11 +3409,11 @@ def build_ai_solve_advisor(records: dict, ai_summary: dict, ai_config=None) -> d
     }
     local_advice = local_solve_advice(ai_summary)
     provider_label = config.get("providerLabel", "AI")
-    remote = call_ai_advisor(config, "solve_review", context) if as_text(config.get("apiKey")) else {
+    remote = call_ai_advisor(config, "solve_review", context) if allow_remote and as_text(config.get("apiKey")) else {
         "ok": False,
-        "status": "not-configured",
+        "status": "skipped_timeout_guard" if as_text(config.get("apiKey")) and not allow_remote else "not-configured",
         "provider": provider_label,
-        "message": f"{provider_label} API 키가 없어 로컬 진단만 사용했습니다.",
+        "message": f"{provider_label} 원격 조언은 시간 제한 보호를 위해 건너뛰었습니다." if as_text(config.get("apiKey")) and not allow_remote else f"{provider_label} API 키가 없어 로컬 진단만 사용했습니다.",
     }
     return {
         "mode": f"{config.get('provider')}-advisor" if remote.get("ok") else "local-fallback",
@@ -3293,10 +3424,13 @@ def build_ai_solve_advisor(records: dict, ai_summary: dict, ai_config=None) -> d
     }
 
 
-def solve_schedule(records: dict, api_key: str = "", ai_config=None, solve_options: dict | None = None) -> dict:
+def solve_schedule(records: dict, api_key: str = "", ai_config=None, solve_options: dict | None = None, persist: bool = True) -> dict:
     solve_options = solve_options or {}
+    started_at = time.monotonic()
     run_id = uuid.uuid4().hex[:12]
     seed = solve_run_seed(solve_options)
+    time_budget = solve_time_budget_seconds(solve_options)
+    deadline = started_at + time_budget if time_budget else None
     search_strength = normalize_search_strength(solve_options.get("searchStrength"))
     variation_mode = normalize_variation_mode(solve_options.get("variationMode"))
     records = apply_solve_options(records, solve_options)
@@ -3313,13 +3447,16 @@ def solve_schedule(records: dict, api_key: str = "", ai_config=None, solve_optio
         candidate.setdefault("aiGenerated", False)
     needs_relaxation = needs_repair_candidates(strict_candidates)
     repair_candidates = generate_ai_repair_candidates(records, strict_candidates)
-    genetic_candidates, genetic_stats = solve_metaheuristic(records, include_relaxations=needs_relaxation, seed=seed, search_strength=search_strength, return_stats=True)
+    genetic_candidates, genetic_stats = solve_metaheuristic(records, include_relaxations=needs_relaxation, seed=seed, search_strength=search_strength, return_stats=True, deadline=deadline)
     annotate_candidate_signatures(genetic_candidates)
     previous_result = load_last_schedule() if variation_mode == "quality-first" else None
     best, best_changed, selection_source = select_quality_first_candidate(records, genetic_candidates, variation_mode, previous_result)
     best["signature"] = candidate_signature(best)
     candidates = selected_candidate_list(best, genetic_candidates, limit=4)
     ai_summary = summarize_candidate_for_ai(best)
+    elapsed_ms = int((time.monotonic() - started_at) * 1000)
+    timed_out = bool(genetic_stats.get("timedOut") or deadline_reached(deadline))
+    allow_remote_advisor = not deadline or time.monotonic() < deadline - 8
     result = {
         "runId": run_id,
         "seed": seed,
@@ -3329,10 +3466,13 @@ def solve_schedule(records: dict, api_key: str = "", ai_config=None, solve_optio
         "candidates": candidates,
         "selected": best,
         "aiSummary": ai_summary,
-        "aiAdvisor": build_ai_solve_advisor(records, ai_summary, config),
+        "aiAdvisor": build_ai_solve_advisor(records, ai_summary, config, allow_remote=allow_remote_advisor),
         "attemptCount": genetic_stats.get("attemptCount", 0),
         "bestChanged": best_changed,
         "bestSignature": best["signature"],
+        "timedOut": timed_out,
+        "elapsedMs": elapsed_ms,
+        "progressMessage": "시간 제한 내 현재까지의 최선 후보를 반환했습니다." if timed_out else "자동배정 탐색이 완료되었습니다.",
         "searchStats": {
             **genetic_stats,
             "variationMode": variation_mode,
@@ -3351,7 +3491,19 @@ def solve_schedule(records: dict, api_key: str = "", ai_config=None, solve_optio
             "options": {key: value for key, value in solve_options.items() if key != "apiKey"},
         },
     }
-    save_last_schedule(result)
+    append_operation_log("solve", {
+        "runId": run_id,
+        "seed": seed,
+        "elapsedMs": elapsed_ms,
+        "timedOut": timed_out,
+        "attemptCount": result["attemptCount"],
+        "unassigned": len(best.get("unassigned", [])),
+        "errors": ai_summary.get("errorCount", 0),
+        "provider": config.get("provider"),
+        "remoteStatus": result.get("aiAdvisor", {}).get("remote", {}).get("status"),
+    })
+    if persist:
+        save_last_schedule(result)
     return result
 
 
@@ -3624,6 +3776,109 @@ def quick_move_options(records: dict, schedule: dict, source: dict) -> dict:
     }
 
 
+def affected_teacher_codes_for_move(schedule: dict, move: dict, result_schedule: dict | None = None) -> list[str]:
+    codes = []
+    src = move.get("from", {})
+    dst = move.get("to", {})
+    class_code = src.get("classCode")
+    for source_schedule, day, period in [
+        (schedule, src.get("day"), str(src.get("period"))),
+        (schedule, dst.get("day"), str(dst.get("period"))),
+        (result_schedule or {}, src.get("day"), str(src.get("period"))),
+        (result_schedule or {}, dst.get("day"), str(dst.get("period"))),
+    ]:
+        cell = (source_schedule.get("classes", {}).get(class_code, {}).get("grid", {}).get(day, {}) or {}).get(period)
+        teacher_code = cell.get("teacherCode") if isinstance(cell, dict) else ""
+        if teacher_code and teacher_code not in codes:
+            codes.append(teacher_code)
+    return codes
+
+
+def teacher_schedule_cells(schedule: dict, teacher_code: str) -> list[dict]:
+    cells = []
+    for class_code, class_data in schedule.get("classes", {}).items():
+        for day in schedule.get("days", []):
+            for period in schedule.get("periods", []):
+                cell = class_data.get("grid", {}).get(day, {}).get(str(period))
+                if not cell or cell.get("teacherCode") != teacher_code:
+                    continue
+                cells.append({
+                    "classCode": class_code,
+                    "className": class_data.get("name", class_code),
+                    "day": day,
+                    "period": period,
+                    "subjectCode": cell.get("subjectCode", ""),
+                    "subjectName": cell.get("subjectName", ""),
+                    "roomCode": cell.get("roomCode", ""),
+                    "label": f"{cell.get('subjectName') or cell.get('subjectCode', '')} {class_data.get('name', class_code)}".strip(),
+                })
+    return cells
+
+
+def schedule_diff_cells(before_schedule: dict, after_schedule: dict, move: dict) -> list[dict]:
+    class_code = move.get("from", {}).get("classCode")
+    changed = []
+    if not class_code:
+        return changed
+    for day in before_schedule.get("days", []):
+        for period in before_schedule.get("periods", []):
+            before = before_schedule.get("classes", {}).get(class_code, {}).get("grid", {}).get(day, {}).get(str(period))
+            after = after_schedule.get("classes", {}).get(class_code, {}).get("grid", {}).get(day, {}).get(str(period))
+            if json.dumps(before, ensure_ascii=False, sort_keys=True, default=str) != json.dumps(after, ensure_ascii=False, sort_keys=True, default=str):
+                changed.append({"classCode": class_code, "day": day, "period": period, "before": before, "after": after})
+    return changed
+
+
+def move_preview(records: dict, schedule: dict, move: dict) -> dict:
+    result = move_schedule(records, schedule, move)
+    after_schedule = result.get("schedule", schedule)
+    teacher_codes = affected_teacher_codes_for_move(schedule, move, after_schedule)
+    affected = [
+        {
+            "teacherCode": teacher_code,
+            "teacherName": display_name(records, "교사", teacher_code),
+            "beforeCells": teacher_schedule_cells(schedule, teacher_code),
+            "afterCells": teacher_schedule_cells(after_schedule, teacher_code),
+        }
+        for teacher_code in teacher_codes
+    ]
+    return {
+        "ok": bool(result.get("validation")) and result.get("ok", False),
+        "message": result.get("message", ""),
+        "move": move,
+        "before": {"schedule": schedule},
+        "after": {"schedule": after_schedule},
+        "affectedTeachers": affected,
+        "validation": result.get("validation", {}),
+        "diagnostics": result.get("diagnostics", []),
+        "teacherIssues": result.get("teacherIssues", []),
+        "diffPreview": schedule_diff_cells(schedule, after_schedule, move),
+    }
+
+
+def apply_schedule_proposal(records: dict, proposal: dict) -> dict:
+    schedule_result = deepcopy(proposal.get("scheduleResult") or proposal)
+    selected = schedule_result.get("selected") or schedule_result
+    schedule = selected.get("schedule")
+    if not schedule:
+        return {"ok": False, "error": "적용할 시간표가 없습니다."}
+    validation = validate_schedule(records, schedule, selected.get("unassigned") or [])
+    selected["validation"] = validation
+    selected["diagnostics"] = diagnose_schedule(records, schedule, validation, selected.get("unassigned") or [])
+    selected["teacherIssues"] = teacher_issue_summary(records, schedule, validation)
+    schedule_result["selected"] = selected
+    schedule_result.setdefault("candidates", [selected])
+    schedule_result["bestStrategy"] = selected.get("strategy", schedule_result.get("bestStrategy", "ai-proposal"))
+    schedule_result["createdAt"] = schedule_result.get("createdAt") or now_iso()
+    save_last_schedule(schedule_result)
+    append_operation_log("proposal_apply", {
+        "strategy": selected.get("strategy"),
+        "ok": validation.get("ok"),
+        "errors": len([item for item in validation.get("violations", []) if item.get("severity") == "error"]),
+    })
+    return {"ok": validation.get("ok", False), "scheduleResult": schedule_result}
+
+
 def save_moved_schedule_result(move_result: dict, body: dict) -> None:
     if "validation" not in move_result:
         return
@@ -3832,6 +4087,78 @@ def extract_constraint_drafts(records: dict, text: str) -> list[dict]:
     }]
 
 
+def extract_constraint_drafts_v2(records: dict, text: str) -> list[dict]:
+    drafts = []
+    sentence_candidates = [part.strip() for part in re.split(r"[\n.;。]+", as_text(text)) if part.strip()]
+    for sentence in sentence_candidates or [as_text(text)]:
+        entities = find_entities_in_text(records, sentence)
+        days = [day for day in DEFAULT_DAYS if day in sentence]
+        periods = [int(item) for item in re.findall(r"(\d+)\s*교시", sentence)]
+        if not days and any(token in sentence for token in ["매일", "전체요일", "모든 요일"]):
+            days = DEFAULT_DAYS[:]
+        soft_hint = any(token in sentence for token in ["가능하면", "하도록", "가급적", "선호", "비선호"])
+        hope_hint = any(token in sentence for token in ["희망", "원해", "넣어", "배정해", "좋아"])
+        avoid_hint = any(token in sentence for token in ["안", "금지", "비", "넣지", "하지마", "하지 마", "말아", "안돼", "안되", "불가", "X"])
+        if hope_hint and not avoid_hint:
+            condition_type = "희망"
+            strength = "soft"
+        elif soft_hint and avoid_hint:
+            condition_type = "비선호"
+            strength = "soft"
+        else:
+            condition_type = "배정금지"
+            strength = "hard"
+        period_text = ",".join(str(item) for item in periods)
+        if entities and (periods or days):
+            for target_type, target_code, target_name in entities:
+                when = " ".join(days + ([f"{period_text}교시"] if period_text else []))
+                drafts.append({
+                    "id": uuid.uuid4().hex[:8],
+                    "title": f"{target_name} {condition_type}: {when}".strip(),
+                    "targetType": target_type,
+                    "targetCode": target_code,
+                    "targetName": target_name,
+                    "conditionType": condition_type,
+                    "days": days,
+                    "periods": periods,
+                    "periodsText": period_text,
+                    "strength": strength,
+                    "priority": 5 if strength == "soft" else 10,
+                    "description": sentence,
+                    "engineSupported": True,
+                })
+        elif sentence:
+            drafts.append({
+                "id": uuid.uuid4().hex[:8],
+                "title": "메모형 제약: 엔진 미반영",
+                "targetType": "",
+                "targetCode": "",
+                "targetName": "",
+                "conditionType": "메모",
+                "days": days,
+                "periods": periods,
+                "periodsText": period_text,
+                "strength": "soft",
+                "priority": 1,
+                "description": sentence,
+                "engineSupported": False,
+                "unsupportedReason": "대상 또는 요일/교시를 구조화하지 못해 자동배정 엔진에는 아직 반영되지 않습니다.",
+            })
+    unique = {}
+    for draft in drafts:
+        key = (
+            draft.get("targetType"),
+            draft.get("targetCode"),
+            draft.get("conditionType"),
+            tuple(draft.get("days") or []),
+            draft.get("periodsText"),
+            draft.get("description"),
+            draft.get("engineSupported"),
+        )
+        unique.setdefault(key, draft)
+    return list(unique.values())[:12]
+
+
 def unassigned_advice_steps(records: dict, schedule_context: dict, unassigned: list[dict]) -> list[str]:
     steps = []
     for item in unassigned[:5]:
@@ -3871,11 +4198,12 @@ def repair_schedule_by_chat(records: dict, text: str, solve_options: dict | None
         return None, None
     before = len(unassigned or [])
     options = repair_chat_solve_options(records, solve_options)
-    result = solve_schedule(records, ai_config=ai_config, solve_options=options)
+    result = solve_schedule(records, ai_config=ai_config, solve_options=options, persist=False)
     after = len(result.get("selected", {}).get("unassigned", []))
     action = {
         "type": "repair-solve",
-        "applied": True,
+        "applied": False,
+        "requiresApproval": True,
         "beforeUnassigned": before,
         "afterUnassigned": after,
         "message": f"미배정 우선 재탐색을 실행했습니다. 미배정 {before}건 → {after}건",
@@ -3956,14 +4284,14 @@ def ai_chat(records: dict, message: str, api_key_present: bool = False, schedule
     day_hits = [day for day in DEFAULT_DAYS if day in text]
     period_hits = re.findall(r"(\d+)\s*교시", text)
     settings = constraint_settings(records)
-    constraint_drafts = extract_constraint_drafts(records, text)
+    constraint_drafts = extract_constraint_drafts_v2(records, text)
     schedule_action, schedule_result = repair_schedule_by_chat(records, text, solve_options=solve_options, unassigned=unassigned, ai_config=config)
     if schedule_action:
         suggestions.append({
             "type": "schedule_action",
-            "title": "시간표 즉시 수정",
+            "title": "시간표 수정안",
             "explanation": schedule_action["message"],
-            "steps": [schedule_action["message"], "새 후보 시간표를 화면에 바로 반영했습니다."],
+            "steps": [schedule_action["message"], "변경안은 승인 후 적용됩니다."],
         })
 
     if constraint_drafts:
@@ -4078,7 +4406,11 @@ def ai_chat(records: dict, message: str, api_key_present: bool = False, schedule
         "scheduleContext": schedule_context,
         "constraintDrafts": constraint_drafts,
         "scheduleAction": schedule_action,
-        "scheduleResult": schedule_result,
+        "scheduleProposal": {
+            "requiresApproval": True,
+            "scheduleResult": schedule_result,
+            "message": schedule_action.get("message") if schedule_action else "",
+        } if schedule_result else None,
         "remote": remote,
         "remoteFailure": remote_failure,
         "localAdvice": local_advice,
@@ -4224,6 +4556,12 @@ class AppHandler(BaseHTTPRequestHandler):
         if path == "/api/imports":
             self.send_json({"imports": list_imports()})
             return
+        if path == "/logs/recent":
+            self.send_json({"logs": read_operation_logs()})
+            return
+        if path == "/logs/download.txt":
+            self.send_bytes(operation_logs_text(), "text/plain; charset=utf-8", "timetable-logs.txt")
+            return
         if path == "/schedules/current":
             result = load_last_schedule()
             if not result:
@@ -4300,6 +4638,16 @@ class AppHandler(BaseHTTPRequestHandler):
                     return
                 self.send_json(quick_move_options(records, schedule, source))
                 return
+            if path == "/schedules/move-preview":
+                body = read_json_body(self)
+                records = get_records_from_body(body)
+                schedule = get_schedule_from_body(body)
+                move = body.get("move", {})
+                if records is None or schedule is None:
+                    self.send_json({"error": "현재 시간표를 불러오지 못했습니다. 자동배정을 먼저 실행하세요."}, status=400)
+                    return
+                self.send_json(move_preview(records, schedule, move))
+                return
             if path == "/schedules/move":
                 body = read_json_body(self)
                 records = get_records_from_body(body)
@@ -4310,19 +4658,36 @@ class AppHandler(BaseHTTPRequestHandler):
                     return
                 result = move_schedule(records, schedule, move)
                 save_moved_schedule_result(result, body)
+                append_operation_log("manual_move", {"ok": result.get("ok"), "message": result.get("message"), "move": move})
                 self.send_json(result)
+                return
+            if path == "/schedules/proposals/apply":
+                body = read_json_body(self)
+                records = get_records_from_body(body)
+                if records is None:
+                    self.send_json({"error": "importId 또는 records가 필요합니다."}, status=400)
+                    return
+                self.send_json(apply_schedule_proposal(records, body.get("proposal") or body.get("scheduleProposal") or body))
                 return
             if path == "/ai/chat":
                 body = read_json_body(self)
                 records = get_records_from_body(body) or {"config": {}, "teachers": {}, "classes": {}, "subjects": {}, "rooms": {}, "loads": [], "constraints": []}
                 ai_config = ai_config_from_body(body, require_validated=True)
-                self.send_json(ai_chat(records, body.get("message", ""), bool(ai_config.get("apiKey") or body.get("apiKey")), body.get("schedule"), ai_config=ai_config, unassigned=body.get("unassigned") or [], solve_options=body.get("solveOptions")))
+                response = ai_chat(records, body.get("message", ""), bool(ai_config.get("apiKey") or body.get("apiKey")), body.get("schedule"), ai_config=ai_config, unassigned=body.get("unassigned") or [], solve_options=body.get("solveOptions"))
+                append_operation_log("ai_chat", {
+                    "provider": ai_config.get("provider"),
+                    "remoteStatus": response.get("remote", {}).get("status"),
+                    "proposal": bool(response.get("scheduleProposal")),
+                    "constraintDrafts": len(response.get("constraintDrafts") or []),
+                })
+                self.send_json(response)
                 return
             if path == "/ai/validate-key":
                 body = read_json_body(self)
                 self.send_json(validate_ai_key(body.get("aiConfig") if body.get("aiConfig") else body.get("apiKey", "")))
                 return
         except Exception as exc:  # Keep the prototype honest and debuggable.
+            append_operation_log("error", {"path": path, "message": str(exc)})
             self.send_json({"error": str(exc)}, status=500)
             return
         self.send_json({"error": "지원하지 않는 POST 경로입니다."}, status=404)

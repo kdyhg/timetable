@@ -223,6 +223,67 @@ textarea {
   margin-top: 8px;
 }
 
+.preview-modal {
+  width: min(980px, calc(100vw - 28px));
+}
+
+.change-preview-body {
+  display: grid;
+  gap: 12px;
+  max-height: min(70vh, 720px);
+  overflow: auto;
+}
+
+.preview-summary {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcfc;
+  font-size: 13px;
+}
+
+.preview-teacher-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 10px;
+}
+
+.preview-teacher {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.preview-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: 12px;
+}
+
+.preview-table th,
+.preview-table td {
+  border: 1px solid var(--line);
+  padding: 5px;
+  vertical-align: top;
+  text-align: center;
+}
+
+.preview-table th {
+  background: #eef2f2;
+}
+
+.preview-table .changed {
+  outline: 2px solid #06b6d4;
+  outline-offset: -2px;
+  background: #ecfeff;
+}
+
 .solve-overlay {
   position: fixed;
   inset: 0;
@@ -377,6 +438,32 @@ body.setup-complete .start-panel {
   margin: 8px auto 0;
   color: var(--muted);
   line-height: 1.55;
+}
+
+.solve-failure {
+  display: grid;
+  gap: 10px;
+  width: min(520px, 100%);
+  padding: 14px;
+  border: 1px solid #f0b4ad;
+  border-radius: 8px;
+  background: #fff6f5;
+  color: var(--red);
+  text-align: left;
+}
+
+.solve-failure p {
+  margin: 0;
+  color: var(--red);
+  line-height: 1.45;
+}
+
+.step-actions,
+.log-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
 }
 
 .step-actions {
@@ -1095,6 +1182,10 @@ body.setup-complete .start-panel {
 
 .constraint-draft.applied {
   background: #f1fbf7;
+}
+
+.constraint-draft.memo {
+  background: #f4f5f5;
 }
 
 .constraint-draft span {

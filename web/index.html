@@ -40,8 +40,10 @@
               <option value="gemini">Gemini</option>
               <option value="custom">Custom OpenAI-compatible</option>
             </select>
-            <label class="field-label" for="aiModel">모델명</label>
-            <input id="aiModel" class="input" type="text" autocomplete="off" value="gpt-5.2" />
+            <label class="field-label" for="aiModelSelect">모델코드</label>
+            <select id="aiModelSelect" class="select"></select>
+            <input id="aiModelCustom" class="input hidden" type="text" autocomplete="off" placeholder="모델코드 직접 입력" />
+            <input id="aiModel" type="hidden" value="gpt-5.5" />
             <label id="aiBaseUrlLabel" class="field-label hidden" for="aiBaseUrl">Base URL</label>
             <input id="aiBaseUrl" class="input hidden" type="url" autocomplete="off" placeholder="https://example.com/v1" />
             <label class="field-label" for="apiKey">API 키</label>
@@ -97,6 +99,14 @@
             <div>
               <h3>시간표를 만들고 있습니다</h3>
               <p>미배정을 줄이는 후보를 비교하고, 연강·점심·균등배분 조건을 함께 검토하는 중입니다.</p>
+            </div>
+            <div id="solveFailureBox" class="solve-failure hidden">
+              <strong id="solveFailureTitle">자동배정 실패</strong>
+              <p id="solveFailureMessage"></p>
+              <div class="step-actions">
+                <button id="retrySolveButton" class="button primary" type="button">다시 시도</button>
+                <button id="editSolvePreferenceButton" class="button ghost" type="button">선호도 수정</button>
+              </div>
             </div>
           </div>
         </section>
@@ -241,7 +251,10 @@
             <section class="panel">
               <div class="panel-heading">
                 <h2>운영 상태</h2>
-                <span class="badge muted">프로토타입</span>
+                <div class="log-actions">
+                  <button id="recentLogsButton" class="mini-button ghost" type="button">최근 오류 보기</button>
+                  <a id="downloadLogsLink" class="mini-button ghost" href="/logs/download.txt">로그 다운로드</a>
+                </div>
               </div>
               <div id="systemLog" class="system-log"></div>
             </section>
@@ -249,6 +262,19 @@
         </div>
       </main>
     </div>
+    <dialog id="changePreviewModal" class="modal preview-modal">
+      <form method="dialog" class="modal-content preview-modal-content">
+        <div class="panel-heading">
+          <h2 id="changePreviewTitle">변경 미리보기</h2>
+          <button id="changePreviewClose" class="icon-button" type="button" aria-label="닫기">×</button>
+        </div>
+        <div id="changePreviewBody" class="change-preview-body"></div>
+        <div class="modal-actions">
+          <button id="changePreviewCancel" class="button ghost" type="button">취소</button>
+          <button id="changePreviewConfirm" class="button primary" type="button">승인 적용</button>
+        </div>
+      </form>
+    </dialog>
     <dialog id="solvePreferenceModal" class="modal">
       <form method="dialog" class="modal-content">
         <div class="panel-heading">

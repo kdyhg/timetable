@@ -5,7 +5,7 @@ from collections import defaultdict
 from unittest.mock import patch
 
 import app as app_module
-from app import SPECS_BY_NAME, ai_chat, create_template_workbook, move_schedule, parse_days, quick_move_options, routed_request_path, save_moved_schedule_result, solve_schedule, teacher_balance_penalty, teacher_issue_summary, validate_ai_key, validate_schedule, validate_workbook
+from app import SPECS_BY_NAME, ai_chat, append_operation_log, create_template_workbook, move_preview, move_schedule, operation_logs_text, parse_days, quick_move_options, routed_request_path, save_moved_schedule_result, solve_schedule, teacher_balance_penalty, teacher_issue_summary, validate_ai_key, validate_schedule, validate_workbook
 
 
 def append_named_row(workbook, sheet_name, values):
@@ -108,8 +108,10 @@ class TimetableAppTests(unittest.TestCase):
         self.assertIn('setStartStep("solving")', script)
         self.assertIn('setStartStep("preferences")', script)
         self.assertIn("createInitialConstraintDraft", script)
-        self.assertIn("response.scheduleResult", script)
-        self.assertIn("applyScheduleResult(response.scheduleResult", script)
+        self.assertIn("response.scheduleProposal", script)
+        self.assertIn("openChangePreview", script)
+        self.assertIn("/schedules/move-preview", script)
+        self.assertIn("/schedules/proposals/apply", script)
         self.assertIn("document.addEventListener(\"keydown\", handleQuickEditKeydown)", script)
         self.assertNotIn("유전탐색", script)
 
@@ -120,7 +122,8 @@ class TimetableAppTests(unittest.TestCase):
         self.assertIn("class handler(AppHandler)", api_index)
         self.assertEqual(vercel_config["rewrites"][0]["destination"], "/api?__path=")
         self.assertEqual(vercel_config["rewrites"][1]["destination"], "/api?__path=:path*")
-        self.assertNotIn("functions", vercel_config)
+        self.assertIn("functions", vercel_config)
+        self.assertEqual(vercel_config["functions"]["api/*.py"]["maxDuration"], 300)
         self.assertEqual(routed_request_path("/api?__path=api/health"), "/api/health")
         self.assertEqual(routed_request_path("/api?__path=templates/timetable-input.xlsx"), "/templates/timetable-input.xlsx")
         self.assertEqual(routed_request_path("/"), "/")
@@ -136,6 +139,19 @@ class TimetableAppTests(unittest.TestCase):
             self.assertEqual(app_module.storage_mode(), "postgres+redis+blob")
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(app_module.storage_mode(), "local")
+
+    def test_operation_logs_redact_api_keys(self):
+        log_path = app_module.ROOT / "work" / "test-operation-log.jsonl"
+        if log_path.exists():
+            log_path.unlink()
+        with patch.object(app_module, "OPERATION_LOG_FILE", log_path):
+            append_operation_log("ai", {"path": "/ai/chat", "apiKey": "sk-test-secret", "nested": {"x-goog-api-key": "AIza-secret"}})
+            text = operation_logs_text().decode("utf-8")
+        self.assertNotIn("sk-test-secret", text)
+        self.assertNotIn("AIza-secret", text)
+        self.assertIn("[redacted]", text)
+        if log_path.exists():
+            log_path.unlink()
 
     def test_parse_days_accepts_common_weekday_formats(self):
         expected = ["월", "화", "수", "목", "금"]
@@ -533,10 +549,12 @@ class TimetableAppTests(unittest.TestCase):
 
         response = ai_chat(validation["records"], "미배정을 모두 없애줘", api_key_present=False, solve_options={"iterations": 12})
         self.assertEqual(response["scheduleAction"]["type"], "repair-solve")
-        self.assertTrue(response["scheduleAction"]["applied"])
-        self.assertIn("scheduleResult", response)
-        self.assertIn("selected", response["scheduleResult"])
-        self.assertEqual(response["scheduleResult"]["selected"]["unassigned"], [])
+        self.assertFalse(response["scheduleAction"]["applied"])
+        self.assertTrue(response["scheduleAction"]["requiresApproval"])
+        self.assertIn("scheduleProposal", response)
+        self.assertTrue(response["scheduleProposal"]["requiresApproval"])
+        self.assertIn("selected", response["scheduleProposal"]["scheduleResult"])
+        self.assertEqual(response["scheduleProposal"]["scheduleResult"]["selected"]["unassigned"], [])
 
     def test_records_from_body_can_fallback_to_latest_import(self):
         records = {"config": {}, "teachers": {"T001": {"교사명": "김교사"}}, "classes": {}, "subjects": {}, "rooms": {}, "loads": [], "constraints": []}
@@ -904,6 +922,39 @@ class TimetableAppTests(unittest.TestCase):
         self.assertIn(options["options"][0]["grade"], {"good", "ok", "warn", "bad"})
         self.assertIn(options["options"][0]["mode"], {"move", "swap"})
         self.assertIn("teacherIssues", options)
+
+    def test_move_preview_returns_teacher_before_after_without_saving(self):
+        workbook = create_template_workbook()
+        set_config_value(workbook, "점심시간보호", "N")
+        set_config_value(workbook, "최대연강허용", "7")
+        append_named_row(workbook, "교사", {"교사명": "김교사"})
+        append_named_row(workbook, "학급-계열", {"학급명": "1-1", "학년": "1", "계열": "공통", "담임교사명": "김교사", "가상학급여부": "N"})
+        append_named_row(workbook, "과목", {"과목명": "국어", "단축명": "국", "NEIS과목명": "국어"})
+        append_named_row(workbook, "교사별 시수표", {"교사명": "김교사", "과목명": "국어"})
+        load_sheet = workbook["교사별 시수표"]
+        class_start = len(SPECS_BY_NAME["교사별 시수표"]) + 1
+        load_sheet.cell(row=1, column=class_start).value = "1-1"
+        load_sheet.cell(row=load_sheet.max_row, column=class_start).value = 2
+        validation = validate_workbook(workbook)
+        selected = solve_schedule(validation["records"], solve_options={"iterations": 12})["selected"]
+        source = None
+        for day in selected["schedule"]["days"]:
+            for period in selected["schedule"]["periods"]:
+                if selected["schedule"]["classes"]["C001"]["grid"][day][str(period)]:
+                    source = {"classCode": "C001", "day": day, "period": period}
+                    break
+            if source:
+                break
+        options = quick_move_options(validation["records"], selected["schedule"], source)
+        option = options["options"][0]
+        move = {"mode": option["mode"], "from": source, "to": {"day": option["day"], "period": option["period"]}}
+        with patch.object(app_module, "save_last_schedule") as save_last_schedule:
+            preview = move_preview(validation["records"], selected["schedule"], move)
+        save_last_schedule.assert_not_called()
+        self.assertIn("affectedTeachers", preview)
+        self.assertGreaterEqual(len(preview["affectedTeachers"]), 1)
+        self.assertIn("beforeCells", preview["affectedTeachers"][0])
+        self.assertIn("afterCells", preview["affectedTeachers"][0])
 
     def test_quick_move_options_do_not_mark_existing_errors_as_new_bad_moves(self):
         workbook = create_template_workbook()
