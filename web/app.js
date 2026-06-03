@@ -11,6 +11,7 @@ const state = {
   pendingConstraintDrafts: [],
   activeTab: "overview",
   startStep: "api",
+  setupComplete: false,
   apiValidated: false,
   validatedAiConfig: null,
 };
@@ -21,6 +22,7 @@ const STORAGE_KEYS = {
 
 const els = {
   healthBadge: document.querySelector("#healthBadge"),
+  startPanel: document.querySelector(".start-panel"),
   fileDrop: document.querySelector(".file-drop"),
   uploadInput: document.querySelector("#uploadInput"),
   selectedFileName: document.querySelector("#selectedFileName"),
@@ -236,6 +238,10 @@ const startSteps = ["api", "excel", "constraints", "preferences"];
 
 function setStartStep(stepName) {
   const step = startSteps.includes(stepName) ? stepName : "api";
+  if (!state.setupComplete) {
+    els.startPanel?.classList.remove("completed");
+    document.body.classList.remove("setup-complete");
+  }
   state.startStep = step;
   const stepIndex = startSteps.indexOf(step);
   for (const panel of document.querySelectorAll("[data-start-step]")) {
@@ -248,6 +254,12 @@ function setStartStep(stepName) {
   if (els.startStepBadge) {
     els.startStepBadge.textContent = `${stepIndex + 1}/4`;
   }
+}
+
+function completeSetup() {
+  state.setupComplete = true;
+  els.startPanel?.classList.add("completed");
+  document.body.classList.add("setup-complete");
 }
 
 function updateSolveAvailability() {
@@ -532,6 +544,7 @@ function applyScheduleResult(result, message = "시간표 반영 완료") {
   renderTeacherIssues(result.selected);
   setExportsEnabled(true);
   setActiveTab("timetable");
+  completeSetup();
   log(message);
 }
 

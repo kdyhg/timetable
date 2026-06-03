@@ -43,6 +43,7 @@ class TimetableAppTests(unittest.TestCase):
 
     def test_api_connection_controls_are_before_excel_upload_in_start_panel(self):
         html = (app_module.ROOT / "web" / "index.html").read_text(encoding="utf-8")
+        styles = (app_module.ROOT / "web" / "styles.css").read_text(encoding="utf-8")
         start_index = html.index("start-panel")
         provider_index = html.index('id="aiProvider"')
         key_index = html.index('id="apiKey"')
@@ -58,6 +59,8 @@ class TimetableAppTests(unittest.TestCase):
         self.assertIn('data-start-step="preferences"', html)
         self.assertIn('id="initialConstraintText"', html)
         self.assertIn('id="startSolveButton"', html)
+        self.assertIn("position: fixed", styles)
+        self.assertIn(".start-panel.completed", styles)
 
     def test_solve_preferences_and_manual_edit_are_visible(self):
         html = (app_module.ROOT / "web" / "index.html").read_text(encoding="utf-8")
@@ -87,6 +90,7 @@ class TimetableAppTests(unittest.TestCase):
         self.assertIn("fallbackLatestImport: true", script)
         self.assertIn("fallbackLastSchedule: true", script)
         self.assertIn("function setStartStep", script)
+        self.assertIn("function completeSetup()", script)
         self.assertIn("createInitialConstraintDraft", script)
         self.assertIn("response.scheduleResult", script)
         self.assertIn("applyScheduleResult(response.scheduleResult", script)
