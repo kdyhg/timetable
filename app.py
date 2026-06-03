@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import csv
 import io
 import json
@@ -1160,13 +1161,345 @@ def create_report_workbook(validation: dict) -> Workbook:
     return wb
 
 
+POSTGRES_ENV_NAMES = ("POSTGRES_URL", "DATABASE_URL", "POSTGRES_URL_NON_POOLING", "POSTGRES_PRISMA_URL")
+REDIS_URL_ENV_NAMES = ("KV_REST_API_URL", "UPSTASH_REDIS_REST_URL")
+REDIS_TOKEN_ENV_NAMES = ("KV_REST_API_TOKEN", "UPSTASH_REDIS_REST_TOKEN")
+_POSTGRES_SCHEMA_READY = False
+
+
+def first_env(names: tuple[str, ...]) -> str:
+    for name in names:
+        value = as_text(os.environ.get(name))
+        if value:
+            return value
+    return ""
+
+
+def postgres_url() -> str:
+    return first_env(POSTGRES_ENV_NAMES)
+
+
+def redis_config() -> tuple[str, str]:
+    return first_env(REDIS_URL_ENV_NAMES), first_env(REDIS_TOKEN_ENV_NAMES)
+
+
+def blob_enabled() -> bool:
+    return bool(as_text(os.environ.get("BLOB_READ_WRITE_TOKEN")))
+
+
+def storage_mode() -> str:
+    parts = []
+    if postgres_url():
+        parts.append("postgres")
+    url, token = redis_config()
+    if url and token:
+        parts.append("redis")
+    if blob_enabled():
+        parts.append("blob")
+    return "+".join(parts) if parts else "local"
+
+
+def public_import_metadata(metadata: dict) -> dict:
+    return {key: metadata[key] for key in ["id", "createdAt", "fileName", "ok", "stats", "issues"] if key in metadata}
+
+
+def blob_put(pathname: str, payload: bytes, content_type: str) -> dict:
+    from vercel.blob import BlobClient
+
+    client = BlobClient()
+    uploaded = client.put(
+        pathname,
+        payload,
+        access=os.environ.get("BLOB_ACCESS", "private"),
+        content_type=content_type,
+        overwrite=True,
+    )
+    if isinstance(uploaded, dict):
+        return uploaded
+    return {key: getattr(uploaded, key) for key in ("url", "download_url", "pathname") if hasattr(uploaded, key)}
+
+
+def blob_get(pathname: str) -> bytes:
+    from vercel.blob import BlobClient
+
+    client = BlobClient()
+    result = client.get(pathname, access=os.environ.get("BLOB_ACCESS", "private"))
+    status_code = getattr(result, "status_code", getattr(result, "statusCode", 200)) if result else None
+    if result is None or status_code != 200:
+        raise FileNotFoundError(pathname)
+    stream = getattr(result, "stream", None)
+    if stream is None:
+        return b""
+    if isinstance(stream, bytes):
+        return stream
+    if hasattr(stream, "read"):
+        return stream.read()
+    return b"".join(bytes(chunk) for chunk in stream)
+
+
+def postgres_connect():
+    try:
+        import psycopg
+    except ImportError as exc:
+        raise RuntimeError("Postgres 저장소를 사용하려면 psycopg 패키지가 필요합니다.") from exc
+    return psycopg.connect(postgres_url(), autocommit=True)
+
+
+def ensure_postgres_schema() -> None:
+    global _POSTGRES_SCHEMA_READY
+    if _POSTGRES_SCHEMA_READY:
+        return
+    with postgres_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS timetable_imports (
+                    id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    ok BOOLEAN NOT NULL,
+                    issues_json TEXT NOT NULL,
+                    stats_json TEXT NOT NULL,
+                    records_json TEXT NOT NULL,
+                    input_blob_path TEXT,
+                    report_blob_path TEXT,
+                    input_bytes BYTEA,
+                    report_bytes BYTEA
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS timetable_state (
+                    key TEXT PRIMARY KEY,
+                    payload_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+    _POSTGRES_SCHEMA_READY = True
+
+
+def save_import_postgres(metadata: dict, original_bytes: bytes, report_bytes: bytes) -> dict:
+    ensure_postgres_schema()
+    input_blob_path = ""
+    report_blob_path = ""
+    input_bytes = original_bytes
+    stored_report_bytes = report_bytes
+    if blob_enabled():
+        input_blob_path = f"imports/{metadata['id']}/input.xlsx"
+        report_blob_path = f"imports/{metadata['id']}/report.xlsx"
+        blob_put(input_blob_path, original_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        blob_put(report_blob_path, report_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        input_bytes = None
+        stored_report_bytes = None
+    with postgres_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO timetable_imports (
+                    id, created_at, file_name, ok, issues_json, stats_json, records_json,
+                    input_blob_path, report_blob_path, input_bytes, report_bytes
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                    created_at = EXCLUDED.created_at,
+                    file_name = EXCLUDED.file_name,
+                    ok = EXCLUDED.ok,
+                    issues_json = EXCLUDED.issues_json,
+                    stats_json = EXCLUDED.stats_json,
+                    records_json = EXCLUDED.records_json,
+                    input_blob_path = EXCLUDED.input_blob_path,
+                    report_blob_path = EXCLUDED.report_blob_path,
+                    input_bytes = EXCLUDED.input_bytes,
+                    report_bytes = EXCLUDED.report_bytes
+                """,
+                (
+                    metadata["id"],
+                    metadata["createdAt"],
+                    metadata["fileName"],
+                    metadata["ok"],
+                    json.dumps(metadata["issues"], ensure_ascii=False),
+                    json.dumps(metadata["stats"], ensure_ascii=False),
+                    json.dumps(metadata["records"], ensure_ascii=False),
+                    input_blob_path,
+                    report_blob_path,
+                    input_bytes,
+                    stored_report_bytes,
+                ),
+            )
+    metadata["_inputBlobPath"] = input_blob_path
+    metadata["_reportBlobPath"] = report_blob_path
+    return metadata
+
+
+def list_imports_postgres() -> list[dict]:
+    ensure_postgres_schema()
+    with postgres_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, created_at, file_name, ok, issues_json, stats_json
+                FROM timetable_imports
+                ORDER BY created_at DESC
+                LIMIT 100
+                """
+            )
+            rows = cur.fetchall()
+    return [
+        {
+            "id": row[0],
+            "createdAt": row[1],
+            "fileName": row[2],
+            "ok": row[3],
+            "issues": json.loads(row[4]),
+            "stats": json.loads(row[5]),
+        }
+        for row in rows
+    ]
+
+
+def load_import_postgres(import_id: str) -> dict | None:
+    ensure_postgres_schema()
+    with postgres_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, created_at, file_name, ok, issues_json, stats_json, records_json, input_blob_path, report_blob_path
+                FROM timetable_imports
+                WHERE id = %s
+                """,
+                (import_id,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "createdAt": row[1],
+        "fileName": row[2],
+        "ok": row[3],
+        "issues": json.loads(row[4]),
+        "stats": json.loads(row[5]),
+        "records": json.loads(row[6]),
+        "_inputBlobPath": row[7] or "",
+        "_reportBlobPath": row[8] or "",
+    }
+
+
+def load_report_postgres(import_id: str) -> bytes | None:
+    ensure_postgres_schema()
+    with postgres_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT report_blob_path, report_bytes FROM timetable_imports WHERE id = %s", (import_id,))
+            row = cur.fetchone()
+    if not row:
+        return None
+    report_blob_path, report_bytes = row
+    if report_blob_path:
+        return blob_get(report_blob_path)
+    return bytes(report_bytes) if report_bytes is not None else None
+
+
+def save_state_postgres(key: str, payload: dict) -> None:
+    ensure_postgres_schema()
+    with postgres_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO timetable_state (key, payload_json, updated_at)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (key) DO UPDATE SET
+                    payload_json = EXCLUDED.payload_json,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (key, json.dumps(payload, ensure_ascii=False), now_iso()),
+            )
+
+
+def load_state_postgres(key: str) -> dict | None:
+    ensure_postgres_schema()
+    with postgres_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT payload_json FROM timetable_state WHERE key = %s", (key,))
+            row = cur.fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def redis_command(command: list) -> object:
+    url, token = redis_config()
+    if not url or not token:
+        raise RuntimeError("Redis REST URL/TOKEN 환경변수가 필요합니다.")
+    request = Request(
+        url.rstrip("/"),
+        data=json.dumps(command, ensure_ascii=False).encode("utf-8"),
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlopen(request, timeout=8) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if payload.get("error"):
+        raise RuntimeError(payload["error"])
+    return payload.get("result")
+
+
+def save_import_redis(metadata: dict, original_bytes: bytes, report_bytes: bytes) -> dict:
+    if blob_enabled():
+        input_blob_path = f"imports/{metadata['id']}/input.xlsx"
+        report_blob_path = f"imports/{metadata['id']}/report.xlsx"
+        blob_put(input_blob_path, original_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        blob_put(report_blob_path, report_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        metadata["_inputBlobPath"] = input_blob_path
+        metadata["_reportBlobPath"] = report_blob_path
+    else:
+        metadata["_reportBase64"] = base64.b64encode(report_bytes).decode("ascii")
+    redis_command(["SET", f"timetable:import:{metadata['id']}", json.dumps(metadata, ensure_ascii=False)])
+    redis_command(["LPUSH", "timetable:imports", metadata["id"]])
+    return metadata
+
+
+def list_imports_redis() -> list[dict]:
+    ids = redis_command(["LRANGE", "timetable:imports", "0", "99"]) or []
+    imports = []
+    seen = set()
+    for import_id in ids:
+        if import_id in seen:
+            continue
+        seen.add(import_id)
+        raw = redis_command(["GET", f"timetable:import:{import_id}"])
+        if raw:
+            imports.append(public_import_metadata(json.loads(raw)))
+    return imports
+
+
+def load_import_redis(import_id: str) -> dict | None:
+    raw = redis_command(["GET", f"timetable:import:{import_id}"])
+    return json.loads(raw) if raw else None
+
+
+def load_report_redis(import_id: str) -> bytes | None:
+    metadata = load_import_redis(import_id)
+    if not metadata:
+        return None
+    if metadata.get("_reportBlobPath"):
+        return blob_get(metadata["_reportBlobPath"])
+    if metadata.get("_reportBase64"):
+        return base64.b64decode(metadata["_reportBase64"])
+    return None
+
+
+def save_state_redis(key: str, payload: dict) -> None:
+    redis_command(["SET", f"timetable:state:{key}", json.dumps(payload, ensure_ascii=False)])
+
+
+def load_state_redis(key: str) -> dict | None:
+    raw = redis_command(["GET", f"timetable:state:{key}"])
+    return json.loads(raw) if raw else None
+
+
 def save_import(validation: dict, original_name: str, original_bytes: bytes) -> dict:
-    ensure_dirs()
     import_id = uuid.uuid4().hex[:12]
-    folder = IMPORT_DIR / import_id
-    folder.mkdir(parents=True, exist_ok=True)
-    (folder / "input.xlsx").write_bytes(original_bytes)
-    (folder / "report.xlsx").write_bytes(make_workbook_bytes(create_report_workbook(validation)))
+    report_bytes = make_workbook_bytes(create_report_workbook(validation))
     metadata = {
         "id": import_id,
         "createdAt": now_iso(),
@@ -1176,27 +1509,57 @@ def save_import(validation: dict, original_name: str, original_bytes: bytes) -> 
         "stats": validation["stats"],
         "records": validation["records"],
     }
+    if postgres_url():
+        return save_import_postgres(metadata, original_bytes, report_bytes)
+    redis_url, redis_token = redis_config()
+    if redis_url and redis_token:
+        return save_import_redis(metadata, original_bytes, report_bytes)
+    ensure_dirs()
+    folder = IMPORT_DIR / import_id
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "input.xlsx").write_bytes(original_bytes)
+    (folder / "report.xlsx").write_bytes(report_bytes)
     (folder / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     return metadata
 
 
 def list_imports() -> list[dict]:
+    if postgres_url():
+        return list_imports_postgres()
+    redis_url, redis_token = redis_config()
+    if redis_url and redis_token:
+        return list_imports_redis()
     ensure_dirs()
     imports = []
     for metadata_path in IMPORT_DIR.glob("*/metadata.json"):
         try:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            imports.append({k: metadata[k] for k in ["id", "createdAt", "fileName", "ok", "stats", "issues"] if k in metadata})
+            imports.append(public_import_metadata(metadata))
         except (OSError, json.JSONDecodeError):
             continue
     return sorted(imports, key=lambda item: item.get("createdAt", ""), reverse=True)
 
 
 def load_import(import_id: str) -> dict | None:
+    if postgres_url():
+        return load_import_postgres(import_id)
+    redis_url, redis_token = redis_config()
+    if redis_url and redis_token:
+        return load_import_redis(import_id)
     path = IMPORT_DIR / import_id / "metadata.json"
     if not path.exists():
         return None
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def load_report_bytes(import_id: str) -> bytes | None:
+    if postgres_url():
+        return load_report_postgres(import_id)
+    redis_url, redis_token = redis_config()
+    if redis_url and redis_token:
+        return load_report_redis(import_id)
+    report_path = IMPORT_DIR / import_id / "report.xlsx"
+    return report_path.read_bytes() if report_path.exists() else None
 
 
 def read_json_body(handler: BaseHTTPRequestHandler) -> dict:
@@ -2408,7 +2771,7 @@ def solve_schedule(records: dict, api_key: str = "", ai_config=None, solve_optio
             "options": {key: value for key, value in (solve_options or {}).items() if key != "apiKey"},
         },
     }
-    LAST_SCHEDULE_FILE.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    save_last_schedule(result)
     return result
 
 
@@ -2579,7 +2942,7 @@ def save_moved_schedule_result(move_result: dict, body: dict) -> None:
                 "manualEdited": True,
             })
             break
-    LAST_SCHEDULE_FILE.write_text(json.dumps(last, ensure_ascii=False, indent=2), encoding="utf-8")
+    save_last_schedule(last)
 
 
 def mask_records_for_ai(records: dict) -> dict:
@@ -2890,7 +3253,33 @@ def export_neis_csv(result: dict) -> bytes:
     return ("\ufeff" + stream.getvalue()).encode("utf-8")
 
 
+def save_last_schedule(result: dict) -> None:
+    if postgres_url():
+        save_state_postgres("last_schedule", result)
+        redis_url, redis_token = redis_config()
+        if redis_url and redis_token:
+            save_state_redis("last_schedule", result)
+        return
+    redis_url, redis_token = redis_config()
+    if redis_url and redis_token:
+        save_state_redis("last_schedule", result)
+        return
+    ensure_dirs()
+    LAST_SCHEDULE_FILE.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def load_last_schedule() -> dict | None:
+    if postgres_url():
+        result = load_state_postgres("last_schedule")
+        if result is not None:
+            return result
+        redis_url, redis_token = redis_config()
+        if redis_url and redis_token:
+            return load_state_redis("last_schedule")
+        return None
+    redis_url, redis_token = redis_config()
+    if redis_url and redis_token:
+        return load_state_redis("last_schedule")
     if LAST_SCHEDULE_FILE.exists():
         return json.loads(LAST_SCHEDULE_FILE.read_text(encoding="utf-8"))
     return None
@@ -2921,7 +3310,7 @@ class AppHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         if path == "/api/health":
-            self.send_json({"ok": True, "time": now_iso()})
+            self.send_json({"ok": True, "time": now_iso(), "storage": storage_mode()})
             return
         if path == "/templates/timetable-input.xlsx":
             self.send_bytes(make_workbook_bytes(create_template_workbook()), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "timetable-input.xlsx")
@@ -2931,11 +3320,11 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if path.startswith("/imports/") and path.endswith("/report.xlsx"):
             import_id = path.split("/")[2]
-            report_path = IMPORT_DIR / import_id / "report.xlsx"
-            if not report_path.exists():
+            report_bytes = load_report_bytes(import_id)
+            if report_bytes is None:
                 self.send_json({"error": "리포트를 찾을 수 없습니다."}, status=404)
                 return
-            self.send_bytes(report_path.read_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", f"import-{import_id}-report.xlsx")
+            self.send_bytes(report_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", f"import-{import_id}-report.xlsx")
             return
         if path == "/exports/excel":
             result = load_last_schedule()

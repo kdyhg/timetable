@@ -30,6 +30,18 @@ GitHub 연동 배포라면 커밋을 푸쉬한 뒤 Vercel에서 다시 배포하
 
 주의: Vercel 서버리스 환경에서는 `data/` 같은 로컬 파일 저장소가 영구 보관되지 않습니다. 이 프로토타입은 Vercel에서 런타임 임시 디렉터리를 사용하므로 업로드 이력과 마지막 시간표는 함수 인스턴스가 바뀌면 사라질 수 있습니다. 실제 운영 배포에서는 Vercel Blob, Postgres, Redis 같은 외부 저장소를 붙이는 것이 안전합니다.
 
+### 운영 저장소 환경변수
+
+Vercel Storage에서 리소스를 만든 뒤 프로젝트에 연결하면 아래 환경변수가 자동 또는 수동으로 들어갑니다.
+
+- Blob: `BLOB_READ_WRITE_TOKEN`
+- Postgres/Neon: `POSTGRES_URL` 또는 `DATABASE_URL`
+- Redis/Upstash: `KV_REST_API_URL` + `KV_REST_API_TOKEN`, 또는 `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN`
+
+저장 우선순위는 `Postgres + Blob`, `Redis + Blob`, `로컬 파일` 순서입니다. Postgres가 있으면 업로드 메타데이터, 검증 records, 마지막 시간표를 Postgres에 저장하고, Blob이 있으면 업로드 원본과 오류 리포트 엑셀을 Blob에 저장합니다. Redis만 있으면 메타데이터와 마지막 시간표를 Redis REST API에 저장합니다.
+
+배포 후 `/api/health`의 `storage` 값을 보면 현재 저장소 모드를 확인할 수 있습니다. 예: `postgres+redis+blob`, `postgres+blob`, `redis+blob`, `local`.
+
 ## 주요 API
 
 - `GET /templates/timetable-input.xlsx`: 통합 입력 엑셀 양식 다운로드

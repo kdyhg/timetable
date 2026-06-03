@@ -1,6 +1,8 @@
 import json
+import os
 import unittest
 from collections import defaultdict
+from unittest.mock import patch
 
 import app as app_module
 from app import SPECS_BY_NAME, ai_chat, create_template_workbook, move_schedule, parse_days, save_moved_schedule_result, solve_schedule, teacher_balance_penalty, validate_ai_key, validate_workbook
@@ -72,6 +74,18 @@ class TimetableAppTests(unittest.TestCase):
         self.assertIn("from app import handler", api_index)
         self.assertEqual(vercel_config["rewrites"][0]["destination"], "/api/index.py")
         self.assertIn("api/index.py", vercel_config["functions"])
+
+    def test_storage_mode_detects_vercel_storage_envs(self):
+        storage_env = {
+            "POSTGRES_URL": "postgres://example",
+            "BLOB_READ_WRITE_TOKEN": "vercel_blob_token",
+            "KV_REST_API_URL": "https://redis.example",
+            "KV_REST_API_TOKEN": "redis-token",
+        }
+        with patch.dict(os.environ, storage_env, clear=True):
+            self.assertEqual(app_module.storage_mode(), "postgres+redis+blob")
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(app_module.storage_mode(), "local")
 
     def test_parse_days_accepts_common_weekday_formats(self):
         expected = ["월", "화", "수", "목", "금"]
