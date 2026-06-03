@@ -14,6 +14,8 @@ const state = {
   setupComplete: false,
   apiValidated: false,
   validatedAiConfig: null,
+  sessionAiConfig: null,
+  solveLaunchContext: "workspace",
 };
 
 const STORAGE_KEYS = {
@@ -28,6 +30,8 @@ const els = {
   selectedFileName: document.querySelector("#selectedFileName"),
   uploadButton: document.querySelector("#uploadButton"),
   solveMethod: document.querySelector("#solveMethod"),
+  searchStrength: document.querySelector("#searchStrength"),
+  variationMode: document.querySelector("#variationMode"),
   preferenceOrder: document.querySelector("#preferenceOrder"),
   solveIterations: document.querySelector("#solveIterations"),
   maxConsecutive: document.querySelector("#maxConsecutive"),
@@ -46,6 +50,11 @@ const els = {
   currentSubtitle: document.querySelector("#currentSubtitle"),
   solveButton: document.querySelector("#solveButton"),
   startSolveButton: document.querySelector("#startSolveButton"),
+  solvePreferenceModal: document.querySelector("#solvePreferenceModal"),
+  solvePreferenceClose: document.querySelector("#solvePreferenceClose"),
+  solvePreferenceCancel: document.querySelector("#solvePreferenceCancel"),
+  solvePreferenceConfirm: document.querySelector("#solvePreferenceConfirm"),
+  solveOverlay: document.querySelector("#solveOverlay"),
   solveStatus: document.querySelector("#solveStatus"),
   excelExport: document.querySelector("#excelExport"),
   neisExport: document.querySelector("#neisExport"),
@@ -147,13 +156,20 @@ function setSelectedFile(file) {
   els.uploadButton.disabled = !state.selectedFile;
 }
 
-function getAiConfig() {
+function readAiConfig() {
   return {
     provider: els.aiProvider.value,
     model: els.aiModel.value.trim(),
     baseUrl: els.aiProvider.value === "custom" ? els.aiBaseUrl.value.trim() : "",
     apiKey: els.apiKey.value.trim(),
   };
+}
+
+function getAiConfig() {
+  if (state.sessionAiConfig) {
+    return { ...state.sessionAiConfig };
+  }
+  return { ...readAiConfig(), validated: state.apiValidated };
 }
 
 function numericOption(input, fallback) {
@@ -164,6 +180,8 @@ function numericOption(input, fallback) {
 function getSolveOptions() {
   return {
     assignmentMethod: els.solveMethod.value,
+    searchStrength: els.searchStrength?.value || "strong",
+    variationMode: els.variationMode?.value || "quality-first",
     preferenceOrder: els.preferenceOrder.value,
     iterations: numericOption(els.solveIterations, 60),
     maxConsecutive: numericOption(els.maxConsecutive, 3),
@@ -188,6 +206,7 @@ function providerLabel(provider = els.aiProvider.value) {
 function resetApiValidation(message = "API 키 미검증") {
   state.apiValidated = false;
   state.validatedAiConfig = null;
+  state.sessionAiConfig = null;
   els.apiStatus.textContent = message;
   els.apiStatus.classList.remove("ok");
   els.apiStatus.classList.add("error");
@@ -317,6 +336,28 @@ async function api(path, options = {}) {
     throw new Error(data.error || data || `요청 실패: ${response.status}`);
   }
   return data;
+}
+
+async function restoreCurrentSchedule(activateTab = false) {
+  const result = await api("/schedules/current");
+  if (!result.ok || !result.scheduleResult?.selected?.schedule) {
+    throw new Error(result.error || "현재 시간표를 불러오지 못했습니다. 자동배정을 먼저 실행하세요.");
+  }
+  applyScheduleResult(result.scheduleResult, "현재 시간표 복구 완료", { activateTab });
+  return true;
+}
+
+async function ensureScheduleForManual() {
+  getActiveImport();
+  if (state.selectedCandidate?.schedule) return true;
+  try {
+    await restoreCurrentSchedule(false);
+    return true;
+  } catch (error) {
+    setQuickEditStatus(error.message || "현재 시간표를 불러오지 못했습니다. 자동배정을 먼저 실행하세요.", "error");
+    log(error.message);
+    return false;
+  }
 }
 
 async function checkHealth() {
@@ -535,7 +576,8 @@ function renderTeacherIssues(candidate = state.selectedCandidate) {
     .join("");
 }
 
-function applyScheduleResult(result, message = "시간표 반영 완료") {
+function applyScheduleResult(result, message = "시간표 반영 완료", options = {}) {
+  const activateTab = options.activateTab !== false;
   state.scheduleResult = result;
   state.selectedCandidate = result.selected;
   clearQuickMove("수업 칸 선택", false);
@@ -544,15 +586,48 @@ function applyScheduleResult(result, message = "시간표 반영 완료") {
   renderDiagnostics(result.selected);
   renderTeacherIssues(result.selected);
   setExportsEnabled(true);
-  setActiveTab("timetable");
+  if (activateTab) setActiveTab("timetable");
   completeSetup();
   log(message);
 }
 
-async function solveSchedule() {
+function openSolvePreferences(context = "workspace") {
+  state.solveLaunchContext = context;
+  if (els.solvePreferenceModal?.showModal) {
+    els.solvePreferenceModal.showModal();
+  } else {
+    els.solvePreferenceModal?.classList.remove("hidden");
+    els.solvePreferenceModal?.setAttribute("open", "open");
+  }
+}
+
+function closeSolvePreferences() {
+  if (els.solvePreferenceModal?.close) {
+    els.solvePreferenceModal.close();
+  } else {
+    els.solvePreferenceModal?.classList.add("hidden");
+    els.solvePreferenceModal?.removeAttribute("open");
+  }
+}
+
+function showSolveProgress(context) {
+  if (context === "setup") {
+    setStartStep("solving");
+  } else {
+    els.solveOverlay?.classList.remove("hidden");
+  }
+}
+
+function hideSolveProgress() {
+  els.solveOverlay?.classList.add("hidden");
+}
+
+async function solveSchedule(context = "workspace") {
   getActiveImport();
   els.solveButton.disabled = true;
   els.solveButton.textContent = "배정 중";
+  if (els.solvePreferenceConfirm) els.solvePreferenceConfirm.disabled = true;
+  showSolveProgress(context);
   try {
     const result = await api("/schedules/solve", {
       method: "POST",
@@ -567,8 +642,17 @@ async function solveSchedule() {
     applyScheduleResult(result, `자동배정 완료: ${strategyName(result.bestStrategy)} 선택`);
     if (result.aiAdvisor?.advice) {
       const advice = result.aiAdvisor.advice;
-      const lines = [advice.summary, ...(advice.suggestions || []).map((item) => `${item.title}: ${(item.steps || []).join(" → ") || item.explanation}`)].filter(Boolean);
-      appendChat("assistant", `AI 자동배정 검토\n${lines.join("\n")}`, result.aiAdvisor.remote?.ok ? { responseId: result.aiAdvisor.remote.responseId, model: result.aiAdvisor.remote.model } : null);
+      const remote = result.aiAdvisor.remote || {};
+      const lines = [];
+      if (remote.ok) {
+        lines.push(`[원격 AI 응답] ${remote.provider || "AI"} ${remote.model || ""}`.trim());
+      } else if (getAiConfig().apiKey) {
+        lines.push(`[원격 AI 실패] ${remote.provider || providerLabel()} ${remote.status || ""}: ${remote.message || "응답을 받지 못했습니다."}`);
+        lines.push("[보조 진단]");
+      }
+      lines.push(advice.summary);
+      lines.push(...(advice.suggestions || []).map((item) => `${item.title}: ${(item.steps || []).join(" → ") || item.explanation}`));
+      appendChat("assistant", `AI 자동배정 검토\n${lines.filter(Boolean).join("\n")}`, remote.ok ? { responseId: remote.responseId, model: remote.model } : null);
     }
     return true;
   } catch (error) {
@@ -577,13 +661,20 @@ async function solveSchedule() {
     return false;
   } finally {
     els.solveButton.textContent = "▶ AI 자동배정";
+    if (els.solvePreferenceConfirm) els.solvePreferenceConfirm.disabled = false;
+    hideSolveProgress();
     updateSolveAvailability();
   }
 }
 
 async function solveScheduleFromSetup() {
-  setStartStep("solving");
-  const ok = await solveSchedule();
+  openSolvePreferences("setup");
+}
+
+async function confirmSolvePreferences() {
+  const context = state.solveLaunchContext || "workspace";
+  closeSolvePreferences();
+  const ok = await solveSchedule(context);
   if (!ok && !state.setupComplete) {
     setStartStep("preferences");
   }
@@ -790,10 +881,13 @@ async function handleScheduleCellClick(event) {
 }
 
 async function loadQuickMoveOptions() {
-  if (!getActiveImport() || !state.selectedCandidate || !state.quickMoveSource) {
+  if (!state.quickMoveSource) {
     setQuickEditStatus("이동할 수업 칸을 먼저 선택하세요.", "error");
     return;
   }
+  const source = { ...state.quickMoveSource };
+  if (!(await ensureScheduleForManual())) return;
+  state.quickMoveSource = source;
   setQuickEditStatus("이동 후보 계산 중");
   try {
     const result = await api("/schedules/move-options", {
@@ -802,7 +896,7 @@ async function loadQuickMoveOptions() {
       body: JSON.stringify({
         ...requestBasePayload(),
         schedule: state.selectedCandidate.schedule,
-        from: state.quickMoveSource,
+        from: source,
       }),
     });
     if (!result.ok) {
@@ -829,7 +923,7 @@ async function loadQuickMoveOptions() {
 }
 
 async function submitManualMove(move) {
-  if (!getActiveImport() || !state.selectedCandidate) return;
+  if (!(await ensureScheduleForManual())) return;
   try {
     const result = await api("/schedules/move", {
       method: "POST",
@@ -840,6 +934,7 @@ async function submitManualMove(move) {
         effectiveConfig: state.selectedCandidate.effectiveConfig || null,
         strategy: state.selectedCandidate.strategy,
         relaxations: state.selectedCandidate.relaxations || [],
+        recordSignature: state.scheduleResult?.recordSignature || "",
         move,
       }),
     });
@@ -1044,14 +1139,29 @@ async function sendChat() {
         solveOptions: getSolveOptions(),
       }),
     });
-    const suggestionText = response.suggestions
+    const suggestionText = (response.suggestions || [])
       .map((item) => {
         const body = item.explanation || (item.steps ? item.steps.join(" → ") : JSON.stringify(item.draft));
         return `${item.title}: ${body}`;
       })
       .join("\n");
-    const summary = response.advice?.summary ? `${response.advice.summary}\n` : "";
-    appendChat("assistant", `${response.privacy}\n${summary}${suggestionText}`, response.maskedPayload);
+    const lines = [response.privacy];
+    if (response.remote?.ok) {
+      lines.push(`[원격 AI 응답] ${response.remote.provider || "AI"} ${response.remote.model || ""}`.trim());
+    } else if (response.remoteFailure) {
+      const remote = response.remoteFailure;
+      lines.push(`[원격 AI 실패] ${remote.provider || "AI"} ${remote.status || ""}: ${remote.message || "응답을 받지 못했습니다."}`);
+    }
+    if (response.advice?.summary) lines.push(response.advice.summary);
+    if (suggestionText) lines.push(suggestionText);
+    if (response.remoteFailure && response.localAdvice?.summary && response.localAdvice.summary !== response.advice?.summary) {
+      lines.push(`[보조 진단] ${response.localAdvice.summary}`);
+      const localText = (response.localAdvice.suggestions || [])
+        .map((item) => `${item.title}: ${item.explanation || (item.steps || []).join(" → ")}`)
+        .join("\n");
+      if (localText) lines.push(localText);
+    }
+    appendChat("assistant", lines.filter(Boolean).join("\n"), response.maskedPayload);
     if (response.constraintDrafts?.length) {
       state.pendingConstraintDrafts = response.constraintDrafts;
       renderChatConstraints();
@@ -1073,14 +1183,16 @@ async function sendChat() {
 async function validateApiKey() {
   els.apiCheckButton.disabled = true;
   els.apiStatus.textContent = `${providerLabel()} API 키 검증 중`;
+  const inputConfig = readAiConfig();
   try {
     const result = await api("/ai/validate-key", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ aiConfig: getAiConfig() }),
+      body: JSON.stringify({ aiConfig: inputConfig }),
     });
     state.apiValidated = Boolean(result.ok);
     state.validatedAiConfig = result.aiConfig || null;
+    state.sessionAiConfig = result.ok ? { ...inputConfig, validated: true } : null;
     els.apiStatus.textContent = result.message;
     els.apiStatus.classList.toggle("ok", Boolean(result.ok));
     els.apiStatus.classList.toggle("error", !result.ok);
@@ -1094,6 +1206,7 @@ async function validateApiKey() {
     updateSolveAvailability();
   } catch (error) {
     state.apiValidated = false;
+    state.sessionAiConfig = null;
     els.apiStatus.textContent = error.message;
     els.apiStatus.classList.remove("ok");
     els.apiStatus.classList.add("error");
@@ -1149,8 +1262,11 @@ function wireEvents() {
   });
   els.uploadButton.addEventListener("click", uploadWorkbook);
   els.refreshImports.addEventListener("click", () => loadImports().catch((error) => log(error.message)));
-  els.solveButton.addEventListener("click", solveSchedule);
+  els.solveButton.addEventListener("click", () => openSolvePreferences("workspace"));
   els.startSolveButton?.addEventListener("click", solveScheduleFromSetup);
+  els.solvePreferenceClose?.addEventListener("click", closeSolvePreferences);
+  els.solvePreferenceCancel?.addEventListener("click", closeSolvePreferences);
+  els.solvePreferenceConfirm?.addEventListener("click", confirmSolvePreferences);
   els.initialConstraintButton?.addEventListener("click", createInitialConstraintDraft);
   els.skipConstraintButton?.addEventListener("click", () => setStartStep("preferences"));
   els.importList.addEventListener("click", (event) => {

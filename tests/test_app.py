@@ -72,6 +72,10 @@ class TimetableAppTests(unittest.TestCase):
         manual_link_index = html.index('href="#manualEditPanel"')
         manual_panel_index = html.index('id="manualEditPanel"')
         self.assertIn('id="solveMethod"', html)
+        self.assertIn('id="solvePreferenceModal"', html)
+        self.assertIn('id="searchStrength"', html)
+        self.assertIn('id="variationMode"', html)
+        self.assertIn('id="solveOverlay"', html)
         self.assertIn('id="preferenceOrder"', html)
         self.assertIn('id="allowRelaxForUnassigned"', html)
         self.assertIn('id="quickEditStatus"', html)
@@ -92,9 +96,15 @@ class TimetableAppTests(unittest.TestCase):
         self.assertIn("chatConstraints: state.chatConstraints", script)
         self.assertIn("fallbackLatestImport: true", script)
         self.assertIn("fallbackLastSchedule: true", script)
+        self.assertIn('api("/schedules/current")', script)
+        self.assertIn("function ensureScheduleForManual()", script)
         self.assertIn("function setStartStep", script)
         self.assertIn("function completeSetup()", script)
         self.assertIn("function solveScheduleFromSetup()", script)
+        self.assertIn("function openSolvePreferences", script)
+        self.assertIn("function confirmSolvePreferences", script)
+        self.assertIn("openSolvePreferences(\"workspace\")", script)
+        self.assertIn("openSolvePreferences(\"setup\")", script)
         self.assertIn('setStartStep("solving")', script)
         self.assertIn('setStartStep("preferences")', script)
         self.assertIn("createInitialConstraintDraft", script)
@@ -320,6 +330,59 @@ class TimetableAppTests(unittest.TestCase):
         self.assertEqual(set(day for day, count in counts.items() if count), set(selected["schedule"]["days"]))
         self.assertLessEqual(max(counts.values()) - min(counts.values()), 1)
 
+    def test_solve_runs_use_fresh_seed_and_return_search_metadata(self):
+        workbook = create_template_workbook()
+        set_config_value(workbook, "점심시간보호", "N")
+        set_config_value(workbook, "최대연강허용", "7")
+        append_named_row(workbook, "교사", {"교사명": "김교사"})
+        append_named_row(workbook, "학급-계열", {"학급명": "1-1", "학년": "1", "계열": "공통", "담임교사명": "김교사", "가상학급여부": "N"})
+        append_named_row(workbook, "과목", {"과목명": "국어", "단축명": "국", "NEIS과목명": "국어"})
+        append_named_row(workbook, "교사별 시수표", {"교사명": "김교사", "과목명": "국어"})
+        load_sheet = workbook["교사별 시수표"]
+        class_start = len(SPECS_BY_NAME["교사별 시수표"]) + 1
+        load_sheet.cell(row=1, column=class_start).value = "1-1"
+        load_sheet.cell(row=load_sheet.max_row, column=class_start).value = 8
+        records = validate_workbook(workbook)["records"]
+
+        first = solve_schedule(records, solve_options={"iterations": 10, "searchStrength": "fast"})
+        second = solve_schedule(records, solve_options={"iterations": 10, "searchStrength": "fast"})
+
+        self.assertNotEqual(first["runId"], second["runId"])
+        self.assertNotEqual(first["seed"], second["seed"])
+        self.assertGreater(first["attemptCount"], 0)
+        self.assertIn("bestSignature", first)
+        self.assertIn("searchStats", first)
+        self.assertEqual(first["searchStats"]["variationMode"], "quality-first")
+        self.assertEqual(first["recordSignature"], second["recordSignature"])
+        self.assertEqual(second["recordSignature"], app_module.records_signature(app_module.apply_solve_options(records, {"iterations": 10, "searchStrength": "fast"})))
+
+    def test_quality_first_keeps_previous_candidate_when_new_search_is_worse(self):
+        records = {"classes": {"C001": {}}, "config": {}, "teachers": {}, "subjects": {}, "rooms": {}, "loads": [], "constraints": []}
+        previous = {
+            "recordSignature": app_module.records_signature(records),
+            "selected": {
+                "strategy": "previous",
+                "schedule": {"days": ["월"], "periods": [1], "classes": {"C001": {"grid": {"월": {"1": None}}}}},
+                "unassigned": [],
+                "validation": {"violations": []},
+                "score": 10,
+                "diagnostics": [],
+            },
+        }
+        worse = {
+            "strategy": "worse",
+            "schedule": {"days": ["월"], "periods": [1], "classes": {"C001": {"grid": {"월": {"1": None}}}}},
+            "unassigned": [{"hours": 1}],
+            "validation": {"violations": []},
+            "score": 0,
+        }
+
+        selected, changed, source = app_module.select_quality_first_candidate(records, [worse], "quality-first", previous)
+
+        self.assertFalse(changed)
+        self.assertEqual(source, "previous-retained")
+        self.assertEqual(selected["strategy"], "previous")
+
     def test_fixed_periods_block_auto_assignment_without_counting_load(self):
         workbook = create_template_workbook()
         append_named_row(workbook, "교사", {"교사명": "김교사"})
@@ -426,6 +489,33 @@ class TimetableAppTests(unittest.TestCase):
         payload = json.dumps(captured, ensure_ascii=False)
         self.assertIn("T001", payload)
         self.assertNotIn("김교사", payload)
+
+    def test_ai_chat_reports_remote_failure_and_local_assist_separately(self):
+        records = {
+            "config": {},
+            "teachers": {"T001": {"교사명": "김교사"}},
+            "classes": {"C001": {"학급명": "1-1"}},
+            "subjects": {"S001": {"과목명": "국어"}},
+            "rooms": {},
+            "loads": [{"teacherCode": "T001", "subjectCode": "S001", "classCode": "C001", "weeklyHours": 1}],
+            "constraints": [],
+        }
+        original = app_module.call_ai_advisor
+        try:
+            app_module.call_ai_advisor = lambda ai_config, task, context: {
+                "ok": False,
+                "status": "mock-error",
+                "provider": "OpenAI",
+                "message": "mock provider failure",
+            }
+            response = ai_chat(records, "미배정을 0건으로 만들어줘.", api_key_present=True, ai_config={"provider": "openai", "apiKey": "sk-test", "model": "test-model"})
+        finally:
+            app_module.call_ai_advisor = original
+
+        self.assertEqual(response["remoteFailure"]["status"], "mock-error")
+        self.assertEqual(response["localAdvice"]["summary"], "보조 진단입니다.")
+        self.assertEqual(response["advice"]["summary"], "보조 진단입니다.")
+        self.assertEqual(response["externalApi"], "fallback-local-analysis")
 
     def test_ai_chat_can_apply_repair_solve_action(self):
         workbook = create_template_workbook()

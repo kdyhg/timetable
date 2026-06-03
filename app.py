@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import csv
+import hashlib
 import io
 import json
 import mimetypes
@@ -1801,6 +1802,48 @@ def apply_solve_options(records: dict, options: dict | None) -> dict:
     return records_with_config(records, updates)
 
 
+def normalize_search_strength(value: str | None) -> str:
+    normalized = as_text(value).lower()
+    if normalized in {"fast", "quick", "빠른형"}:
+        return "fast"
+    if normalized in {"balanced", "balance", "균형형"}:
+        return "balanced"
+    return "strong"
+
+
+def normalize_variation_mode(value: str | None) -> str:
+    normalized = as_text(value).lower()
+    if normalized in {"random", "full-random", "완전랜덤"}:
+        return "random"
+    if normalized in {"replay", "reproducible", "재현가능"}:
+        return "reproducible"
+    return "quality-first"
+
+
+def search_iteration_budget(settings: dict, search_strength: str) -> int:
+    base = parse_positive_int(settings.get("metaIterations")) or 60
+    if search_strength == "fast":
+        return max(24, min(base, 60))
+    if search_strength == "balanced":
+        return max(60, min(max(base, 84), 160))
+    return max(96, min(max(base, 132), 240))
+
+
+def search_generation_budget(iterations: int, search_strength: str) -> int:
+    if search_strength == "fast":
+        return max(3, min(5, iterations // 16))
+    if search_strength == "balanced":
+        return max(5, min(8, iterations // 14))
+    return max(7, min(12, iterations // 12))
+
+
+def solve_run_seed(solve_options: dict | None) -> int:
+    explicit = parse_positive_int((solve_options or {}).get("seed"))
+    if explicit:
+        return explicit
+    return random.SystemRandom().randint(1, 2_147_483_647)
+
+
 def preference_weights(settings: dict) -> dict:
     order_text = settings.get("preferenceOrder") or ""
     tokens = [part.strip() for part in re.split(r"[>,/]+", order_text) if part.strip()]
@@ -2293,8 +2336,19 @@ def solve_greedy(records: dict, strategy: str, gene: dict | None = None) -> dict
         _, day, period = min(candidates, key=lambda item: item[0])
         place_entry(schedule, load["classCode"], day, period, block_size, teacher_busy, room_busy, entry)
 
+    repair_notes = []
+    if unassigned:
+        unassigned, repair_notes = repair_unassigned_blocks(records, schedule, unassigned, teacher_busy, room_busy, forbidden, settings, max_period, gene)
     validation = validate_schedule(records, schedule, unassigned)
     diagnostics = diagnose_schedule(records, schedule, validation, unassigned)
+    for note in repair_notes:
+        diagnostics.insert(0, {
+            "type": "repair",
+            "severity": "success",
+            "title": "미배정 후처리",
+            "reason": note,
+            "suggestion": "검증 결과를 확인하세요.",
+        })
     result = {
         "strategy": strategy,
         "schedule": schedule,
@@ -2305,10 +2359,133 @@ def solve_greedy(records: dict, strategy: str, gene: dict | None = None) -> dict
         "gene": {key: value for key, value in gene.items() if key != "apiKey"},
         "quality": teacher_distribution_metrics(schedule),
         "teacherIssues": teacher_issue_summary(records, schedule, validation),
+        "repairNotes": repair_notes,
         "score": 0,
     }
     result["score"] = timetable_quality_score(result)
     return result
+
+
+def load_for_unassigned(records: dict, item: dict) -> dict | None:
+    for load in records.get("loads", []):
+        if (
+            load.get("teacherCode") == item.get("teacherCode")
+            and load.get("subjectCode") == item.get("subjectCode")
+            and load.get("classCode") == item.get("classCode")
+        ):
+            return load
+    if item.get("teacherCode") and item.get("subjectCode") and item.get("classCode"):
+        return {
+            "teacherCode": item.get("teacherCode"),
+            "subjectCode": item.get("subjectCode"),
+            "classCode": item.get("classCode"),
+            "weeklyHours": item.get("hours", 1),
+            "roomCode": item.get("roomCode", ""),
+        }
+    return None
+
+
+def remove_cell_from_busy(cell: dict, day: str, period: int, teacher_busy, room_busy) -> None:
+    if cell.get("teacherCode"):
+        teacher_busy[cell["teacherCode"]].discard((day, period))
+    if cell.get("roomCode"):
+        room_busy[cell["roomCode"]].discard((day, period))
+
+
+def restore_single_cell(schedule: dict, class_code: str, day: str, period: int, cell: dict, teacher_busy, room_busy) -> None:
+    schedule["classes"][class_code]["grid"][day][str(period)] = cell
+    if cell.get("teacherCode"):
+        teacher_busy[cell["teacherCode"]].add((day, period))
+    if cell.get("roomCode"):
+        room_busy[cell["roomCode"]].add((day, period))
+
+
+def can_place_repair_entry(records: dict, schedule: dict, load: dict, entry: dict, day: str, period: int, block_size: int, teacher_busy, room_busy, forbidden, settings: dict, max_period: int) -> bool:
+    if not slot_free(schedule, load["classCode"], day, period, block_size, teacher_busy, room_busy, entry, max_period, forbidden):
+        return False
+    periods = [period + offset for offset in range(block_size)]
+    if violates_teacher_flow(teacher_busy, load["teacherCode"], day, periods, settings):
+        return False
+    return teacher_day_max_penalty(teacher_busy, load["teacherCode"], day, block_size, settings) is not None
+
+
+def repair_unassigned_blocks(records: dict, schedule: dict, unassigned: list[dict], teacher_busy, room_busy, forbidden, settings: dict, max_period: int, gene: dict | None = None) -> tuple[list[dict], list[str]]:
+    if not unassigned:
+        return [], []
+    rng = random.Random((gene or {}).get("seed", 0) + 911)
+    remaining = []
+    notes = []
+    days = list(schedule.get("days", []))
+    periods = list(schedule.get("periods", []))
+
+    for item in unassigned:
+        load = load_for_unassigned(records, item)
+        block_size = parse_positive_int(item.get("hours")) or 1
+        if not load:
+            remaining.append(item)
+            continue
+        entry = entry_for_load(load, records, block_size)
+        day_order = days[:]
+        period_order = periods[:]
+        rng.shuffle(day_order)
+        rng.shuffle(period_order)
+        placed = False
+        for day in day_order:
+            for period in period_order:
+                if can_place_repair_entry(records, schedule, load, entry, day, period, block_size, teacher_busy, room_busy, forbidden, settings, max_period):
+                    place_entry(schedule, load["classCode"], day, period, block_size, teacher_busy, room_busy, entry)
+                    notes.append(f"{describe_unassigned_item(records, item)} 직접 배치")
+                    placed = True
+                    break
+            if placed:
+                break
+        if placed:
+            continue
+
+        if block_size != 1:
+            remaining.append(item)
+            continue
+        class_code = load["classCode"]
+        class_grid = schedule.get("classes", {}).get(class_code, {}).get("grid", {})
+        for day in day_order:
+            for period in period_order:
+                target_cell = class_grid.get(day, {}).get(str(period))
+                if not target_cell or target_cell.get("source") == "fixed" or target_cell.get("blockSize", 1) != 1:
+                    continue
+                remove_cell_from_busy(target_cell, day, period, teacher_busy, room_busy)
+                class_grid[day][str(period)] = None
+                if not can_place_repair_entry(records, schedule, load, entry, day, period, 1, teacher_busy, room_busy, forbidden, settings, max_period):
+                    restore_single_cell(schedule, class_code, day, period, target_cell, teacher_busy, room_busy)
+                    continue
+                moved_target = False
+                target_load = {
+                    "teacherCode": target_cell.get("teacherCode", ""),
+                    "subjectCode": target_cell.get("subjectCode", ""),
+                    "classCode": class_code,
+                    "roomCode": target_cell.get("roomCode", ""),
+                    "weeklyHours": 1,
+                }
+                for move_day in day_order:
+                    for move_period in period_order:
+                        if move_day == day and move_period == period:
+                            continue
+                        if can_place_repair_entry(records, schedule, target_load, target_cell, move_day, move_period, 1, teacher_busy, room_busy, forbidden, settings, max_period):
+                            place_entry(schedule, class_code, move_day, move_period, 1, teacher_busy, room_busy, target_cell)
+                            moved_target = True
+                            break
+                    if moved_target:
+                        break
+                if moved_target:
+                    place_entry(schedule, class_code, day, period, 1, teacher_busy, room_busy, entry)
+                    notes.append(f"{describe_unassigned_item(records, item)} 이동 후 배치")
+                    placed = True
+                    break
+                restore_single_cell(schedule, class_code, day, period, target_cell, teacher_busy, room_busy)
+            if placed:
+                break
+        if not placed:
+            remaining.append(item)
+    return remaining, notes
 
 
 def candidate_error_count(candidate: dict) -> int:
@@ -2424,17 +2601,23 @@ def relaxation_profiles(records: dict, include_relaxations: bool = True) -> list
     if not include_relaxations or not settings.get("allowRelaxForUnassigned"):
         return profiles
     if settings.get("maxConsecutive") and settings["maxConsecutive"] < max_period:
-        next_limit = min(max_period, settings["maxConsecutive"] + 1)
-        profiles.append((
-            "relax-consecutive",
-            {"최대연강허용": str(next_limit)},
-            [f"연강 {settings['maxConsecutive']}→{next_limit}"],
-        ))
+        for next_limit in range(settings["maxConsecutive"] + 1, min(max_period, settings["maxConsecutive"] + 2) + 1):
+            profiles.append((
+                f"relax-consecutive-{next_limit}",
+                {"최대연강허용": str(next_limit)},
+                [f"연강 {settings['maxConsecutive']}→{next_limit}"],
+            ))
     if settings.get("protectLunch"):
         profiles.append((
             "relax-lunch",
             {"점심시간보호": "N"},
             ["점심보호 해제"],
+        ))
+    if settings.get("balanceStrength") != "off":
+        profiles.append((
+            "relax-balance",
+            {"균등분배강도": "off"},
+            ["안배 완화"],
         ))
     if settings.get("teacherDayMaxEnabled"):
         profiles.append((
@@ -2452,9 +2635,10 @@ def relaxation_profiles(records: dict, include_relaxations: bool = True) -> list
     return profiles
 
 
-def initial_genes(records: dict) -> list[dict]:
+def initial_genes(records: dict, rng: random.Random | None = None, seed_base: int | None = None, search_strength: str = "strong", iterations: int | None = None) -> list[dict]:
+    rng = rng or random.Random(seed_base or solve_run_seed(None))
     settings = constraint_settings(records)
-    iterations = settings.get("metaIterations") or 60
+    iterations = iterations or settings.get("metaIterations") or 60
     method = settings.get("assignmentMethod", "fixed-first")
     strategies = ["genetic-balanced", "spread-days", "spread-periods", "balanced", "gap-light", "special-room-first", "unassigned-first"]
     if method == "unassigned-only":
@@ -2462,12 +2646,15 @@ def initial_genes(records: dict) -> list[dict]:
     elif method == "from-start":
         strategies = ["spread-days", "spread-periods", "genetic-balanced", "balanced"]
     genes = []
-    seed_base = 1729
+    seed_base = seed_base or rng.randint(1, 1_000_000)
     for index in range(max(12, iterations)):
+        strategy = strategies[index % len(strategies)]
+        if search_strength == "strong" and index >= len(strategies):
+            strategy = rng.choice(strategies)
         genes.append({
-            "seed": seed_base + index * 37,
-            "strategy": strategies[index % len(strategies)],
-            "randomness": 0.25 + (index % 7) * 0.11,
+            "seed": seed_base + index * 9973 + rng.randint(0, 7919),
+            "strategy": strategy,
+            "randomness": min(1.6, 0.25 + (index % 7) * 0.11 + (0.18 if search_strength == "strong" else 0.0)),
         })
     return genes
 
@@ -2501,17 +2688,20 @@ def crossover_gene(parent_a: dict, parent_b: dict, rng: random.Random, generatio
     }
 
 
-def solve_metaheuristic(records: dict, include_relaxations: bool = True) -> list[dict]:
+def solve_metaheuristic(records: dict, include_relaxations: bool = True, seed: int | None = None, search_strength: str = "strong", return_stats: bool = False):
     settings = constraint_settings(records)
-    iterations = settings.get("metaIterations") or 60
-    rng = random.Random(20260603)
+    iterations = search_iteration_budget(settings, normalize_search_strength(search_strength))
+    seed = seed or solve_run_seed(None)
+    rng = random.Random(seed)
     profiles = relaxation_profiles(records, include_relaxations=include_relaxations)
-    genes = initial_genes(records)
+    genes = initial_genes(records, rng=rng, seed_base=seed, search_strength=normalize_search_strength(search_strength), iterations=iterations)
     population = []
+    attempt_count = 0
     for gene in genes[: max(10, min(len(genes), iterations))]:
         for profile in profiles:
             population.append(solve_gene(records, gene, profile))
-    generations = max(3, min(10, iterations // 10))
+            attempt_count += 1
+    generations = search_generation_budget(iterations, normalize_search_strength(search_strength))
     for generation in range(generations):
         elites = sorted(population, key=candidate_rank, reverse=True)[: max(4, min(10, len(population)))]
         children = []
@@ -2519,18 +2709,31 @@ def solve_metaheuristic(records: dict, include_relaxations: bool = True) -> list
             parent_a = elites[index % len(elites)].get("gene", {})
             parent_b = elites[(index * 3 + 1) % len(elites)].get("gene", {})
             child_gene = crossover_gene(parent_a, parent_b, rng, generation)
+            if normalize_search_strength(search_strength) == "strong" and rng.random() < 0.35:
+                child_gene["strategy"] = rng.choice(["genetic-balanced", "spread-days", "spread-periods", "balanced", "gap-light", "special-room-first", "unassigned-first"])
+                child_gene["randomness"] = min(1.7, float(child_gene.get("randomness", 0.4)) + rng.uniform(0.05, 0.28))
             profile = profiles[index % len(profiles)]
             children.append(solve_gene(records, child_gene, profile))
+            attempt_count += 1
         population = elites + children
         if any(candidate_unassigned_count(candidate) == 0 and candidate_error_count(candidate) == 0 for candidate in elites):
-            if generation >= 2:
+            if generation >= (2 if normalize_search_strength(search_strength) != "strong" else 4):
                 break
     unique = {}
     for candidate in population:
-        key = candidate.get("strategy")
+        key = candidate_signature(candidate)
         if key not in unique or candidate_rank(candidate) > candidate_rank(unique[key]):
             unique[key] = candidate
-    return sorted(unique.values(), key=candidate_rank, reverse=True)[:8]
+    candidates = sorted(unique.values(), key=candidate_rank, reverse=True)[:8]
+    stats = {
+        "attemptCount": attempt_count,
+        "generationCount": generations,
+        "populationCount": len(population),
+        "uniqueCandidateCount": len(unique),
+        "profileCount": len(profiles),
+        "searchStrength": normalize_search_strength(search_strength),
+    }
+    return (candidates, stats) if return_stats else candidates
 
 
 def candidate_rank(candidate: dict):
@@ -2541,6 +2744,139 @@ def candidate_rank(candidate: dict):
         -relaxation_count,
         candidate.get("score", 0),
     )
+
+
+def schedule_signature(schedule: dict) -> str:
+    parts = []
+    for class_code, class_data in sorted((schedule.get("classes") or {}).items()):
+        grid = class_data.get("grid", {})
+        for day in schedule.get("days", []):
+            for period in schedule.get("periods", []):
+                cell = grid.get(day, {}).get(str(period))
+                if not cell:
+                    continue
+                parts.append("|".join([
+                    class_code,
+                    as_text(day),
+                    str(period),
+                    as_text(cell.get("teacherCode")),
+                    as_text(cell.get("subjectCode")),
+                    as_text(cell.get("roomCode")),
+                    as_text(cell.get("source")),
+                ]))
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:20]
+
+
+def records_signature(records: dict) -> str:
+    loads = []
+    for item in records.get("loads", []):
+        loads.append({
+            "teacherCode": item.get("teacherCode"),
+            "subjectCode": item.get("subjectCode"),
+            "classCode": item.get("classCode"),
+            "weeklyHours": item.get("weeklyHours"),
+            "blockPattern": item.get("blockPattern"),
+            "roomCode": item.get("roomCode"),
+            "syncGroup": item.get("syncGroup"),
+            "coTeacherGroup": item.get("coTeacherGroup"),
+        })
+    classes = {
+        code: {
+            "dayLimits": item.get("_dayLimits") or {},
+            "grade": item.get("학년"),
+            "series": item.get("계열"),
+            "virtual": item.get("가상학급여부"),
+        }
+        for code, item in sorted((records.get("classes") or {}).items())
+    }
+    payload = {
+        "config": records.get("config", {}),
+        "teachers": sorted((records.get("teachers") or {}).keys()),
+        "classes": classes,
+        "subjects": sorted((records.get("subjects") or {}).keys()),
+        "rooms": sorted((records.get("rooms") or {}).keys()),
+        "loads": sorted(loads, key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True)),
+        "constraints": records.get("constraints", []),
+        "fixedPeriods": records.get("fixedPeriods", []),
+        "syncGroups": records.get("syncGroups", []),
+        "continuous": records.get("continuous", []),
+        "coTeachers": records.get("coTeachers", []),
+    }
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:20]
+
+
+def candidate_signature(candidate: dict) -> str:
+    signature = candidate.get("signature")
+    if signature:
+        return signature
+    return schedule_signature(candidate.get("schedule", {}))
+
+
+def annotate_candidate_signatures(candidates: list[dict]) -> list[dict]:
+    for candidate in candidates:
+        candidate["signature"] = candidate_signature(candidate)
+    return candidates
+
+
+def candidate_compatible_with_records(records: dict, candidate: dict | None) -> bool:
+    if not candidate:
+        return False
+    schedule = candidate.get("schedule") or {}
+    return set((schedule.get("classes") or {}).keys()) == set((records.get("classes") or {}).keys())
+
+
+def select_quality_first_candidate(records: dict, candidates: list[dict], variation_mode: str, previous_result: dict | None) -> tuple[dict, bool, str]:
+    ranked = sorted(candidates, key=candidate_rank, reverse=True)
+    if not ranked:
+        raise ValueError("선택할 후보 시간표가 없습니다.")
+    best = ranked[0]
+    if variation_mode == "random":
+        pool = ranked[: min(4, len(ranked))]
+        selected = random.choice(pool)
+        return selected, True, "random"
+    previous = deepcopy((previous_result or {}).get("selected") or {})
+    previous_records_signature = (previous_result or {}).get("recordSignature")
+    current_records_signature = records_signature(records)
+    if (
+        variation_mode != "quality-first"
+        or previous_records_signature != current_records_signature
+        or not candidate_compatible_with_records(records, previous)
+    ):
+        return best, True, "new-best"
+
+    previous["signature"] = candidate_signature(previous)
+    previous_rank = candidate_rank(previous)
+    previous_signature = previous["signature"]
+    eligible = [candidate for candidate in ranked if candidate_rank(candidate) >= previous_rank]
+    diverse = [candidate for candidate in eligible if candidate_signature(candidate) != previous_signature]
+    if diverse:
+        return diverse[0], True, "new-diverse"
+    if eligible:
+        selected = eligible[0]
+        return selected, candidate_signature(selected) != previous_signature, "new-equivalent"
+
+    previous["retainedPrevious"] = True
+    previous.setdefault("diagnostics", []).insert(0, {
+        "type": "quality-first-retained",
+        "severity": "warning",
+        "title": "이전 후보 유지",
+        "reason": "새 탐색 후보가 이전 시간표보다 미배정/검증 기준에서 나빠 이전 결과를 유지했습니다.",
+        "suggestion": "선호도 팝업에서 강도를 높이거나 조건 완화를 켠 뒤 다시 탐색하세요.",
+    })
+    return previous, False, "previous-retained"
+
+
+def selected_candidate_list(selected: dict, candidates: list[dict], limit: int = 4) -> list[dict]:
+    selected_signature = candidate_signature(selected)
+    output = [selected]
+    for candidate in sorted(candidates, key=candidate_rank, reverse=True):
+        if candidate_signature(candidate) == selected_signature:
+            continue
+        output.append(candidate)
+        if len(output) >= limit:
+            break
+    return output
 
 
 def diagnose_schedule(records: dict, schedule: dict, validation: dict, unassigned=None) -> list[dict]:
@@ -2958,7 +3294,13 @@ def build_ai_solve_advisor(records: dict, ai_summary: dict, ai_config=None) -> d
 
 
 def solve_schedule(records: dict, api_key: str = "", ai_config=None, solve_options: dict | None = None) -> dict:
+    solve_options = solve_options or {}
+    run_id = uuid.uuid4().hex[:12]
+    seed = solve_run_seed(solve_options)
+    search_strength = normalize_search_strength(solve_options.get("searchStrength"))
+    variation_mode = normalize_variation_mode(solve_options.get("variationMode"))
     records = apply_solve_options(records, solve_options)
+    record_signature = records_signature(records)
     config = normalize_ai_config(ai_config, api_key=api_key)
     strict_candidates = [
         solve_greedy(records, "balanced", gene={"seed": 11, "randomness": 0.0, "strategy": "balanced"}),
@@ -2971,17 +3313,32 @@ def solve_schedule(records: dict, api_key: str = "", ai_config=None, solve_optio
         candidate.setdefault("aiGenerated", False)
     needs_relaxation = needs_repair_candidates(strict_candidates)
     repair_candidates = generate_ai_repair_candidates(records, strict_candidates)
-    genetic_candidates = solve_metaheuristic(records, include_relaxations=needs_relaxation)
-    candidates = sorted(genetic_candidates, key=candidate_rank, reverse=True)[:4]
-    best = max(candidates, key=candidate_rank)
+    genetic_candidates, genetic_stats = solve_metaheuristic(records, include_relaxations=needs_relaxation, seed=seed, search_strength=search_strength, return_stats=True)
+    annotate_candidate_signatures(genetic_candidates)
+    previous_result = load_last_schedule() if variation_mode == "quality-first" else None
+    best, best_changed, selection_source = select_quality_first_candidate(records, genetic_candidates, variation_mode, previous_result)
+    best["signature"] = candidate_signature(best)
+    candidates = selected_candidate_list(best, genetic_candidates, limit=4)
     ai_summary = summarize_candidate_for_ai(best)
     result = {
+        "runId": run_id,
+        "seed": seed,
+        "recordSignature": record_signature,
         "createdAt": now_iso(),
         "bestStrategy": best["strategy"],
         "candidates": candidates,
         "selected": best,
         "aiSummary": ai_summary,
         "aiAdvisor": build_ai_solve_advisor(records, ai_summary, config),
+        "attemptCount": genetic_stats.get("attemptCount", 0),
+        "bestChanged": best_changed,
+        "bestSignature": best["signature"],
+        "searchStats": {
+            **genetic_stats,
+            "variationMode": variation_mode,
+            "selectionSource": selection_source,
+            "previousSignature": candidate_signature((previous_result or {}).get("selected", {})) if previous_result and previous_result.get("recordSignature") == record_signature else "",
+        },
         "repairSummary": {
             "strictCandidateCount": len(strict_candidates),
             "repairCandidateCount": len(repair_candidates),
@@ -2991,7 +3348,7 @@ def solve_schedule(records: dict, api_key: str = "", ai_config=None, solve_optio
         "solver": {
             "algorithm": "metaheuristic-genetic",
             "objective": "미배정과 hard 검증 오류를 최우선으로 줄이고, 교사별 요일/오전오후 균등성을 최적화합니다.",
-            "options": {key: value for key, value in (solve_options or {}).items() if key != "apiKey"},
+            "options": {key: value for key, value in solve_options.items() if key != "apiKey"},
         },
     }
     save_last_schedule(result)
@@ -3276,6 +3633,8 @@ def save_moved_schedule_result(move_result: dict, body: dict) -> None:
         "candidates": [],
         "selected": {},
     }
+    if body.get("recordSignature"):
+        last["recordSignature"] = body.get("recordSignature")
     selected = last.setdefault("selected", {})
     selected["schedule"] = move_result["schedule"]
     selected["validation"] = move_result.get("validation", {})
@@ -3512,9 +3871,7 @@ def repair_schedule_by_chat(records: dict, text: str, solve_options: dict | None
         return None, None
     before = len(unassigned or [])
     options = repair_chat_solve_options(records, solve_options)
-    local_ai_config = normalize_ai_config(ai_config)
-    local_ai_config["apiKey"] = ""
-    result = solve_schedule(records, ai_config=local_ai_config, solve_options=options)
+    result = solve_schedule(records, ai_config=ai_config, solve_options=options)
     after = len(result.get("selected", {}).get("unassigned", []))
     action = {
         "type": "repair-solve",
@@ -3673,7 +4030,7 @@ def ai_chat(records: dict, message: str, api_key_present: bool = False, schedule
         })
 
     local_advice = {
-        "summary": "로컬 규칙 기반 제안입니다.",
+        "summary": "보조 진단입니다." if api_key_present else "로컬 규칙 기반 제안입니다.",
         "suggestions": [
             {
                 "type": item.get("type", "advisor"),
@@ -3709,6 +4066,7 @@ def ai_chat(records: dict, message: str, api_key_present: bool = False, schedule
                 ],
             },
         )
+    remote_failure = remote if as_text(config.get("apiKey")) and not remote.get("ok") else None
     active_advice = remote.get("advice") if remote.get("ok") else local_advice
 
     return {
@@ -3722,6 +4080,8 @@ def ai_chat(records: dict, message: str, api_key_present: bool = False, schedule
         "scheduleAction": schedule_action,
         "scheduleResult": schedule_result,
         "remote": remote,
+        "remoteFailure": remote_failure,
+        "localAdvice": local_advice,
         "advice": active_advice,
         "suggestions": active_advice.get("suggestions", suggestions),
     }
@@ -3864,6 +4224,13 @@ class AppHandler(BaseHTTPRequestHandler):
         if path == "/api/imports":
             self.send_json({"imports": list_imports()})
             return
+        if path == "/schedules/current":
+            result = load_last_schedule()
+            if not result:
+                self.send_json({"ok": False, "error": "현재 시간표를 불러오지 못했습니다. 자동배정을 먼저 실행하세요."}, status=404)
+                return
+            self.send_json({"ok": True, "scheduleResult": result})
+            return
         if path.startswith("/imports/") and path.endswith("/report.xlsx"):
             import_id = path.split("/")[2]
             report_bytes = load_report_bytes(import_id)
@@ -3929,7 +4296,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 schedule = get_schedule_from_body(body)
                 source = body.get("from", {})
                 if records is None or schedule is None:
-                    self.send_json({"error": "records/importId와 schedule이 필요합니다."}, status=400)
+                    self.send_json({"error": "현재 시간표를 불러오지 못했습니다. 자동배정을 먼저 실행하세요."}, status=400)
                     return
                 self.send_json(quick_move_options(records, schedule, source))
                 return
@@ -3939,7 +4306,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 schedule = get_schedule_from_body(body)
                 move = body.get("move", {})
                 if records is None or schedule is None:
-                    self.send_json({"error": "records/importId와 schedule이 필요합니다."}, status=400)
+                    self.send_json({"error": "현재 시간표를 불러오지 못했습니다. 자동배정을 먼저 실행하세요."}, status=400)
                     return
                 result = move_schedule(records, schedule, move)
                 save_moved_schedule_result(result, body)

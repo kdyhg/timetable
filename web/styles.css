@@ -195,6 +195,51 @@ textarea {
   opacity: 0.45;
 }
 
+.modal {
+  width: min(620px, calc(100vw - 28px));
+  max-height: calc(100vh - 40px);
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  color: var(--text);
+}
+
+.modal::backdrop {
+  background: rgba(23, 33, 33, 0.35);
+}
+
+.modal-content {
+  display: grid;
+  gap: 10px;
+  padding: 18px;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.solve-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 12px;
+  padding: 24px;
+  background: rgba(245, 246, 247, 0.92);
+  text-align: center;
+}
+
+.solve-overlay span {
+  color: var(--muted);
+}
+
 .button-icon {
   display: inline-grid;
   place-items: center;

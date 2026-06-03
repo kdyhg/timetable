@@ -86,59 +86,10 @@
               <strong>4. 자동배정 선호도</strong>
               <span class="badge">메타휴리스틱</span>
             </div>
-            <label class="field-label" for="solveMethod">배정 방법</label>
-            <select id="solveMethod" class="select">
-              <option value="fixed-first">고정 수업 유지 후 전체 배정</option>
-              <option value="from-start">처음부터 다시 탐색</option>
-              <option value="unassigned-only">미배정 우선 탐색</option>
-            </select>
-            <label class="field-label" for="preferenceOrder">선호도 순서</label>
-            <select id="preferenceOrder" class="select">
-              <option value="안배>연강>식사시간">안배 > 연강 > 식사시간</option>
-              <option value="안배>식사시간>연강">안배 > 식사시간 > 연강</option>
-              <option value="연강>안배>식사시간">연강 > 안배 > 식사시간</option>
-              <option value="연강>식사시간>안배">연강 > 식사시간 > 안배</option>
-              <option value="식사시간>안배>연강">식사시간 > 안배 > 연강</option>
-              <option value="식사시간>연강>안배">식사시간 > 연강 > 안배</option>
-            </select>
-            <div class="preference-grid">
-              <label>
-                <span>배정횟수</span>
-                <input id="solveIterations" class="input compact" type="number" min="12" max="240" value="60" />
-              </label>
-              <label>
-                <span>최대연강</span>
-                <input id="maxConsecutive" class="input compact" type="number" min="0" max="9" value="3" />
-              </label>
-            </div>
-            <label class="field-label" for="balanceStrength">균등분배 강도</label>
-            <select id="balanceStrength" class="select">
-              <option value="hard">강하게</option>
-              <option value="soft" selected>보통</option>
-              <option value="off">끄기</option>
-            </select>
-            <label class="checkbox-row">
-              <input id="allowRelaxForUnassigned" type="checkbox" checked />
-              <span>미배정 방지를 위해 낮은 우선순위 조건 완화</span>
-            </label>
-            <label class="checkbox-row">
-              <input id="protectLunch" type="checkbox" checked />
-              <span>점심 전후 연속 회피</span>
-            </label>
-            <label class="checkbox-row">
-              <input id="teacherDayMaxEnabled" type="checkbox" />
-              <span>교사 요일별 최대시수 적용</span>
-            </label>
-            <div class="day-limit-grid" aria-label="교사 요일별 최대시수">
-              <label><span>월</span><input id="teacherMaxMon" class="input compact" type="number" min="0" /></label>
-              <label><span>화</span><input id="teacherMaxTue" class="input compact" type="number" min="0" /></label>
-              <label><span>수</span><input id="teacherMaxWed" class="input compact" type="number" min="0" /></label>
-              <label><span>목</span><input id="teacherMaxThu" class="input compact" type="number" min="0" /></label>
-              <label><span>금</span><input id="teacherMaxFri" class="input compact" type="number" min="0" /></label>
-            </div>
+            <div class="status-line">자동배정 전에 선호도 팝업에서 탐색 강도와 조건 완화 방식을 확인합니다.</div>
             <button id="startSolveButton" class="button primary full" type="button">
               <span class="button-icon">▶</span>
-              AI 자동배정
+              선호도 설정 후 AI 자동배정
             </button>
           </div>
           <div class="start-step loading-step" data-start-step="solving" aria-live="polite">
@@ -297,6 +248,88 @@
           </aside>
         </div>
       </main>
+    </div>
+    <dialog id="solvePreferenceModal" class="modal">
+      <form method="dialog" class="modal-content">
+        <div class="panel-heading">
+          <h2>자동배정 선호도</h2>
+          <button id="solvePreferenceClose" class="icon-button" type="button" aria-label="닫기">×</button>
+        </div>
+        <label class="field-label" for="solveMethod">배정 방법</label>
+        <select id="solveMethod" class="select">
+          <option value="fixed-first">고정 수업 유지 후 전체 배정</option>
+          <option value="from-start">처음부터 다시 탐색</option>
+          <option value="unassigned-only">미배정 우선 탐색</option>
+        </select>
+        <label class="field-label" for="searchStrength">탐색 강도</label>
+        <select id="searchStrength" class="select">
+          <option value="strong" selected>강력형</option>
+          <option value="balanced">균형형</option>
+          <option value="fast">빠른형</option>
+        </select>
+        <label class="field-label" for="variationMode">결과 변화 방식</label>
+        <select id="variationMode" class="select">
+          <option value="quality-first" selected>품질우선 변화</option>
+          <option value="random">완전랜덤 변화</option>
+          <option value="reproducible">재현가능 변화</option>
+        </select>
+        <label class="field-label" for="preferenceOrder">선호도 순서</label>
+        <select id="preferenceOrder" class="select">
+          <option value="안배>연강>식사시간">안배 > 연강 > 식사시간</option>
+          <option value="안배>식사시간>연강">안배 > 식사시간 > 연강</option>
+          <option value="연강>안배>식사시간">연강 > 안배 > 식사시간</option>
+          <option value="연강>식사시간>안배">연강 > 식사시간 > 안배</option>
+          <option value="식사시간>안배>연강">식사시간 > 안배 > 연강</option>
+          <option value="식사시간>연강>안배">식사시간 > 연강 > 안배</option>
+        </select>
+        <div class="preference-grid">
+          <label>
+            <span>배정횟수</span>
+            <input id="solveIterations" class="input compact" type="number" min="12" max="240" value="120" />
+          </label>
+          <label>
+            <span>최대연강</span>
+            <input id="maxConsecutive" class="input compact" type="number" min="0" max="9" value="3" />
+          </label>
+        </div>
+        <label class="field-label" for="balanceStrength">균등분배 강도</label>
+        <select id="balanceStrength" class="select">
+          <option value="hard">강하게</option>
+          <option value="soft" selected>보통</option>
+          <option value="off">끄기</option>
+        </select>
+        <label class="checkbox-row">
+          <input id="allowRelaxForUnassigned" type="checkbox" checked />
+          <span>미배정 방지를 위해 낮은 우선순위 조건 완화</span>
+        </label>
+        <label class="checkbox-row">
+          <input id="protectLunch" type="checkbox" checked />
+          <span>점심 전후 연속 회피</span>
+        </label>
+        <label class="checkbox-row">
+          <input id="teacherDayMaxEnabled" type="checkbox" />
+          <span>교사 요일별 최대시수 적용</span>
+        </label>
+        <div class="day-limit-grid" aria-label="교사 요일별 최대시수">
+          <label><span>월</span><input id="teacherMaxMon" class="input compact" type="number" min="0" /></label>
+          <label><span>화</span><input id="teacherMaxTue" class="input compact" type="number" min="0" /></label>
+          <label><span>수</span><input id="teacherMaxWed" class="input compact" type="number" min="0" /></label>
+          <label><span>목</span><input id="teacherMaxThu" class="input compact" type="number" min="0" /></label>
+          <label><span>금</span><input id="teacherMaxFri" class="input compact" type="number" min="0" /></label>
+        </div>
+        <div class="modal-actions">
+          <button id="solvePreferenceCancel" class="button ghost" type="button">취소</button>
+          <button id="solvePreferenceConfirm" class="button primary" type="button">
+            <span class="button-icon">▶</span>
+            이 설정으로 자동배정
+          </button>
+        </div>
+      </form>
+    </dialog>
+    <div id="solveOverlay" class="solve-overlay hidden" aria-live="polite">
+      <div class="loading-spinner" role="status" aria-label="AI 자동배정 진행 중"></div>
+      <strong>시간표를 다시 탐색하고 있습니다</strong>
+      <span>강력형 탐색으로 여러 seed와 완화 조합을 비교합니다.</span>
     </div>
     <script src="/app.js"></script>
   </body>
