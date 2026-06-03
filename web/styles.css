@@ -497,6 +497,55 @@ textarea {
   align-items: center;
 }
 
+.preference-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.preference-grid label,
+.day-limit-grid label {
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.checkbox-row {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  margin-top: 8px;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.checkbox-row input {
+  width: 16px;
+  height: 16px;
+  margin: 2px 0 0;
+}
+
+.day-limit-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.day-limit-grid .input {
+  text-align: center;
+  padding-left: 4px;
+  padding-right: 4px;
+}
+
+.manual-panel {
+  scroll-margin-top: 16px;
+}
+
 .status-line {
   margin: 8px 0;
   color: var(--muted);
@@ -687,7 +736,9 @@ textarea {
 
   .manual-move,
   .api-row,
-  .view-controls {
+  .view-controls,
+  .preference-grid,
+  .day-limit-grid {
     grid-template-columns: 1fr;
   }
 

@@ -14,6 +14,19 @@ const els = {
   uploadInput: document.querySelector("#uploadInput"),
   selectedFileName: document.querySelector("#selectedFileName"),
   uploadButton: document.querySelector("#uploadButton"),
+  solveMethod: document.querySelector("#solveMethod"),
+  preferenceOrder: document.querySelector("#preferenceOrder"),
+  solveIterations: document.querySelector("#solveIterations"),
+  maxConsecutive: document.querySelector("#maxConsecutive"),
+  balanceStrength: document.querySelector("#balanceStrength"),
+  allowRelaxForUnassigned: document.querySelector("#allowRelaxForUnassigned"),
+  protectLunch: document.querySelector("#protectLunch"),
+  teacherDayMaxEnabled: document.querySelector("#teacherDayMaxEnabled"),
+  teacherMaxMon: document.querySelector("#teacherMaxMon"),
+  teacherMaxTue: document.querySelector("#teacherMaxTue"),
+  teacherMaxWed: document.querySelector("#teacherMaxWed"),
+  teacherMaxThu: document.querySelector("#teacherMaxThu"),
+  teacherMaxFri: document.querySelector("#teacherMaxFri"),
   refreshImports: document.querySelector("#refreshImports"),
   importList: document.querySelector("#importList"),
   currentTitle: document.querySelector("#currentTitle"),
@@ -104,6 +117,31 @@ function getAiConfig() {
   };
 }
 
+function numericOption(input, fallback) {
+  const value = Number(input?.value || fallback);
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function getSolveOptions() {
+  return {
+    assignmentMethod: els.solveMethod.value,
+    preferenceOrder: els.preferenceOrder.value,
+    iterations: numericOption(els.solveIterations, 60),
+    maxConsecutive: numericOption(els.maxConsecutive, 3),
+    balanceStrength: els.balanceStrength.value,
+    allowRelaxForUnassigned: els.allowRelaxForUnassigned.checked ? "Y" : "N",
+    protectLunch: els.protectLunch.checked ? "Y" : "N",
+    teacherDayMaxEnabled: els.teacherDayMaxEnabled.checked ? "Y" : "N",
+    teacherDayMax: {
+      월: els.teacherMaxMon.value.trim(),
+      화: els.teacherMaxTue.value.trim(),
+      수: els.teacherMaxWed.value.trim(),
+      목: els.teacherMaxThu.value.trim(),
+      금: els.teacherMaxFri.value.trim(),
+    },
+  };
+}
+
 function providerLabel(provider = els.aiProvider.value) {
   return providerDefaults[provider]?.label || provider;
 }
@@ -132,6 +170,14 @@ function updateProviderFields(forceDefault = false) {
 }
 
 function strategyName(strategy) {
+  if (strategy?.startsWith("ga-")) {
+    const labels = [];
+    if (strategy.includes("relax")) labels.push("조건완화");
+    if (strategy.includes("spread-days")) labels.push("요일균등");
+    if (strategy.includes("spread-periods")) labels.push("교시균등");
+    if (strategy.includes("special-room")) labels.push("특별실");
+    return `유전탐색${labels.length ? `: ${labels.join("/")}` : ""}`;
+  }
   return {
     balanced: "균형형",
     "gap-light": "공강 완화형",
@@ -360,7 +406,12 @@ async function solveSchedule() {
     const result = await api("/schedules/solve", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ importId: state.currentImport.id, aiConfig: getAiConfig(), apiValidated: state.apiValidated }),
+      body: JSON.stringify({
+        importId: state.currentImport.id,
+        aiConfig: getAiConfig(),
+        apiValidated: state.apiValidated,
+        solveOptions: getSolveOptions(),
+      }),
     });
     state.scheduleResult = result;
     state.selectedCandidate = result.selected;

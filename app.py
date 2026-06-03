@@ -5,6 +5,7 @@ import io
 import json
 import mimetypes
 import os
+import random
 import re
 import sys
 import uuid
@@ -1262,6 +1263,11 @@ def truthy_config(value) -> bool:
 def constraint_settings(records: dict) -> dict:
     config = records.get("config", {})
     days, _ = schedule_dimensions(records)
+    day_max = {}
+    for day in days:
+        value = parse_positive_int(config.get(f"교사{day}최대시수"))
+        if value:
+            day_max[day] = value
     return {
         "days": days,
         "lunchAfter": parse_positive_int(config.get("점심시간후교시")) or 0,
@@ -1269,7 +1275,66 @@ def constraint_settings(records: dict) -> dict:
         "maxConsecutive": parse_positive_int(config.get("최대연강허용")) or 0,
         "balanceStrength": as_text(config.get("균등분배강도")) or "soft",
         "aiPreferred": truthy_config(config.get("AI우선사용", "Y")),
+        "assignmentMethod": as_text(config.get("배정방법")) or "fixed-first",
+        "preferenceOrder": as_text(config.get("선호도순서")) or "안배>연강>식사시간",
+        "metaIterations": min(parse_positive_int(config.get("배정횟수")) or 60, 240),
+        "allowRelaxForUnassigned": truthy_config(config.get("미배정방지조건완화", "Y")),
+        "teacherDayMaxEnabled": truthy_config(config.get("교사요일최대적용", "N")),
+        "teacherDayMax": day_max,
     }
+
+
+def apply_solve_options(records: dict, options: dict | None) -> dict:
+    if not options:
+        return records
+    updates = {}
+    mapping = {
+        "assignmentMethod": "배정방법",
+        "preferenceOrder": "선호도순서",
+        "iterations": "배정횟수",
+        "allowRelaxForUnassigned": "미배정방지조건완화",
+        "teacherDayMaxEnabled": "교사요일최대적용",
+        "maxConsecutive": "최대연강허용",
+        "balanceStrength": "균등분배강도",
+        "protectLunch": "점심시간보호",
+    }
+    for source, target in mapping.items():
+        if source in options:
+            updates[target] = options[source]
+    day_max = options.get("teacherDayMax") if isinstance(options.get("teacherDayMax"), dict) else {}
+    for day, value in day_max.items():
+        if as_text(value):
+            updates[f"교사{day}최대시수"] = value
+    return records_with_config(records, updates)
+
+
+def preference_weights(settings: dict) -> dict:
+    order_text = settings.get("preferenceOrder") or ""
+    tokens = [part.strip() for part in re.split(r"[>,/]+", order_text) if part.strip()]
+    weights = {"balance": 1.8, "consecutive": 1.0, "lunch": 1.0, "sameSubject": 1.0, "dayMax": 1.0}
+    aliases = {
+        "안배": "balance",
+        "균등": "balance",
+        "평균": "balance",
+        "연강": "consecutive",
+        "3시간연속": "consecutive",
+        "식사시간": "lunch",
+        "점심": "lunch",
+        "유사과목": "sameSubject",
+        "같은날": "sameSubject",
+        "최대": "dayMax",
+    }
+    for index, token in enumerate(tokens):
+        multiplier = max(0.7, 1.9 - index * 0.25)
+        for alias, key in aliases.items():
+            if alias in token:
+                weights[key] = multiplier
+                break
+    if settings.get("balanceStrength") == "hard":
+        weights["balance"] *= 1.4
+    elif settings.get("balanceStrength") == "off":
+        weights["balance"] = 0.0
+    return weights
 
 
 def build_forbidden_index(records: dict):
@@ -1487,29 +1552,111 @@ def violates_teacher_flow(teacher_busy, teacher_code, day, periods: list[int], s
     return False
 
 
+def period_bucket(period: int) -> str:
+    if period <= 2:
+        return "1-2"
+    if period <= 4:
+        return "3-4"
+    if period <= 6:
+        return "5-6"
+    return "7+"
+
+
 def teacher_balance_penalty(teacher_busy, teacher_code, day, period, settings: dict) -> float:
     if settings.get("balanceStrength") == "off":
         return 0.0
+    weights = preference_weights(settings)
     lunch_after = settings.get("lunchAfter") or 0
     day_loads = Counter(busy_day for busy_day, _ in teacher_busy[teacher_code])
     projected_day_load = day_loads[day] + 1
     schedule_days = settings.get("days") or DEFAULT_DAYS
     average_day_load = (sum(day_loads.values()) + 1) / max(1, len(schedule_days))
-    day_penalty = abs(projected_day_load - average_day_load) * 0.45
+    day_penalty = abs(projected_day_load - average_day_load) * 1.6 * weights["balance"]
+    if len(day_loads) < len(schedule_days) and day_loads[day] > 0:
+        day_penalty += 1.2 * weights["balance"]
     day_periods = teacher_periods_for_day(teacher_busy, teacher_code, day) | {period}
     if lunch_after:
         morning = sum(1 for item in day_periods if item <= lunch_after)
         afternoon = sum(1 for item in day_periods if item > lunch_after)
-        segment_penalty = abs(morning - afternoon) * 0.35
+        segment_penalty = abs(morning - afternoon) * 1.1 * weights["balance"]
     else:
-        segment_penalty = 0.0
-    return day_penalty + segment_penalty
+        midpoint = max(1, (max(day_periods) if day_periods else period) // 2)
+        early = sum(1 for item in day_periods if item <= midpoint)
+        late = sum(1 for item in day_periods if item > midpoint)
+        segment_penalty = abs(early - late) * 0.8 * weights["balance"]
+    bucket = period_bucket(period)
+    existing_bucket_count = sum(
+        1
+        for _, existing_period in teacher_busy[teacher_code]
+        if period_bucket(existing_period) == bucket
+    )
+    bucket_penalty = existing_bucket_count * 0.45 * weights["balance"]
+    return day_penalty + segment_penalty + bucket_penalty
 
 
-def solve_greedy(records: dict, strategy: str) -> dict:
+def teacher_day_max_penalty(teacher_busy, teacher_code, day, block_size: int, settings: dict) -> float | None:
+    if not settings.get("teacherDayMaxEnabled"):
+        return 0.0
+    limit = settings.get("teacherDayMax", {}).get(day)
+    if not limit:
+        return 0.0
+    projected = teacher_day_count(teacher_busy, teacher_code, day) + block_size
+    if projected <= limit:
+        return 0.0
+    if not settings.get("allowRelaxForUnassigned"):
+        return None
+    return (projected - limit) * 4.0 * preference_weights(settings)["dayMax"]
+
+
+def teacher_distribution_metrics(schedule: dict) -> dict:
+    by_teacher = defaultdict(lambda: {"days": Counter(), "buckets": Counter(), "total": 0})
+    schedule_days = schedule.get("days", [])
+    available_buckets = sorted({period_bucket(parse_int(period) or 0) for period in schedule.get("periods", [])})
+    for class_data in schedule.get("classes", {}).values():
+        for day, periods in class_data.get("grid", {}).items():
+            for period_text, cell in periods.items():
+                if not cell or not cell.get("teacherCode") or cell.get("source") == "fixed":
+                    continue
+                period = parse_int(period_text)
+                teacher = cell["teacherCode"]
+                by_teacher[teacher]["days"][day] += 1
+                by_teacher[teacher]["buckets"][period_bucket(period or 0)] += 1
+                by_teacher[teacher]["total"] += 1
+    imbalance = 0.0
+    empty_weekdays = 0
+    for data in by_teacher.values():
+        if not data["total"]:
+            continue
+        day_counts = [data["days"].get(day, 0) for day in schedule_days]
+        if day_counts:
+            imbalance += (max(day_counts) - min(day_counts)) * 2.0
+            expected = data["total"] / max(1, len(day_counts))
+            imbalance += sum(abs(count - expected) for count in day_counts) * 0.8
+        empty_weekdays += sum(1 for count in day_counts if count == 0)
+        bucket_counts = [data["buckets"].get(bucket, 0) for bucket in available_buckets]
+        if bucket_counts:
+            imbalance += (max(bucket_counts) - min(bucket_counts)) * 1.5
+            bucket_expected = data["total"] / max(1, len(bucket_counts))
+            imbalance += sum(abs(count - bucket_expected) for count in bucket_counts) * 0.5
+    return {"imbalance": imbalance, "emptyWeekdays": empty_weekdays}
+
+
+def timetable_quality_score(candidate: dict) -> float:
+    validation = candidate.get("validation", {})
+    errors = len([item for item in validation.get("violations", []) if item.get("severity") == "error"])
+    unassigned = len(candidate.get("unassigned", []))
+    metrics = teacher_distribution_metrics(candidate.get("schedule", {}))
+    return max(0.0, 1000.0 - unassigned * 180.0 - errors * 140.0 - metrics["imbalance"] * 7.0 - metrics["emptyWeekdays"] * 12.0)
+
+
+def solve_greedy(records: dict, strategy: str, gene: dict | None = None) -> dict:
+    gene = gene or {}
+    rng = random.Random(gene.get("seed", 0)) if gene.get("seed") is not None else random.Random()
+    randomness = float(gene.get("randomness", 0.0) or 0.0)
     schedule = empty_schedule(records)
     days, max_period = schedule_dimensions(records)
     settings = constraint_settings(records)
+    weights = preference_weights(settings)
     forbidden = build_forbidden_index(records)
     teacher_busy = defaultdict(set)
     room_busy = defaultdict(set)
@@ -1520,34 +1667,57 @@ def solve_greedy(records: dict, strategy: str) -> dict:
     for load in records.get("loads", []):
         for block_size in parse_block_pattern(load.get("continuousPattern"), load["weeklyHours"]):
             blocks.append((load, block_size))
+    if strategy in {"spread-days", "spread-periods", "genetic-balanced"}:
+        blocks.sort(key=lambda item: (-item[1], item[0]["teacherCode"], item[0]["classCode"], item[0]["subjectCode"]))
+    elif strategy == "unassigned-first":
+        blocks.sort(key=lambda item: (-item[0]["weeklyHours"], -item[1], item[0]["teacherCode"]))
     if strategy == "special-room-first":
         blocks.sort(key=lambda item: (0 if item[0].get("roomCode") else 1, -item[1], item[0]["teacherCode"]))
     elif strategy == "balanced":
         blocks.sort(key=lambda item: (-item[1], item[0]["classCode"], item[0]["subjectCode"]))
-    else:
+    elif strategy == "gap-light":
         blocks.sort(key=lambda item: (item[0]["teacherCode"], -item[1], item[0]["classCode"]))
+    if randomness:
+        blocks = [item for _, item in sorted(enumerate(blocks), key=lambda pair: pair[0] + rng.random() * randomness)]
 
     for load, block_size in blocks:
         entry = entry_for_load(load, records, block_size)
         candidates = []
-        for day_index, day in enumerate(days):
-            for period in range(1, max_period + 1):
+        day_order = list(days)
+        period_order = list(range(1, max_period + 1))
+        if randomness:
+            rng.shuffle(day_order)
+            rng.shuffle(period_order)
+        for day_index, day in enumerate(day_order):
+            for period in period_order:
                 if not slot_free(schedule, load["classCode"], day, period, block_size, teacher_busy, room_busy, entry, max_period, forbidden):
                     continue
                 periods = [period + offset for offset in range(block_size)]
                 if violates_teacher_flow(teacher_busy, load["teacherCode"], day, periods, settings):
                     continue
+                day_max_penalty = teacher_day_max_penalty(teacher_busy, load["teacherCode"], day, block_size, settings)
+                if day_max_penalty is None:
+                    continue
                 same_day = day_subject_count(schedule, load["classCode"], day, load["subjectCode"])
                 teacher_load = teacher_day_count(teacher_busy, load["teacherCode"], day)
-                late_penalty = period * 0.05
+                late_penalty = abs(period - ((max_period + 1) / 2)) * 0.08
                 balance_penalty = sum(teacher_balance_penalty(teacher_busy, load["teacherCode"], day, item, settings) for item in periods)
                 constraint_penalty = sum(soft_constraint_score(records, entry, day, item, max_period) for item in periods)
+                consecutive_penalty = max_consecutive_count(teacher_periods_for_day(teacher_busy, load["teacherCode"], day) | set(periods)) * 0.2 * weights["consecutive"]
+                lunch_penalty = 0.0
+                lunch_after = settings.get("lunchAfter") or 0
+                if lunch_after and {lunch_after, lunch_after + 1}.intersection(periods):
+                    lunch_penalty = 0.35 * weights["lunch"]
                 if strategy == "gap-light":
-                    score = teacher_load * 1.2 + same_day * 2 + late_penalty + balance_penalty + constraint_penalty
+                    score = teacher_load * 1.6 + same_day * 2.2 * weights["sameSubject"] + late_penalty + balance_penalty + constraint_penalty + consecutive_penalty + lunch_penalty + (day_max_penalty or 0)
                 elif strategy == "special-room-first":
-                    score = (0 if load.get("roomCode") else 0.5) + same_day * 1.5 + day_index * 0.05 + balance_penalty + constraint_penalty
+                    score = (0 if load.get("roomCode") else 0.5) + same_day * 1.8 * weights["sameSubject"] + day_index * 0.05 + balance_penalty + constraint_penalty + consecutive_penalty + lunch_penalty + (day_max_penalty or 0)
+                elif strategy in {"spread-days", "spread-periods", "genetic-balanced"}:
+                    score = teacher_load * 2.0 + same_day * 2.6 * weights["sameSubject"] + balance_penalty * 1.5 + constraint_penalty + consecutive_penalty + lunch_penalty + (day_max_penalty or 0)
                 else:
-                    score = same_day * 2 + abs(teacher_load - 3) * 0.6 + day_index * 0.1 + late_penalty + balance_penalty + constraint_penalty
+                    score = teacher_load * 1.2 + same_day * 2.2 * weights["sameSubject"] + day_index * 0.05 + late_penalty + balance_penalty + constraint_penalty + consecutive_penalty + lunch_penalty + (day_max_penalty or 0)
+                if randomness:
+                    score += rng.uniform(-0.4, 0.4) * randomness
                 candidates.append((score, day, period))
         if not candidates:
             unassigned.append({
@@ -1563,14 +1733,19 @@ def solve_greedy(records: dict, strategy: str) -> dict:
 
     validation = validate_schedule(records, schedule, unassigned)
     diagnostics = diagnose_schedule(records, schedule, validation, unassigned)
-    return {
+    result = {
         "strategy": strategy,
         "schedule": schedule,
         "unassigned": unassigned,
         "validation": validation,
         "diagnostics": diagnostics,
-        "score": max(0, 100 - len([v for v in validation["violations"] if v["severity"] == "error"]) * 12 - len(unassigned) * 5),
+        "algorithm": "greedy-seed",
+        "gene": {key: value for key, value in gene.items() if key != "apiKey"},
+        "quality": teacher_distribution_metrics(schedule),
+        "score": 0,
     }
+    result["score"] = timetable_quality_score(result)
+    return result
 
 
 def candidate_error_count(candidate: dict) -> int:
@@ -1654,13 +1829,128 @@ def generate_ai_repair_candidates(records: dict, strict_candidates: list[dict]) 
     return repair_candidates
 
 
+def relaxation_profiles(records: dict, include_relaxations: bool = True) -> list[tuple[str, dict, list[str]]]:
+    _, max_period = schedule_dimensions(records)
+    settings = constraint_settings(records)
+    profiles = [("strict", {}, [])]
+    if not include_relaxations or not settings.get("allowRelaxForUnassigned"):
+        return profiles
+    if settings.get("maxConsecutive") and settings["maxConsecutive"] < max_period:
+        profiles.append((
+            "relax-consecutive",
+            {"최대연강허용": str(min(max_period, settings["maxConsecutive"] + 1))},
+            [f"미배정 방지를 위해 최대연강허용을 {settings['maxConsecutive']}에서 {min(max_period, settings['maxConsecutive'] + 1)}로 완화했습니다."],
+        ))
+    if settings.get("protectLunch"):
+        profiles.append((
+            "relax-lunch",
+            {"점심시간보호": "N"},
+            ["미배정 방지를 위해 점심시간보호를 N으로 완화했습니다."],
+        ))
+    if settings.get("teacherDayMaxEnabled"):
+        profiles.append((
+            "relax-day-max",
+            {"교사요일최대적용": "N"},
+            ["미배정 방지를 위해 교사 요일별 최대시수 제한을 완화했습니다."],
+        ))
+    combined = {}
+    combined_notes = []
+    for _, updates, notes in profiles[1:]:
+        combined.update(updates)
+        combined_notes.extend(notes)
+    if combined:
+        profiles.append(("relax-combined", combined, combined_notes))
+    return profiles
+
+
+def initial_genes(records: dict) -> list[dict]:
+    settings = constraint_settings(records)
+    iterations = settings.get("metaIterations") or 60
+    method = settings.get("assignmentMethod", "fixed-first")
+    strategies = ["genetic-balanced", "spread-days", "spread-periods", "balanced", "gap-light", "special-room-first", "unassigned-first"]
+    if method == "unassigned-only":
+        strategies = ["unassigned-first", "spread-days", "genetic-balanced", "balanced"]
+    elif method == "from-start":
+        strategies = ["spread-days", "spread-periods", "genetic-balanced", "balanced"]
+    genes = []
+    seed_base = 1729
+    for index in range(max(12, iterations)):
+        genes.append({
+            "seed": seed_base + index * 37,
+            "strategy": strategies[index % len(strategies)],
+            "randomness": 0.25 + (index % 7) * 0.11,
+        })
+    return genes
+
+
+def solve_gene(records: dict, gene: dict, profile: tuple[str, dict, list[str]]) -> dict:
+    profile_name, updates, relaxations = profile
+    effective_records = records_with_config(records, updates)
+    strategy = gene.get("strategy", "genetic-balanced")
+    candidate = solve_greedy(effective_records, strategy, gene=gene)
+    candidate["strategy"] = f"ga-{profile_name}-{strategy}-{gene.get('seed')}"
+    candidate["algorithm"] = "metaheuristic-genetic"
+    candidate["effectiveConfig"] = {**records.get("config", {}), **updates}
+    candidate["relaxations"] = relaxations
+    candidate["aiGenerated"] = bool(relaxations)
+    if relaxations:
+        candidate.setdefault("diagnostics", []).insert(0, {
+            "type": "relaxation",
+            "severity": "warning",
+            "title": "미배정 방지 완화",
+            "reason": " / ".join(relaxations),
+            "suggestion": "미배정을 줄이기 위한 자동 완화 후보입니다. 업무적으로 허용 가능한지 확인하세요.",
+        })
+    return candidate
+
+
+def crossover_gene(parent_a: dict, parent_b: dict, rng: random.Random, generation: int) -> dict:
+    return {
+        "seed": rng.randint(1, 1_000_000) + generation,
+        "strategy": rng.choice([parent_a.get("strategy", "genetic-balanced"), parent_b.get("strategy", "spread-days")]),
+        "randomness": max(0.05, min(1.4, (float(parent_a.get("randomness", 0.4)) + float(parent_b.get("randomness", 0.4))) / 2 + rng.uniform(-0.18, 0.18))),
+    }
+
+
+def solve_metaheuristic(records: dict, include_relaxations: bool = True) -> list[dict]:
+    settings = constraint_settings(records)
+    iterations = settings.get("metaIterations") or 60
+    rng = random.Random(20260603)
+    profiles = relaxation_profiles(records, include_relaxations=include_relaxations)
+    genes = initial_genes(records)
+    population = []
+    for gene in genes[: max(10, min(len(genes), iterations))]:
+        for profile in profiles:
+            population.append(solve_gene(records, gene, profile))
+    generations = max(3, min(10, iterations // 10))
+    for generation in range(generations):
+        elites = sorted(population, key=candidate_rank, reverse=True)[: max(4, min(10, len(population)))]
+        children = []
+        for index in range(max(6, iterations // 8)):
+            parent_a = elites[index % len(elites)].get("gene", {})
+            parent_b = elites[(index * 3 + 1) % len(elites)].get("gene", {})
+            child_gene = crossover_gene(parent_a, parent_b, rng, generation)
+            profile = profiles[index % len(profiles)]
+            children.append(solve_gene(records, child_gene, profile))
+        population = elites + children
+        if any(candidate_unassigned_count(candidate) == 0 and candidate_error_count(candidate) == 0 for candidate in elites):
+            if generation >= 2:
+                break
+    unique = {}
+    for candidate in population:
+        key = candidate.get("strategy")
+        if key not in unique or candidate_rank(candidate) > candidate_rank(unique[key]):
+            unique[key] = candidate
+    return sorted(unique.values(), key=candidate_rank, reverse=True)[:8]
+
+
 def candidate_rank(candidate: dict):
     relaxation_count = len(candidate.get("relaxations", []))
     return (
         -candidate_unassigned_count(candidate),
         -candidate_error_count(candidate),
-        candidate.get("score", 0),
         -relaxation_count,
+        candidate.get("score", 0),
     )
 
 
@@ -2078,19 +2368,22 @@ def build_ai_solve_advisor(records: dict, ai_summary: dict, ai_config=None) -> d
     }
 
 
-def solve_schedule(records: dict, api_key: str = "", ai_config=None) -> dict:
+def solve_schedule(records: dict, api_key: str = "", ai_config=None, solve_options: dict | None = None) -> dict:
+    records = apply_solve_options(records, solve_options)
     config = normalize_ai_config(ai_config, api_key=api_key)
     strict_candidates = [
-        solve_greedy(records, "balanced"),
-        solve_greedy(records, "gap-light"),
-        solve_greedy(records, "special-room-first"),
+        solve_greedy(records, "balanced", gene={"seed": 11, "randomness": 0.0, "strategy": "balanced"}),
+        solve_greedy(records, "gap-light", gene={"seed": 17, "randomness": 0.0, "strategy": "gap-light"}),
+        solve_greedy(records, "special-room-first", gene={"seed": 23, "randomness": 0.0, "strategy": "special-room-first"}),
     ]
     for candidate in strict_candidates:
         candidate.setdefault("relaxations", [])
         candidate.setdefault("effectiveConfig", records.get("config", {}))
         candidate.setdefault("aiGenerated", False)
+    needs_relaxation = needs_repair_candidates(strict_candidates)
     repair_candidates = generate_ai_repair_candidates(records, strict_candidates)
-    candidates = strict_candidates + repair_candidates
+    genetic_candidates = solve_metaheuristic(records, include_relaxations=needs_relaxation)
+    candidates = strict_candidates + repair_candidates + genetic_candidates
     best = max(candidates, key=candidate_rank)
     ai_summary = summarize_candidate_for_ai(best)
     result = {
@@ -2103,7 +2396,13 @@ def solve_schedule(records: dict, api_key: str = "", ai_config=None) -> dict:
         "repairSummary": {
             "strictCandidateCount": len(strict_candidates),
             "repairCandidateCount": len(repair_candidates),
+            "geneticCandidateCount": len(genetic_candidates),
             "selectedRelaxations": best.get("relaxations", []),
+        },
+        "solver": {
+            "algorithm": "metaheuristic-genetic",
+            "objective": "미배정과 hard 검증 오류를 최우선으로 줄이고, 교사별 요일/오전오후 균등성을 최적화합니다.",
+            "options": {key: value for key, value in (solve_options or {}).items() if key != "apiKey"},
         },
     }
     LAST_SCHEDULE_FILE.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -2676,7 +2975,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 if records is None:
                     self.send_json({"error": "importId 또는 records가 필요합니다."}, status=400)
                     return
-                self.send_json(solve_schedule(records, ai_config=ai_config_from_body(body, require_validated=True)))
+                self.send_json(solve_schedule(records, ai_config=ai_config_from_body(body, require_validated=True), solve_options=body.get("solveOptions")))
                 return
             if path == "/schedules/validate":
                 body = read_json_body(self)

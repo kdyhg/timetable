@@ -62,6 +62,60 @@
             업로드 및 검증
           </button>
           </div>
+          <div class="start-step">
+            <div class="step-heading">
+              <strong>3. 자동배정 선호도</strong>
+              <span class="badge">메타휴리스틱</span>
+            </div>
+            <label class="field-label" for="solveMethod">배정 방법</label>
+            <select id="solveMethod" class="select">
+              <option value="fixed-first">고정 수업 유지 후 전체 배정</option>
+              <option value="from-start">처음부터 다시 탐색</option>
+              <option value="unassigned-only">미배정 우선 탐색</option>
+            </select>
+            <label class="field-label" for="preferenceOrder">선호도 순서</label>
+            <select id="preferenceOrder" class="select">
+              <option value="안배>연강>식사시간">안배 > 연강 > 식사시간</option>
+              <option value="연강>안배>식사시간">연강 > 안배 > 식사시간</option>
+              <option value="식사시간>안배>연강">식사시간 > 안배 > 연강</option>
+              <option value="안배>식사시간>연강">안배 > 식사시간 > 연강</option>
+            </select>
+            <div class="preference-grid">
+              <label>
+                <span>배정횟수</span>
+                <input id="solveIterations" class="input compact" type="number" min="12" max="240" value="60" />
+              </label>
+              <label>
+                <span>최대연강</span>
+                <input id="maxConsecutive" class="input compact" type="number" min="0" max="9" value="3" />
+              </label>
+            </div>
+            <label class="field-label" for="balanceStrength">균등분배 강도</label>
+            <select id="balanceStrength" class="select">
+              <option value="hard">강하게</option>
+              <option value="soft" selected>보통</option>
+              <option value="off">끄기</option>
+            </select>
+            <label class="checkbox-row">
+              <input id="allowRelaxForUnassigned" type="checkbox" checked />
+              <span>미배정 방지를 위해 낮은 우선순위 조건 완화</span>
+            </label>
+            <label class="checkbox-row">
+              <input id="protectLunch" type="checkbox" checked />
+              <span>점심 전후 연속 회피</span>
+            </label>
+            <label class="checkbox-row">
+              <input id="teacherDayMaxEnabled" type="checkbox" />
+              <span>교사 요일별 최대시수 적용</span>
+            </label>
+            <div class="day-limit-grid" aria-label="교사 요일별 최대시수">
+              <label><span>월</span><input id="teacherMaxMon" class="input compact" type="number" min="0" /></label>
+              <label><span>화</span><input id="teacherMaxTue" class="input compact" type="number" min="0" /></label>
+              <label><span>수</span><input id="teacherMaxWed" class="input compact" type="number" min="0" /></label>
+              <label><span>목</span><input id="teacherMaxThu" class="input compact" type="number" min="0" /></label>
+              <label><span>금</span><input id="teacherMaxFri" class="input compact" type="number" min="0" /></label>
+            </div>
+          </div>
         </section>
 
         <section class="panel">
@@ -85,6 +139,10 @@
               <span class="button-icon">▶</span>
               AI 자동배정
             </button>
+            <a class="button ghost" href="#manualEditPanel">
+              <span class="button-icon">↔</span>
+              수동 수정
+            </a>
             <a id="excelExport" class="button ghost disabled" href="/exports/excel">
               <span class="button-icon">↓</span>
               결과 엑셀
@@ -130,6 +188,13 @@
           </div>
           <div id="scheduleBoard" class="schedule-board"></div>
           <div id="diagnosticPanel" class="diagnostic-panel"></div>
+        </section>
+
+        <section id="manualEditPanel" class="panel manual-panel">
+          <div class="panel-heading">
+            <h2>수동 수정</h2>
+            <span class="badge">이동/맞교환</span>
+          </div>
           <div class="manual-move">
             <select id="moveMode" class="select compact">
               <option value="auto">자동</option>

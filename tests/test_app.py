@@ -51,6 +51,20 @@ class TimetableAppTests(unittest.TestCase):
         self.assertLess(key_index, drop_index)
         self.assertGreater(solve_status_index, drop_index)
 
+    def test_solve_preferences_and_manual_edit_are_visible(self):
+        html = (app_module.ROOT / "web" / "index.html").read_text(encoding="utf-8")
+        script = (app_module.ROOT / "web" / "app.js").read_text(encoding="utf-8")
+        preference_index = html.index("자동배정 선호도")
+        manual_link_index = html.index('href="#manualEditPanel"')
+        manual_panel_index = html.index('id="manualEditPanel"')
+        self.assertIn('id="solveMethod"', html)
+        self.assertIn('id="preferenceOrder"', html)
+        self.assertIn('id="allowRelaxForUnassigned"', html)
+        self.assertLess(preference_index, manual_panel_index)
+        self.assertLess(manual_link_index, manual_panel_index)
+        self.assertIn("function getSolveOptions()", script)
+        self.assertIn("solveOptions: getSolveOptions()", script)
+
     def test_parse_days_accepts_common_weekday_formats(self):
         expected = ["월", "화", "수", "목", "금"]
         self.assertEqual(parse_days("월,화,수,목,금"), expected)
@@ -116,6 +130,8 @@ class TimetableAppTests(unittest.TestCase):
 
         result = solve_schedule(validation["records"])
         selected = result["selected"]
+        self.assertEqual(result["solver"]["algorithm"], "metaheuristic-genetic")
+        self.assertGreater(result["repairSummary"]["geneticCandidateCount"], 0)
         self.assertEqual(selected["unassigned"], [])
         assigned = 0
         for class_code in ["C001", "C002"]:
@@ -209,6 +225,38 @@ class TimetableAppTests(unittest.TestCase):
         off_penalty = teacher_balance_penalty(teacher_busy, "T001", "월", 3, {**settings, "balanceStrength": "off"})
         self.assertGreater(soft_penalty, 0)
         self.assertEqual(off_penalty, 0)
+
+    def test_metaheuristic_solver_spreads_teacher_load_across_weekdays(self):
+        workbook = create_template_workbook()
+        set_config_value(workbook, "점심시간보호", "N")
+        set_config_value(workbook, "최대연강허용", "7")
+        append_named_row(workbook, "교사", {"교사명": "김교사"})
+        append_named_row(workbook, "학급-계열", {"학급명": "1-1", "학년": "1", "계열": "공통", "담임교사명": "김교사", "가상학급여부": "N"})
+        append_named_row(workbook, "과목", {"과목명": "국어", "단축명": "국", "NEIS과목명": "국어"})
+        append_named_row(workbook, "교사별 시수표", {"교사명": "김교사", "과목명": "국어"})
+        load_sheet = workbook["교사별 시수표"]
+        class_start = len(SPECS_BY_NAME["교사별 시수표"]) + 1
+        load_sheet.cell(row=1, column=class_start).value = "1-1"
+        load_sheet.cell(row=load_sheet.max_row, column=class_start).value = 20
+        validation = validate_workbook(workbook)
+        self.assertTrue(validation["ok"])
+
+        result = solve_schedule(validation["records"], solve_options={
+            "balanceStrength": "hard",
+            "iterations": 18,
+            "maxConsecutive": 7,
+            "protectLunch": "N",
+            "preferenceOrder": "안배>연강>식사시간",
+        })
+        selected = result["selected"]
+        self.assertEqual(selected["unassigned"], [])
+        grid = selected["schedule"]["classes"]["C001"]["grid"]
+        counts = {
+            day: sum(1 for period in selected["schedule"]["periods"] if grid[day][str(period)] and grid[day][str(period)].get("source") == "auto")
+            for day in selected["schedule"]["days"]
+        }
+        self.assertEqual(set(day for day, count in counts.items() if count), set(selected["schedule"]["days"]))
+        self.assertLessEqual(max(counts.values()) - min(counts.values()), 1)
 
     def test_fixed_periods_block_auto_assignment_without_counting_load(self):
         workbook = create_template_workbook()
