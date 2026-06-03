@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AI 공동작성 시간표</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">T</div>
+          <div>
+            <h1>AI 공동작성 시간표</h1>
+            <p>엑셀 입력, 검증, 자동배정, AI 제안을 한 흐름으로 처리합니다.</p>
+          </div>
+        </div>
+
+        <section class="panel start-panel">
+          <div class="panel-heading">
+            <h2>시작</h2>
+            <span id="healthBadge" class="badge">확인 중</span>
+          </div>
+          <div class="start-step">
+            <div class="step-heading">
+              <strong>1. AI 연결</strong>
+              <span id="apiProviderBadge" class="badge muted">미검증</span>
+            </div>
+            <label class="field-label" for="aiProvider">AI 제공자</label>
+            <select id="aiProvider" class="select">
+              <option value="openai">OpenAI</option>
+              <option value="gemini">Gemini</option>
+              <option value="custom">Custom OpenAI-compatible</option>
+            </select>
+            <label class="field-label" for="aiModel">모델명</label>
+            <input id="aiModel" class="input" type="text" autocomplete="off" value="gpt-5.2" />
+            <label id="aiBaseUrlLabel" class="field-label hidden" for="aiBaseUrl">Base URL</label>
+            <input id="aiBaseUrl" class="input hidden" type="url" autocomplete="off" placeholder="https://example.com/v1" />
+            <label class="field-label" for="apiKey">API 키</label>
+            <div class="api-row">
+              <input id="apiKey" class="input" type="password" autocomplete="off" placeholder="API 키 입력 후 검증" />
+              <button id="apiCheckButton" class="button" type="button">검증</button>
+            </div>
+            <div id="apiStatus" class="status-line error">AI 자동배정을 하려면 API 키 검증이 필요합니다.</div>
+          </div>
+          <div class="start-step">
+            <div class="step-heading">
+              <strong>2. 엑셀 입력</strong>
+            </div>
+          <a class="button primary full" href="/templates/timetable-input.xlsx">
+            <span class="button-icon">↓</span>
+            통합 엑셀 양식
+          </a>
+          <label class="file-drop" for="uploadInput">
+            <input id="uploadInput" type="file" accept=".xlsx,.xlsm" />
+            <span>작성한 엑셀 첨부</span>
+            <small id="selectedFileName">선택된 파일 없음</small>
+          </label>
+          <button id="uploadButton" class="button full" type="button" disabled>
+            <span class="button-icon">↥</span>
+            업로드 및 검증
+          </button>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-heading">
+            <h2>업로드 이력</h2>
+            <button id="refreshImports" class="icon-button" title="이력 새로고침" type="button">↻</button>
+          </div>
+          <div id="importList" class="history-list"></div>
+        </section>
+      </aside>
+
+      <main class="workspace">
+        <div class="toolbar">
+          <div>
+            <h2 id="currentTitle">자료를 업로드하세요</h2>
+            <p id="currentSubtitle">빈 양식은 구조 검증을 통과하며, 실제 자동배정은 시수표 입력 후 가능합니다.</p>
+          </div>
+          <div class="toolbar-actions">
+            <span id="solveStatus" class="badge muted">API 미검증</span>
+            <button id="solveButton" class="button primary" type="button" disabled>
+              <span class="button-icon">▶</span>
+              AI 자동배정
+            </button>
+            <a id="excelExport" class="button ghost disabled" href="/exports/excel">
+              <span class="button-icon">↓</span>
+              결과 엑셀
+            </a>
+            <a id="neisExport" class="button ghost disabled" href="/exports/neis">
+              <span class="button-icon">↓</span>
+              NEIS 파일
+            </a>
+          </div>
+        </div>
+
+        <section class="metrics" id="metrics"></section>
+
+        <section class="content-grid">
+          <div class="panel wide">
+            <div class="panel-heading">
+              <h2>검증 결과</h2>
+              <a id="reportLink" class="link-button disabled" href="#">오류 리포트</a>
+            </div>
+            <div id="validationState" class="empty-state">업로드한 엑셀의 오류 셀, 원인, 수정 가이드가 여기에 표시됩니다.</div>
+            <div id="issueTable" class="issue-table"></div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-heading">
+              <h2>후보 시간표</h2>
+              <span id="candidateBadge" class="badge muted">대기</span>
+            </div>
+            <div id="candidateList" class="candidate-list"></div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-heading">
+            <h2>시간표 보기</h2>
+            <div class="view-controls">
+              <select id="viewMode" class="select compact">
+                <option value="class">학급별</option>
+                <option value="teacher">교사별</option>
+              </select>
+              <select id="classSelect" class="select"></select>
+            </div>
+          </div>
+          <div id="scheduleBoard" class="schedule-board"></div>
+          <div id="diagnosticPanel" class="diagnostic-panel"></div>
+          <div class="manual-move">
+            <select id="moveMode" class="select compact">
+              <option value="auto">자동</option>
+              <option value="move">빈칸 이동</option>
+              <option value="swap">맞교환</option>
+            </select>
+            <select id="moveClass" class="select compact"></select>
+            <select id="moveFromDay" class="select compact"></select>
+            <input id="moveFromPeriod" class="input compact" type="number" min="1" placeholder="현재" />
+            <select id="moveToDay" class="select compact"></select>
+            <input id="moveToPeriod" class="input compact" type="number" min="1" placeholder="이동" />
+            <button id="moveButton" class="button" type="button">이동</button>
+          </div>
+        </section>
+
+        <section class="content-grid bottom">
+          <div class="panel">
+            <div class="panel-heading">
+              <h2>AI 공동작성</h2>
+              <span class="badge">마스킹</span>
+            </div>
+            <div id="chatAiStatus" class="status-line">왼쪽 시작 패널에서 AI 키를 먼저 검증하세요.</div>
+            <div id="chatLog" class="chat-log"></div>
+            <div class="chat-form">
+              <textarea id="chatMessage" class="textarea" rows="3" placeholder="예: 금요일 6교시는 T001 교사를 배정하지 말아줘."></textarea>
+              <button id="chatButton" class="button primary" type="button">
+                <span class="button-icon">↵</span>
+                제안 받기
+              </button>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-heading">
+              <h2>운영 상태</h2>
+              <span class="badge muted">프로토타입</span>
+            </div>
+            <div id="systemLog" class="system-log"></div>
+          </div>
+        </section>
+      </main>
+    </div>
+    <script src="/app.js"></script>
+  </body>
+</html>
