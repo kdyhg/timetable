@@ -10,6 +10,7 @@ const state = {
   chatConstraints: [],
   pendingConstraintDrafts: [],
   activeTab: "overview",
+  startStep: "api",
   apiValidated: false,
   validatedAiConfig: null,
 };
@@ -42,6 +43,7 @@ const els = {
   currentTitle: document.querySelector("#currentTitle"),
   currentSubtitle: document.querySelector("#currentSubtitle"),
   solveButton: document.querySelector("#solveButton"),
+  startSolveButton: document.querySelector("#startSolveButton"),
   solveStatus: document.querySelector("#solveStatus"),
   excelExport: document.querySelector("#excelExport"),
   neisExport: document.querySelector("#neisExport"),
@@ -78,6 +80,11 @@ const els = {
   chatMessage: document.querySelector("#chatMessage"),
   chatButton: document.querySelector("#chatButton"),
   chatConstraintList: document.querySelector("#chatConstraintList"),
+  startStepBadge: document.querySelector("#startStepBadge"),
+  initialConstraintText: document.querySelector("#initialConstraintText"),
+  initialConstraintButton: document.querySelector("#initialConstraintButton"),
+  initialConstraintStatus: document.querySelector("#initialConstraintStatus"),
+  skipConstraintButton: document.querySelector("#skipConstraintButton"),
   systemLog: document.querySelector("#systemLog"),
 };
 
@@ -225,6 +232,24 @@ function setExportsEnabled(enabled) {
   }
 }
 
+const startSteps = ["api", "excel", "constraints", "preferences"];
+
+function setStartStep(stepName) {
+  const step = startSteps.includes(stepName) ? stepName : "api";
+  state.startStep = step;
+  const stepIndex = startSteps.indexOf(step);
+  for (const panel of document.querySelectorAll("[data-start-step]")) {
+    panel.classList.toggle("active", panel.dataset.startStep === step);
+  }
+  for (const item of document.querySelectorAll("[data-progress-step]")) {
+    const index = startSteps.indexOf(item.dataset.progressStep);
+    item.classList.toggle("active", index <= stepIndex);
+  }
+  if (els.startStepBadge) {
+    els.startStepBadge.textContent = `${stepIndex + 1}/4`;
+  }
+}
+
 function updateSolveAvailability() {
   let status = "API 미검증";
   let enabled = false;
@@ -241,6 +266,10 @@ function updateSolveAvailability() {
   }
   els.solveButton.disabled = !enabled;
   els.solveButton.title = enabled ? "" : status;
+  if (els.startSolveButton) {
+    els.startSolveButton.disabled = !enabled;
+    els.startSolveButton.title = enabled ? "" : status;
+  }
   if (els.solveStatus) {
     els.solveStatus.textContent = status;
     els.solveStatus.classList.toggle("muted", !enabled);
@@ -262,6 +291,7 @@ function requestBasePayload() {
   return {
     importId: item?.id || storageGet(STORAGE_KEYS.importId) || null,
     fallbackLatestImport: true,
+    fallbackLastSchedule: true,
     chatConstraints: state.chatConstraints,
   };
 }
@@ -403,6 +433,7 @@ async function uploadWorkbook() {
     const item = { ...result, reportUrl: result.reportUrl };
     state.imports = [item, ...state.imports.filter((existing) => existing.id !== item.id)];
     renderCurrentImport(item);
+    if (result.ok) setStartStep("constraints");
     log(`엑셀 검증 완료: ${result.ok ? "통과" : "오류 있음"}`);
   } catch (error) {
     log(error.message);
@@ -931,6 +962,43 @@ function removeChatConstraint(index) {
   if (removed) log(`대화 제약 해제: ${constraintLabel(removed)}`);
 }
 
+async function createInitialConstraintDraft() {
+  const message = els.initialConstraintText?.value.trim() || "";
+  if (!message) {
+    setStartStep("preferences");
+    return;
+  }
+  if (els.initialConstraintButton) els.initialConstraintButton.disabled = true;
+  if (els.initialConstraintStatus) els.initialConstraintStatus.textContent = "AI 제약 초안 생성 중";
+  try {
+    const response = await api("/ai/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ...requestBasePayload(),
+        message,
+        aiConfig: getAiConfig(),
+        apiValidated: state.apiValidated,
+        solveOptions: getSolveOptions(),
+      }),
+    });
+    if (response.constraintDrafts?.length) {
+      state.pendingConstraintDrafts = response.constraintDrafts;
+      renderChatConstraints();
+      appendChat("assistant", "시작 단계에서 입력한 조건으로 AI 제약 초안을 만들었습니다. 오른쪽 목록에서 적용할 수 있습니다.");
+      if (els.initialConstraintStatus) els.initialConstraintStatus.textContent = `제약 초안 ${response.constraintDrafts.length}개 생성`;
+    } else if (els.initialConstraintStatus) {
+      els.initialConstraintStatus.textContent = "적용 가능한 제약 초안을 찾지 못했습니다. 선호도 설정으로 이동합니다.";
+    }
+    setStartStep("preferences");
+  } catch (error) {
+    if (els.initialConstraintStatus) els.initialConstraintStatus.textContent = error.message;
+    log(error.message);
+  } finally {
+    if (els.initialConstraintButton) els.initialConstraintButton.disabled = false;
+  }
+}
+
 async function sendChat() {
   const message = els.chatMessage.value.trim();
   if (!message) return;
@@ -997,6 +1065,7 @@ async function validateApiKey() {
     if (els.chatAiStatus) {
       els.chatAiStatus.textContent = result.ok ? `${providerLabel()} 연결이 검증되었습니다.` : "왼쪽 시작 패널에서 AI 키를 먼저 검증하세요.";
     }
+    if (result.ok) setStartStep("excel");
     log(result.message);
     updateSolveAvailability();
   } catch (error) {
@@ -1057,6 +1126,9 @@ function wireEvents() {
   els.uploadButton.addEventListener("click", uploadWorkbook);
   els.refreshImports.addEventListener("click", () => loadImports().catch((error) => log(error.message)));
   els.solveButton.addEventListener("click", solveSchedule);
+  els.startSolveButton?.addEventListener("click", solveSchedule);
+  els.initialConstraintButton?.addEventListener("click", createInitialConstraintDraft);
+  els.skipConstraintButton?.addEventListener("click", () => setStartStep("preferences"));
   els.importList.addEventListener("click", (event) => {
     const button = event.target.closest("[data-import-id]");
     if (!button) return;
@@ -1131,6 +1203,7 @@ async function boot() {
   renderQuickMoveList();
   renderChatConstraints();
   setActiveTab("overview");
+  setStartStep("api");
   updateProviderFields(false);
   appendChat("assistant", "엑셀에는 이름으로 입력하세요. 저는 서버가 자동 코드화한 자료만 보고 제안합니다.");
   wireEvents();

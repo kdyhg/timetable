@@ -1650,6 +1650,17 @@ def get_records_from_body(body: dict) -> dict | None:
     return records
 
 
+def get_schedule_from_body(body: dict) -> dict | None:
+    schedule = body.get("schedule")
+    if schedule:
+        return schedule
+    if body.get("fallbackLastSchedule"):
+        result = load_last_schedule() or {}
+        selected = result.get("selected", {})
+        return selected.get("schedule")
+    return None
+
+
 def latest_import_records() -> dict | None:
     for item in list_imports():
         metadata = load_import(item.get("id", ""))
@@ -3057,15 +3068,22 @@ def validate_schedule(records: dict, schedule: dict, unassigned=None) -> dict:
                 "message": f"특별실 {display_name(records, '특별실', room)}이 {day} {period}교시에 {', '.join(display_names(records, '학급', classes))}에 중복 배정되었습니다.",
             })
 
+    expected_counts = Counter()
+    load_display = {}
     for load in records.get("loads", []):
         key = (load["teacherCode"], load["subjectCode"], load["classCode"])
+        expected_counts[key] += load["weeklyHours"]
+        load_display[key] = load
+    for key, expected in expected_counts.items():
+        teacher_code, subject_code, class_code = key
         actual = counts[key]
-        if actual != load["weeklyHours"]:
-            severity = "error" if actual < load["weeklyHours"] else "warning"
+        if actual != expected:
+            severity = "error" if actual < expected else "warning"
+            load = load_display[key]
             violations.append({
                 "severity": severity,
                 "type": "load_mismatch",
-                "message": f"{display_name(records, '교사', load['teacherCode'])} / {display_name(records, '과목', load['subjectCode'])} / {display_name(records, '학급', load['classCode'])} 시수 {load['weeklyHours']} 중 {actual}시간 배정되었습니다.",
+                "message": f"{display_name(records, '교사', teacher_code)} / {display_name(records, '과목', subject_code)} / {display_name(records, '학급', class_code)} 시수 {expected} 중 {actual}시간 배정되었습니다.",
             })
 
     for item in unassigned:
@@ -3128,10 +3146,25 @@ def move_schedule(records: dict, schedule: dict, move: dict) -> dict:
     }
 
 
-def move_option_reason(result: dict, delta: float, mode: str) -> list[str]:
+def violation_signature(violation: dict) -> tuple:
+    return (
+        violation.get("severity", ""),
+        violation.get("type", ""),
+        violation.get("message", ""),
+    )
+
+
+def hard_error_signatures(validation: dict) -> set[tuple]:
+    return {
+        violation_signature(item)
+        for item in validation.get("violations", [])
+        if item.get("severity") == "error"
+    }
+
+
+def move_option_reason(result: dict, delta: float, mode: str, new_errors: list[dict] | None = None) -> list[str]:
     reasons = ["맞교환" if mode == "swap" else "빈칸"]
-    violations = result.get("validation", {}).get("violations", [])
-    errors = [item for item in violations if item.get("severity") == "error"]
+    errors = new_errors if new_errors is not None else [item for item in result.get("validation", {}).get("violations", []) if item.get("severity") == "error"]
     if errors:
         reason_map = {
             "teacher_conflict": "교사중복",
@@ -3169,6 +3202,8 @@ def quick_move_options(records: dict, schedule: dict, source: dict) -> dict:
         return {"ok": False, "message": "고정 일과는 간편수정 대상이 아닙니다.", "options": []}
 
     base_metrics = teacher_distribution_metrics(schedule)
+    base_validation = validate_schedule(records, schedule)
+    base_error_signatures = hard_error_signatures(base_validation)
     options = []
     for day in schedule.get("days", []):
         for period in schedule.get("periods", []):
@@ -3196,7 +3231,9 @@ def quick_move_options(records: dict, schedule: dict, source: dict) -> dict:
                     "target": target_cell,
                 })
                 continue
-            errors = len([item for item in result["validation"].get("violations", []) if item.get("severity") == "error"])
+            candidate_errors = [item for item in result["validation"].get("violations", []) if item.get("severity") == "error"]
+            new_errors = [item for item in candidate_errors if violation_signature(item) not in base_error_signatures]
+            errors = len(new_errors)
             after_metrics = teacher_distribution_metrics(result["schedule"])
             delta = base_metrics.get("imbalance", 0) - after_metrics.get("imbalance", 0)
             if errors:
@@ -3217,15 +3254,16 @@ def quick_move_options(records: dict, schedule: dict, source: dict) -> dict:
                 "mode": mode,
                 "grade": grade,
                 "score": score,
-                "reasons": move_option_reason(result, delta, mode),
+                "reasons": move_option_reason(result, delta, mode, new_errors),
                 "target": target_cell,
-                "errorCount": errors,
+                "errorCount": len(candidate_errors),
+                "newErrorCount": errors,
             })
     return {
         "ok": True,
         "source": {"classCode": class_code, "day": src_day, "period": parse_int(src_period), "cell": source_cell},
         "options": sorted(options, key=lambda item: (-item["score"], item["day"], item["period"])),
-        "teacherIssues": teacher_issue_summary(records, schedule, validate_schedule(records, schedule)),
+        "teacherIssues": teacher_issue_summary(records, schedule, base_validation),
     }
 
 
@@ -3879,7 +3917,7 @@ class AppHandler(BaseHTTPRequestHandler):
             if path == "/schedules/validate":
                 body = read_json_body(self)
                 records = get_records_from_body(body)
-                schedule = body.get("schedule")
+                schedule = get_schedule_from_body(body)
                 if records is None or schedule is None:
                     self.send_json({"error": "records/importId와 schedule이 필요합니다."}, status=400)
                     return
@@ -3888,7 +3926,7 @@ class AppHandler(BaseHTTPRequestHandler):
             if path == "/schedules/move-options":
                 body = read_json_body(self)
                 records = get_records_from_body(body)
-                schedule = body.get("schedule")
+                schedule = get_schedule_from_body(body)
                 source = body.get("from", {})
                 if records is None or schedule is None:
                     self.send_json({"error": "records/importId와 schedule이 필요합니다."}, status=400)
@@ -3898,7 +3936,7 @@ class AppHandler(BaseHTTPRequestHandler):
             if path == "/schedules/move":
                 body = read_json_body(self)
                 records = get_records_from_body(body)
-                schedule = body.get("schedule")
+                schedule = get_schedule_from_body(body)
                 move = body.get("move", {})
                 if records is None or schedule is None:
                     self.send_json({"error": "records/importId와 schedule이 필요합니다."}, status=400)

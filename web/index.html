@@ -20,9 +20,16 @@
         <section class="panel start-panel">
           <div class="panel-heading">
             <h2>시작</h2>
-            <span id="healthBadge" class="badge">확인 중</span>
+            <span id="startStepBadge" class="badge">1/4</span>
           </div>
-          <div class="start-step">
+          <div class="start-progress" aria-hidden="true">
+            <span class="active" data-progress-step="api"></span>
+            <span data-progress-step="excel"></span>
+            <span data-progress-step="constraints"></span>
+            <span data-progress-step="preferences"></span>
+          </div>
+          <div class="status-line">서버 <span id="healthBadge">확인 중</span></div>
+          <div class="start-step active" data-start-step="api">
             <div class="step-heading">
               <strong>1. AI 연결</strong>
               <span id="apiProviderBadge" class="badge muted">미검증</span>
@@ -44,27 +51,39 @@
             </div>
             <div id="apiStatus" class="status-line error">AI 자동배정을 하려면 API 키 검증이 필요합니다.</div>
           </div>
-          <div class="start-step">
+          <div class="start-step" data-start-step="excel">
             <div class="step-heading">
               <strong>2. 엑셀 입력</strong>
             </div>
-          <a class="button primary full" href="/templates/timetable-input.xlsx">
-            <span class="button-icon">↓</span>
-            통합 엑셀 양식
-          </a>
-          <label class="file-drop" for="uploadInput">
-            <input id="uploadInput" type="file" accept=".xlsx,.xlsm" />
-            <span>작성한 엑셀 첨부</span>
-            <small id="selectedFileName">선택된 파일 없음</small>
-          </label>
-          <button id="uploadButton" class="button full" type="button" disabled>
-            <span class="button-icon">↥</span>
-            업로드 및 검증
-          </button>
+            <a class="button primary full" href="/templates/timetable-input.xlsx">
+              <span class="button-icon">↓</span>
+              통합 엑셀 양식
+            </a>
+            <label class="file-drop" for="uploadInput">
+              <input id="uploadInput" type="file" accept=".xlsx,.xlsm" />
+              <span>작성한 엑셀 첨부</span>
+              <small id="selectedFileName">선택된 파일 없음</small>
+            </label>
+            <button id="uploadButton" class="button full" type="button" disabled>
+              <span class="button-icon">↥</span>
+              업로드 및 검증
+            </button>
           </div>
-          <div class="start-step">
+          <div class="start-step" data-start-step="constraints">
             <div class="step-heading">
-              <strong>3. 자동배정 선호도</strong>
+              <strong>3. 말로 제약 설명</strong>
+              <span class="badge muted">선택</span>
+            </div>
+            <textarea id="initialConstraintText" class="textarea" rows="4" placeholder="예: 김교사 금요일 6교시는 배정하지 말아줘. 특별실 체육관은 월요일 1교시 피하고 싶어."></textarea>
+            <div id="initialConstraintStatus" class="status-line">엑셀로 쓰기 어려운 조건을 말로 적으면 AI 제약 초안을 만듭니다.</div>
+            <div class="step-actions">
+              <button id="initialConstraintButton" class="button" type="button">AI 제약 초안 만들기</button>
+              <button id="skipConstraintButton" class="button ghost" type="button">건너뛰기</button>
+            </div>
+          </div>
+          <div class="start-step" data-start-step="preferences">
+            <div class="step-heading">
+              <strong>4. 자동배정 선호도</strong>
               <span class="badge">메타휴리스틱</span>
             </div>
             <label class="field-label" for="solveMethod">배정 방법</label>
@@ -117,6 +136,10 @@
               <label><span>목</span><input id="teacherMaxThu" class="input compact" type="number" min="0" /></label>
               <label><span>금</span><input id="teacherMaxFri" class="input compact" type="number" min="0" /></label>
             </div>
+            <button id="startSolveButton" class="button primary full" type="button">
+              <span class="button-icon">▶</span>
+              AI 자동배정
+            </button>
           </div>
         </section>
 

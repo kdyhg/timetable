@@ -52,6 +52,12 @@ class TimetableAppTests(unittest.TestCase):
         self.assertLess(provider_index, drop_index)
         self.assertLess(key_index, drop_index)
         self.assertGreater(solve_status_index, drop_index)
+        self.assertIn('data-start-step="api"', html)
+        self.assertIn('data-start-step="excel"', html)
+        self.assertIn('data-start-step="constraints"', html)
+        self.assertIn('data-start-step="preferences"', html)
+        self.assertIn('id="initialConstraintText"', html)
+        self.assertIn('id="startSolveButton"', html)
 
     def test_solve_preferences_and_manual_edit_are_visible(self):
         html = (app_module.ROOT / "web" / "index.html").read_text(encoding="utf-8")
@@ -79,6 +85,9 @@ class TimetableAppTests(unittest.TestCase):
         self.assertIn("function setActiveTab", script)
         self.assertIn("chatConstraints: state.chatConstraints", script)
         self.assertIn("fallbackLatestImport: true", script)
+        self.assertIn("fallbackLastSchedule: true", script)
+        self.assertIn("function setStartStep", script)
+        self.assertIn("createInitialConstraintDraft", script)
         self.assertIn("response.scheduleResult", script)
         self.assertIn("applyScheduleResult(response.scheduleResult", script)
         self.assertIn("document.addEventListener(\"keydown\", handleQuickEditKeydown)", script)
@@ -436,6 +445,12 @@ class TimetableAppTests(unittest.TestCase):
                 loaded = app_module.get_records_from_body({"fallbackLatestImport": True})
         self.assertEqual(loaded["teachers"]["T001"]["교사명"], "김교사")
 
+    def test_schedule_from_body_can_fallback_to_last_schedule(self):
+        schedule = {"days": ["월"], "periods": [1], "classes": {}}
+        with patch.object(app_module, "load_last_schedule", lambda: {"selected": {"schedule": schedule}}):
+            loaded = app_module.get_schedule_from_body({"fallbackLastSchedule": True})
+        self.assertEqual(loaded["days"], ["월"])
+
     def test_ai_chat_uses_remote_advice_when_validated_key_is_sent(self):
         records = {
             "config": {},
@@ -789,6 +804,48 @@ class TimetableAppTests(unittest.TestCase):
         self.assertIn(options["options"][0]["grade"], {"good", "ok", "warn", "bad"})
         self.assertIn(options["options"][0]["mode"], {"move", "swap"})
         self.assertIn("teacherIssues", options)
+
+    def test_quick_move_options_do_not_mark_existing_errors_as_new_bad_moves(self):
+        workbook = create_template_workbook()
+        set_config_value(workbook, "점심시간보호", "N")
+        set_config_value(workbook, "최대연강허용", "1")
+        append_named_row(workbook, "교사", {"교사명": "김교사"})
+        append_named_row(workbook, "학급-계열", {"학급명": "1-1", "학년": "1", "계열": "공통", "담임교사명": "김교사", "가상학급여부": "N"})
+        append_named_row(workbook, "과목", {"과목명": "국어", "단축명": "국", "NEIS과목명": "국어"})
+        append_named_row(workbook, "교사별 시수표", {"교사명": "김교사", "과목명": "국어"})
+        load_sheet = workbook["교사별 시수표"]
+        class_start = len(SPECS_BY_NAME["교사별 시수표"]) + 1
+        load_sheet.cell(row=1, column=class_start).value = "1-1"
+        load_sheet.cell(row=load_sheet.max_row, column=class_start).value = 2
+        validation = validate_workbook(workbook)
+        records = validation["records"]
+        schedule = app_module.empty_schedule(records)
+        entry = app_module.entry_for_load(records["loads"][0], records, 1)
+        schedule["classes"]["C001"]["grid"]["월"]["1"] = dict(entry)
+        schedule["classes"]["C001"]["grid"]["월"]["2"] = dict(entry)
+
+        options = quick_move_options(records, schedule, {"classCode": "C001", "day": "월", "period": 1})
+        self.assertTrue(options["ok"])
+        self.assertTrue(any(item.get("newErrorCount", 0) == 0 and item["grade"] != "bad" for item in options["options"]))
+
+    def test_duplicate_load_rows_are_validated_against_aggregate_hours(self):
+        workbook = create_template_workbook()
+        set_config_value(workbook, "점심시간보호", "N")
+        set_config_value(workbook, "최대연강허용", "7")
+        append_named_row(workbook, "교사", {"교사명": "조혜란"})
+        append_named_row(workbook, "학급-계열", {"학급명": "2-3", "학년": "2", "계열": "공통", "담임교사명": "조혜란", "가상학급여부": "N"})
+        append_named_row(workbook, "과목", {"과목명": "현윤", "단축명": "현윤", "NEIS과목명": "현윤"})
+        append_named_row(workbook, "교사별 시수표", {"교사명": "조혜란", "과목명": "현윤"})
+        append_named_row(workbook, "교사별 시수표", {"교사명": "조혜란", "과목명": "현윤"})
+        load_sheet = workbook["교사별 시수표"]
+        class_start = len(SPECS_BY_NAME["교사별 시수표"]) + 1
+        load_sheet.cell(row=1, column=class_start).value = "2-3"
+        load_sheet.cell(row=load_sheet.max_row - 1, column=class_start).value = 3
+        load_sheet.cell(row=load_sheet.max_row, column=class_start).value = 3
+        validation = validate_workbook(workbook)
+        selected = solve_schedule(validation["records"], solve_options={"iterations": 12})["selected"]
+        messages = [item["message"] for item in selected["validation"]["violations"] if item.get("type") == "load_mismatch"]
+        self.assertNotIn("시수 3 중 6시간", " ".join(messages))
 
     def test_teacher_issue_summary_flags_bad_teacher_distribution(self):
         workbook = create_template_workbook()

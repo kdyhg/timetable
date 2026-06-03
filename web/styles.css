@@ -239,16 +239,47 @@ textarea {
   gap: 14px;
 }
 
-.start-step {
+.start-progress {
   display: grid;
-  gap: 8px;
-  padding-top: 12px;
-  border-top: 1px solid var(--line);
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
 }
 
-.start-step:first-of-type {
-  padding-top: 0;
-  border-top: 0;
+.start-progress span {
+  height: 5px;
+  border-radius: 999px;
+  background: var(--line);
+}
+
+.start-progress span.active {
+  background: var(--teal);
+}
+
+.start-step {
+  display: none;
+  gap: 8px;
+  animation: fadeInStep 220ms ease-out;
+}
+
+.start-step.active {
+  display: grid;
+}
+
+.step-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+@keyframes fadeInStep {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 .step-heading {
@@ -1048,7 +1079,8 @@ textarea {
   .api-row,
   .view-controls,
   .preference-grid,
-  .day-limit-grid {
+  .day-limit-grid,
+  .step-actions {
     grid-template-columns: 1fr;
   }
 
