@@ -3285,6 +3285,15 @@ def load_last_schedule() -> dict | None:
     return None
 
 
+def routed_request_path(raw_path: str) -> str:
+    parsed = urlparse(raw_path)
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    if parsed.path in {"/api", "/api/"} and "__path" in query:
+        forwarded = (query.get("__path") or [""])[0].strip("/")
+        return f"/{forwarded}" if forwarded else "/"
+    return parsed.path
+
+
 class AppHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         safe_log("[%s] %s" % (self.log_date_time_string(), fmt % args))
@@ -3307,8 +3316,7 @@ class AppHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def do_GET(self):
-        parsed = urlparse(self.path)
-        path = parsed.path
+        path = routed_request_path(self.path)
         if path == "/api/health":
             self.send_json({"ok": True, "time": now_iso(), "storage": storage_mode()})
             return
@@ -3343,8 +3351,7 @@ class AppHandler(BaseHTTPRequestHandler):
         self.serve_static(path)
 
     def do_POST(self):
-        parsed = urlparse(self.path)
-        path = parsed.path
+        path = routed_request_path(self.path)
         try:
             if path == "/imports/timetable-input":
                 file_name, payload = parse_multipart_file(self)

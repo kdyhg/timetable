@@ -5,7 +5,7 @@ from collections import defaultdict
 from unittest.mock import patch
 
 import app as app_module
-from app import SPECS_BY_NAME, ai_chat, create_template_workbook, move_schedule, parse_days, save_moved_schedule_result, solve_schedule, teacher_balance_penalty, validate_ai_key, validate_workbook
+from app import SPECS_BY_NAME, ai_chat, create_template_workbook, move_schedule, parse_days, routed_request_path, save_moved_schedule_result, solve_schedule, teacher_balance_penalty, validate_ai_key, validate_workbook
 
 
 def append_named_row(workbook, sheet_name, values):
@@ -72,8 +72,12 @@ class TimetableAppTests(unittest.TestCase):
         vercel_config = json.loads((app_module.ROOT / "vercel.json").read_text(encoding="utf-8"))
         self.assertIs(app_module.handler, app_module.AppHandler)
         self.assertIn("class handler(AppHandler)", api_index)
-        self.assertEqual(vercel_config["rewrites"][0]["destination"], "/api/index.py")
+        self.assertEqual(vercel_config["rewrites"][0]["destination"], "/api?__path=")
+        self.assertEqual(vercel_config["rewrites"][1]["destination"], "/api?__path=:path*")
         self.assertNotIn("functions", vercel_config)
+        self.assertEqual(routed_request_path("/api?__path=api/health"), "/api/health")
+        self.assertEqual(routed_request_path("/api?__path=templates/timetable-input.xlsx"), "/templates/timetable-input.xlsx")
+        self.assertEqual(routed_request_path("/"), "/")
 
     def test_storage_mode_detects_vercel_storage_envs(self):
         storage_env = {
