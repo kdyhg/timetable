@@ -364,6 +364,59 @@ textarea {
   grid-template-columns: minmax(340px, 1fr) minmax(300px, 0.8fr);
 }
 
+.workspace-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 12px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.tab-button {
+  min-height: 38px;
+  padding: 7px 12px;
+  border: 1px solid transparent;
+  border-bottom: 0;
+  border-radius: 8px 8px 0 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-weight: 800;
+}
+
+.tab-button.active,
+[data-tab-target].active.tab-button {
+  border-color: var(--line);
+  background: var(--surface);
+  color: var(--teal-dark);
+}
+
+.workspace-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 380px);
+  gap: 16px;
+  align-items: start;
+}
+
+.tabbed-content {
+  min-width: 0;
+}
+
+.tab-panel {
+  display: none;
+}
+
+.tab-panel.active {
+  display: block;
+}
+
+.ai-dock {
+  display: grid;
+  gap: 16px;
+  position: sticky;
+  top: 12px;
+}
+
 .empty-state {
   padding: 22px;
   border: 1px dashed var(--line);
@@ -855,6 +908,66 @@ textarea {
   background: #fbfcfc;
 }
 
+.constraint-draft-list {
+  display: grid;
+  gap: 8px;
+  margin: 8px 0;
+}
+
+.constraint-group {
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcfc;
+}
+
+.constraint-group strong {
+  color: var(--teal-dark);
+  font-size: 12px;
+}
+
+.constraint-draft {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 7px 8px;
+  border-radius: 8px;
+  font-size: 12px;
+}
+
+.constraint-draft.pending {
+  background: #fff8dd;
+}
+
+.constraint-draft.applied {
+  background: #f1fbf7;
+}
+
+.constraint-draft span {
+  overflow-wrap: anywhere;
+}
+
+.mini-button {
+  min-height: 28px;
+  padding: 3px 8px;
+  border: 1px solid var(--teal);
+  border-radius: 6px;
+  background: var(--teal);
+  color: #fff;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.mini-button.ghost {
+  border-color: var(--line);
+  background: var(--surface);
+  color: var(--muted);
+}
+
 .chat-message,
 .log-line {
   padding: 9px 10px;
@@ -903,6 +1016,14 @@ textarea {
   .content-grid,
   .content-grid.bottom {
     grid-template-columns: 1fr;
+  }
+
+  .workspace-body {
+    grid-template-columns: 1fr;
+  }
+
+  .ai-dock {
+    position: static;
   }
 }
 

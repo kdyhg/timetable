@@ -65,11 +65,19 @@ class TimetableAppTests(unittest.TestCase):
         self.assertIn('id="quickEditStatus"', html)
         self.assertIn('id="quickMoveList"', html)
         self.assertIn('id="teacherIssuePanel"', html)
+        self.assertIn('class="workspace-tabs"', html)
+        self.assertIn('class="ai-dock"', html)
+        self.assertIn('id="chatConstraintList"', html)
+        self.assertEqual(html.count('<option value="안배>'), 2)
+        self.assertEqual(html.count('<option value="연강>'), 2)
+        self.assertEqual(html.count('<option value="식사시간>'), 2)
         self.assertLess(preference_index, manual_panel_index)
         self.assertLess(manual_link_index, manual_panel_index)
         self.assertIn("function getSolveOptions()", script)
         self.assertIn("solveOptions: getSolveOptions()", script)
         self.assertIn("function loadQuickMoveOptions()", script)
+        self.assertIn("function setActiveTab", script)
+        self.assertIn("chatConstraints: state.chatConstraints", script)
         self.assertIn("document.addEventListener(\"keydown\", handleQuickEditKeydown)", script)
         self.assertNotIn("유전탐색", script)
 
@@ -347,6 +355,56 @@ class TimetableAppTests(unittest.TestCase):
         self.assertEqual(response["externalApi"], "fallback-local-analysis")
         self.assertEqual(response["remote"]["status"], "not-configured")
 
+    def test_ai_chat_creates_applicable_name_based_constraint_draft(self):
+        records = {
+            "config": {},
+            "teachers": {"T001": {"교사명": "김교사"}},
+            "classes": {"C001": {"학급명": "1-1"}},
+            "subjects": {"S001": {"과목명": "국어"}},
+            "rooms": {},
+            "loads": [{"teacherCode": "T001", "subjectCode": "S001", "classCode": "C001", "weeklyHours": 1}],
+            "constraints": [],
+            "_lookups": {"teachers": {"김교사": "T001"}, "classes": {"1-1": "C001"}, "subjects": {"국어": "S001"}, "rooms": {}},
+        }
+        response = ai_chat(records, "김교사 금요일 6교시는 배정하지 말아줘", api_key_present=False)
+        draft = response["constraintDrafts"][0]
+        self.assertEqual(draft["targetName"], "김교사")
+        self.assertEqual(draft["targetCode"], "T001")
+        self.assertEqual(draft["conditionType"], "배정금지")
+        self.assertEqual(draft["days"], ["금"])
+        self.assertEqual(draft["periodsText"], "6")
+
+        updated = app_module.records_with_chat_constraints(records, [draft])
+        self.assertEqual(len(updated["constraints"]), 1)
+        self.assertEqual(updated["constraints"][0]["targetName"], "김교사")
+
+    def test_ai_chat_masks_names_before_remote_constraint_advice(self):
+        records = {
+            "config": {},
+            "teachers": {"T001": {"교사명": "김교사"}},
+            "classes": {"C001": {"학급명": "1-1"}},
+            "subjects": {"S001": {"과목명": "국어"}},
+            "rooms": {},
+            "loads": [{"teacherCode": "T001", "subjectCode": "S001", "classCode": "C001", "weeklyHours": 1}],
+            "constraints": [],
+        }
+        captured = {}
+        original = app_module.call_ai_advisor
+        try:
+            def fake_call(ai_config, task, context):
+                captured.update(context)
+                return {"ok": False, "status": "mock-fallback", "provider": "OpenAI", "message": "mock"}
+
+            app_module.call_ai_advisor = fake_call
+            response = ai_chat(records, "김교사 금요일 6교시는 배정하지 말아줘", api_key_present=True, ai_config={"provider": "openai", "apiKey": "sk-test", "model": "test-model"})
+        finally:
+            app_module.call_ai_advisor = original
+
+        self.assertEqual(response["constraintDrafts"][0]["targetName"], "김교사")
+        payload = json.dumps(captured, ensure_ascii=False)
+        self.assertIn("T001", payload)
+        self.assertNotIn("김교사", payload)
+
     def test_ai_chat_uses_remote_advice_when_validated_key_is_sent(self):
         records = {
             "config": {},
@@ -602,6 +660,36 @@ class TimetableAppTests(unittest.TestCase):
         serialized = json.dumps(result["candidates"], ensure_ascii=False)
         self.assertNotIn("미배정 방지를 위해", serialized)
         self.assertNotIn("완화했습니다", serialized)
+
+    def test_unassigned_diagnostics_show_names_instead_of_codes(self):
+        workbook = create_template_workbook()
+        set_config_value(workbook, "수업요일", "월")
+        set_config_value(workbook, "일일최대교시", "1")
+        set_config_value(workbook, "미배정방지조건완화", "N")
+        append_named_row(workbook, "교사", {"교사명": "김교사"})
+        append_named_row(workbook, "학급-계열", {
+            "학급명": "1-1",
+            "학년": "1",
+            "계열": "공통",
+            "담임교사명": "김교사",
+            "요일별시수": "1",
+            "가상학급여부": "N",
+        })
+        append_named_row(workbook, "과목", {"과목명": "국어", "단축명": "국", "NEIS과목명": "국어"})
+        append_named_row(workbook, "교사별 시수표", {"교사명": "김교사", "과목명": "국어"})
+        load_sheet = workbook["교사별 시수표"]
+        class_start = len(SPECS_BY_NAME["교사별 시수표"]) + 1
+        load_sheet.cell(row=1, column=class_start).value = "1-1"
+        load_sheet.cell(row=load_sheet.max_row, column=class_start).value = 2
+        validation = validate_workbook(workbook)
+        result = solve_schedule(validation["records"], solve_options={"allowRelaxForUnassigned": "N", "iterations": 12})
+        selected = result["selected"]
+        self.assertGreater(len(selected["unassigned"]), 0)
+        diagnostic_text = json.dumps(selected["diagnostics"], ensure_ascii=False)
+        self.assertIn("김교사", diagnostic_text)
+        self.assertIn("국어", diagnostic_text)
+        self.assertIn("1-1", diagnostic_text)
+        self.assertNotIn("T001 S001 C001", diagnostic_text)
 
     def test_manual_move_result_is_saved_for_exports(self):
         workbook = create_template_workbook()

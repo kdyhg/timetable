@@ -7,6 +7,9 @@ const state = {
   quickMoveSource: null,
   quickMoveOptions: [],
   quickMoveActive: false,
+  chatConstraints: [],
+  pendingConstraintDrafts: [],
+  activeTab: "overview",
   apiValidated: false,
   validatedAiConfig: null,
 };
@@ -70,6 +73,7 @@ const els = {
   chatLog: document.querySelector("#chatLog"),
   chatMessage: document.querySelector("#chatMessage"),
   chatButton: document.querySelector("#chatButton"),
+  chatConstraintList: document.querySelector("#chatConstraintList"),
   systemLog: document.querySelector("#systemLog"),
 };
 
@@ -204,11 +208,12 @@ function setExportsEnabled(enabled) {
 function updateSolveAvailability() {
   let status = "API 미검증";
   let enabled = false;
+  const importItem = state.currentImport || state.imports.find((item) => item.ok) || null;
   if (!state.apiValidated) {
     status = "API 미검증";
-  } else if (!state.currentImport) {
+  } else if (!importItem) {
     status = "엑셀 미업로드";
-  } else if (!state.currentImport.ok) {
+  } else if (!importItem.ok) {
     status = "검증 오류 있음";
   } else {
     status = "배정 가능";
@@ -220,6 +225,23 @@ function updateSolveAvailability() {
     els.solveStatus.textContent = status;
     els.solveStatus.classList.toggle("muted", !enabled);
   }
+}
+
+function getActiveImport() {
+  if (state.currentImport) return state.currentImport;
+  const item = state.imports.find((candidate) => candidate.ok) || state.imports[0] || null;
+  if (item) {
+    renderCurrentImport(item);
+  }
+  return item;
+}
+
+function requestBasePayload() {
+  const item = getActiveImport();
+  return {
+    importId: item?.id || null,
+    chatConstraints: state.chatConstraints,
+  };
 }
 
 async function api(path, options = {}) {
@@ -276,9 +298,15 @@ function renderIssues(issues = []) {
 }
 
 function renderCurrentImport(item) {
+  const previousImportId = state.currentImport?.id || null;
   state.currentImport = item;
   state.scheduleResult = null;
   state.selectedCandidate = null;
+  if ((item?.id || null) !== previousImportId) {
+    state.chatConstraints = [];
+    state.pendingConstraintDrafts = [];
+    renderChatConstraints();
+  }
   setExportsEnabled(false);
   if (!item) {
     els.currentTitle.textContent = "자료를 업로드하세요";
@@ -438,7 +466,12 @@ function renderTeacherIssues(candidate = state.selectedCandidate) {
 }
 
 async function solveSchedule() {
-  if (!state.currentImport) return;
+  const importItem = getActiveImport();
+  if (!importItem?.id) {
+    alert("먼저 엑셀을 업로드하고 검증을 완료하세요.");
+    updateSolveAvailability();
+    return;
+  }
   els.solveButton.disabled = true;
   els.solveButton.textContent = "배정 중";
   try {
@@ -446,7 +479,7 @@ async function solveSchedule() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        importId: state.currentImport.id,
+        ...requestBasePayload(),
         aiConfig: getAiConfig(),
         apiValidated: state.apiValidated,
         solveOptions: getSolveOptions(),
@@ -459,6 +492,7 @@ async function solveSchedule() {
     renderSchedule(result.selected.schedule);
     renderDiagnostics(result.selected);
     renderTeacherIssues(result.selected);
+    setActiveTab("timetable");
     setExportsEnabled(true);
     if (result.aiAdvisor?.advice) {
       const advice = result.aiAdvisor.advice;
@@ -676,7 +710,7 @@ async function handleScheduleCellClick(event) {
 }
 
 async function loadQuickMoveOptions() {
-  if (!state.currentImport || !state.selectedCandidate || !state.quickMoveSource) {
+  if (!getActiveImport() || !state.selectedCandidate || !state.quickMoveSource) {
     setQuickEditStatus("이동할 수업 칸을 먼저 선택하세요.", "error");
     return;
   }
@@ -686,7 +720,7 @@ async function loadQuickMoveOptions() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        importId: state.currentImport.id,
+        ...requestBasePayload(),
         schedule: state.selectedCandidate.schedule,
         from: state.quickMoveSource,
       }),
@@ -715,13 +749,13 @@ async function loadQuickMoveOptions() {
 }
 
 async function submitManualMove(move) {
-  if (!state.currentImport || !state.selectedCandidate) return;
+  if (!getActiveImport() || !state.selectedCandidate) return;
   try {
     const result = await api("/schedules/move", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        importId: state.currentImport.id,
+        ...requestBasePayload(),
         schedule: state.selectedCandidate.schedule,
         effectiveConfig: state.selectedCandidate.effectiveConfig || null,
         strategy: state.selectedCandidate.strategy,
@@ -804,6 +838,70 @@ function handleQuickEditKeydown(event) {
   }
 }
 
+function constraintLabel(item) {
+  const dayText = (item.days || []).join(",") || "전체요일";
+  const periodText = item.periodsText || (item.periods || []).join(",") || "전체교시";
+  return `${item.targetName || item.targetCode} · ${item.conditionType} · ${dayText} ${periodText}교시`;
+}
+
+function sameConstraint(a, b) {
+  return [
+    "targetType",
+    "targetCode",
+    "conditionType",
+    "periodsText",
+    "strength",
+  ].every((key) => String(a[key] || "") === String(b[key] || "")) && JSON.stringify(a.days || []) === JSON.stringify(b.days || []);
+}
+
+function renderChatConstraints() {
+  if (!els.chatConstraintList) return;
+  const pending = state.pendingConstraintDrafts || [];
+  const applied = state.chatConstraints || [];
+  if (!pending.length && !applied.length) {
+    els.chatConstraintList.innerHTML = "";
+    return;
+  }
+  const pendingHtml = pending
+    .map((item, index) => `
+      <div class="constraint-draft pending">
+        <span>${escapeHtml(constraintLabel(item))}</span>
+        <button class="mini-button" type="button" data-apply-constraint="${index}">적용</button>
+      </div>
+    `)
+    .join("");
+  const appliedHtml = applied
+    .map((item, index) => `
+      <div class="constraint-draft applied">
+        <span>${escapeHtml(constraintLabel(item))}</span>
+        <button class="mini-button ghost" type="button" data-remove-constraint="${index}">해제</button>
+      </div>
+    `)
+    .join("");
+  els.chatConstraintList.innerHTML = `
+    ${pendingHtml ? `<div class="constraint-group"><strong>AI 제약 초안</strong>${pendingHtml}</div>` : ""}
+    ${appliedHtml ? `<div class="constraint-group"><strong>적용 중인 대화 제약</strong>${appliedHtml}</div>` : ""}
+  `;
+}
+
+function applyConstraintDraft(index) {
+  const draft = state.pendingConstraintDrafts[index];
+  if (!draft) return;
+  if (!state.chatConstraints.some((item) => sameConstraint(item, draft))) {
+    state.chatConstraints.push(draft);
+  }
+  state.pendingConstraintDrafts.splice(index, 1);
+  renderChatConstraints();
+  updateSolveAvailability();
+  log(`대화 제약 적용: ${constraintLabel(draft)}`);
+}
+
+function removeChatConstraint(index) {
+  const removed = state.chatConstraints.splice(index, 1)[0];
+  renderChatConstraints();
+  if (removed) log(`대화 제약 해제: ${constraintLabel(removed)}`);
+}
+
 async function sendChat() {
   const message = els.chatMessage.value.trim();
   if (!message) return;
@@ -815,11 +913,12 @@ async function sendChat() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        importId: state.currentImport?.id,
+        ...requestBasePayload(),
         message,
         aiConfig: getAiConfig(),
         apiValidated: state.apiValidated,
         schedule: state.selectedCandidate?.schedule || null,
+        unassigned: state.selectedCandidate?.unassigned || [],
         effectiveConfig: state.selectedCandidate?.effectiveConfig || null,
       }),
     });
@@ -831,6 +930,11 @@ async function sendChat() {
       .join("\n");
     const summary = response.advice?.summary ? `${response.advice.summary}\n` : "";
     appendChat("assistant", `${response.privacy}\n${summary}${suggestionText}`, response.maskedPayload);
+    if (response.constraintDrafts?.length) {
+      state.pendingConstraintDrafts = response.constraintDrafts;
+      renderChatConstraints();
+      setActiveTab("diagnostics");
+    }
     log("AI 제안 생성 완료");
   } catch (error) {
     appendChat("assistant", error.message);
@@ -889,6 +993,16 @@ function appendChat(role, message, payload = null) {
   els.chatLog.scrollTop = els.chatLog.scrollHeight;
 }
 
+function setActiveTab(tabName) {
+  state.activeTab = tabName || "overview";
+  for (const button of document.querySelectorAll("[data-tab-target]")) {
+    button.classList.toggle("active", button.dataset.tabTarget === state.activeTab);
+  }
+  for (const panel of document.querySelectorAll("[data-tab-panel]")) {
+    panel.classList.toggle("active", panel.dataset.tabPanel === state.activeTab);
+  }
+}
+
 function wireEvents() {
   els.uploadInput.addEventListener("change", () => {
     setSelectedFile(els.uploadInput.files[0] || null);
@@ -942,6 +1056,23 @@ function wireEvents() {
     const option = state.quickMoveOptions.find((item) => quickOptionKey(item.day, item.period) === button.dataset.optionKey);
     applyQuickMoveOption(option);
   });
+  els.chatConstraintList?.addEventListener("click", (event) => {
+    const applyButton = event.target.closest("[data-apply-constraint]");
+    if (applyButton) {
+      applyConstraintDraft(Number(applyButton.dataset.applyConstraint));
+      return;
+    }
+    const removeButton = event.target.closest("[data-remove-constraint]");
+    if (removeButton) {
+      removeChatConstraint(Number(removeButton.dataset.removeConstraint));
+    }
+  });
+  document.addEventListener("click", (event) => {
+    const tabButton = event.target.closest("[data-tab-target]");
+    if (!tabButton) return;
+    event.preventDefault();
+    setActiveTab(tabButton.dataset.tabTarget);
+  });
   els.moveButton.addEventListener("click", applyManualMove);
   document.addEventListener("keydown", handleQuickEditKeydown);
   els.apiCheckButton.addEventListener("click", validateApiKey);
@@ -964,6 +1095,8 @@ async function boot() {
   renderSchedule(null);
   renderTeacherIssues(null);
   renderQuickMoveList();
+  renderChatConstraints();
+  setActiveTab("overview");
   updateProviderFields(false);
   appendChat("assistant", "엑셀에는 이름으로 입력하세요. 저는 서버가 자동 코드화한 자료만 보고 제안합니다.");
   wireEvents();

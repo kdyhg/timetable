@@ -439,6 +439,20 @@ ENTITY_CODE_FIELDS = {
     "rooms": "특별실코드",
 }
 
+ENTITY_COLLECTION_BY_TYPE = {
+    "교사": "teachers",
+    "학급": "classes",
+    "과목": "subjects",
+    "특별실": "rooms",
+}
+
+ENTITY_NAME_FIELDS = {
+    "teachers": "교사명",
+    "classes": "학급명",
+    "subjects": "과목명",
+    "rooms": "특별실명",
+}
+
 
 def generated_code(target: str, index: int) -> str:
     return f"{ENTITY_PREFIXES[target]}{index:03d}"
@@ -473,6 +487,31 @@ def resolve_name_list(records, issues, sheet, row, column, target, label, value,
         if code:
             codes.append(code)
     return codes
+
+
+def display_name(records: dict, target: str, code: str) -> str:
+    collection = ENTITY_COLLECTION_BY_TYPE.get(target, target)
+    item = records.get(collection, {}).get(code, {})
+    return item.get(ENTITY_NAME_FIELDS.get(collection, "displayName")) or item.get("displayName") or code
+
+
+def display_names(records: dict, target: str, codes) -> list[str]:
+    return [display_name(records, target, code) for code in codes]
+
+
+def find_entity_in_text(records: dict, text: str) -> tuple[str, str, str] | None:
+    candidates = []
+    for target_type, collection in ENTITY_COLLECTION_BY_TYPE.items():
+        for code, item in records.get(collection, {}).items():
+            name = item.get(ENTITY_NAME_FIELDS[collection]) or item.get("displayName") or code
+            for token in {code, name}:
+                token = as_text(token)
+                if token and token in text:
+                    candidates.append((len(token), target_type, code, name))
+    if not candidates:
+        return None
+    _, target_type, code, name = max(candidates, key=lambda item: item[0])
+    return target_type, code, name
 
 
 def make_workbook_bytes(workbook: Workbook) -> bytes:
@@ -1604,6 +1643,8 @@ def get_records_from_body(body: dict) -> dict | None:
         records = body.get("records")
     if records is not None and body.get("effectiveConfig"):
         records = records_with_config(records, body.get("effectiveConfig"))
+    if records is not None and body.get("chatConstraints"):
+        records = records_with_chat_constraints(records, body.get("chatConstraints"))
     return records
 
 
@@ -1612,6 +1653,71 @@ def records_with_config(records: dict, updates: dict | None) -> dict:
         return records
     copied = deepcopy(records)
     copied.setdefault("config", {}).update({key: as_text(value) for key, value in updates.items()})
+    return copied
+
+
+def normalized_chat_constraint(records: dict, constraint: dict, index: int) -> dict | None:
+    target_type = as_text(constraint.get("targetType"))
+    target_code = as_text(constraint.get("targetCode"))
+    target_name = as_text(constraint.get("targetName"))
+    collection = ENTITY_COLLECTION_BY_TYPE.get(target_type)
+    if not collection:
+        return None
+    if not target_code and target_name:
+        target_code = records.get("_lookups", {}).get(collection, {}).get(target_name, "")
+    if not target_code or target_code not in records.get(collection, {}):
+        return None
+    condition_type = as_text(constraint.get("conditionType")) or "배정금지"
+    if condition_type not in {"배정금지", "이동금지", "임시금지", "희망", "비선호"}:
+        condition_type = "배정금지"
+    strength = as_text(constraint.get("strength")) or ("soft" if condition_type in {"희망", "비선호"} else "hard")
+    return {
+        "row": f"chat-{index}",
+        "source": "ai-chat",
+        "targetType": target_type,
+        "targetCode": target_code,
+        "targetName": target_name or display_name(records, target_type, target_code),
+        "conditionType": condition_type,
+        "days": [day for day in constraint.get("days", []) if day in DEFAULT_DAYS],
+        "periodsText": as_text(constraint.get("periodsText")) or ",".join(str(item) for item in constraint.get("periods", []) if parse_positive_int(item)),
+        "strength": "soft" if strength.lower() == "soft" else "hard",
+        "priority": parse_positive_int(constraint.get("priority")) or (5 if strength.lower() == "soft" else 10),
+        "description": as_text(constraint.get("description")) or "AI 대화로 추가한 제약조건",
+    }
+
+
+def records_with_chat_constraints(records: dict, constraints) -> dict:
+    if not isinstance(constraints, list) or not constraints:
+        return records
+    copied = deepcopy(records)
+    copied.setdefault("constraints", [])
+    existing = {
+        (
+            item.get("targetType"),
+            item.get("targetCode"),
+            item.get("conditionType"),
+            tuple(item.get("days") or []),
+            item.get("periodsText"),
+            item.get("strength"),
+        )
+        for item in copied["constraints"]
+    }
+    for index, constraint in enumerate(constraints, start=1):
+        normalized = normalized_chat_constraint(copied, constraint, index)
+        if not normalized:
+            continue
+        key = (
+            normalized.get("targetType"),
+            normalized.get("targetCode"),
+            normalized.get("conditionType"),
+            tuple(normalized.get("days") or []),
+            normalized.get("periodsText"),
+            normalized.get("strength"),
+        )
+        if key in existing:
+            continue
+        existing.add(key)
+        copied["constraints"].append(normalized)
     return copied
 
 
@@ -2154,8 +2260,11 @@ def solve_greedy(records: dict, strategy: str, gene: dict | None = None) -> dict
         if not candidates:
             unassigned.append({
                 "teacherCode": load["teacherCode"],
+                "teacherName": load.get("teacherName") or display_name(records, "교사", load["teacherCode"]),
                 "subjectCode": load["subjectCode"],
+                "subjectName": load.get("subjectName") or display_name(records, "과목", load["subjectCode"]),
                 "classCode": load["classCode"],
+                "className": load.get("className") or display_name(records, "학급", load["classCode"]),
                 "hours": block_size,
                 "reason": "배정 가능한 빈 교시를 찾지 못했습니다. 배정금지, 최대연강, 점심시간보호, 학급 요일별시수 조건을 함께 확인하세요.",
             })
@@ -2420,7 +2529,7 @@ def diagnose_schedule(records: dict, schedule: dict, validation: dict, unassigne
         diagnostics.append({
             "type": "unassigned",
             "severity": "error",
-            "title": f"{item.get('teacherCode')} {item.get('subjectCode')} {item.get('classCode')} 미배정",
+            "title": f"{describe_unassigned_item(records, item)} 미배정",
             "reason": item.get("reason", "배정 가능한 칸을 찾지 못했습니다."),
             "suggestion": "해당 교사/학급의 배정금지, 최대연강, 점심시간보호, 특별실 조건 중 우선순위가 낮은 조건을 완화해 보세요.",
         })
@@ -2887,7 +2996,7 @@ def validate_schedule(records: dict, schedule: dict, unassigned=None) -> dict:
                     violations.append({
                         "severity": "error",
                         "type": "class_day_limit",
-                        "message": f"{class_code} {day} {period}교시는 학급 요일별시수 범위를 벗어났습니다.",
+                        "message": f"{display_name(records, '학급', class_code)} {day} {period}교시는 학급 요일별시수 범위를 벗어났습니다.",
                     })
                     continue
                 if cell.get("source") == "fixed":
@@ -2902,7 +3011,7 @@ def validate_schedule(records: dict, schedule: dict, unassigned=None) -> dict:
                     violations.append({
                         "severity": "error",
                         "type": "forbidden",
-                        "message": f"{class_code} {day} {period}교시에 배정금지 조건을 위반했습니다.",
+                        "message": f"{display_name(records, '학급', class_code)} {day} {period}교시에 배정금지 조건을 위반했습니다.",
                     })
 
     for (teacher, day, period), classes in teacher_slots.items():
@@ -2910,7 +3019,7 @@ def validate_schedule(records: dict, schedule: dict, unassigned=None) -> dict:
             violations.append({
                 "severity": "error",
                 "type": "teacher_conflict",
-                "message": f"교사 {teacher}가 {day} {period}교시에 {', '.join(classes)}에 중복 배정되었습니다.",
+                "message": f"교사 {display_name(records, '교사', teacher)}가 {day} {period}교시에 {', '.join(display_names(records, '학급', classes))}에 중복 배정되었습니다.",
             })
     teacher_day_periods = defaultdict(set)
     for teacher, day, period in teacher_slots:
@@ -2921,21 +3030,21 @@ def validate_schedule(records: dict, schedule: dict, unassigned=None) -> dict:
             violations.append({
                 "severity": "error",
                 "type": "max_consecutive",
-                "message": f"교사 {teacher}가 {day}요일에 최대연강 {max_consecutive}교시를 초과했습니다.",
+                "message": f"교사 {display_name(records, '교사', teacher)}가 {day}요일에 최대연강 {max_consecutive}교시를 초과했습니다.",
             })
         lunch_after = settings.get("lunchAfter") or 0
         if settings.get("protectLunch") and lunch_after and {lunch_after, lunch_after + 1}.issubset(periods):
             violations.append({
                 "severity": "error",
                 "type": "lunch_protection",
-                "message": f"교사 {teacher}가 {day}요일 점심 전후({lunch_after},{lunch_after + 1}교시)에 모두 배정되었습니다.",
+                "message": f"교사 {display_name(records, '교사', teacher)}가 {day}요일 점심 전후({lunch_after},{lunch_after + 1}교시)에 모두 배정되었습니다.",
             })
     for (room, day, period), classes in room_slots.items():
         if len(classes) > 1:
             violations.append({
                 "severity": "error",
                 "type": "room_conflict",
-                "message": f"특별실 {room}이 {day} {period}교시에 {', '.join(classes)}에 중복 배정되었습니다.",
+                "message": f"특별실 {display_name(records, '특별실', room)}이 {day} {period}교시에 {', '.join(display_names(records, '학급', classes))}에 중복 배정되었습니다.",
             })
 
     for load in records.get("loads", []):
@@ -2946,14 +3055,14 @@ def validate_schedule(records: dict, schedule: dict, unassigned=None) -> dict:
             violations.append({
                 "severity": severity,
                 "type": "load_mismatch",
-                "message": f"{load['teacherCode']} / {load['subjectCode']} / {load['classCode']} 시수 {load['weeklyHours']} 중 {actual}시간 배정되었습니다.",
+                "message": f"{display_name(records, '교사', load['teacherCode'])} / {display_name(records, '과목', load['subjectCode'])} / {display_name(records, '학급', load['classCode'])} 시수 {load['weeklyHours']} 중 {actual}시간 배정되었습니다.",
             })
 
     for item in unassigned:
         violations.append({
             "severity": "error",
             "type": "unassigned",
-            "message": f"{item['teacherCode']} {item['subjectCode']} {item['classCode']} {item['hours']}시간 미배정: {item['reason']}",
+            "message": f"{describe_unassigned_item(records, item)} 미배정: {item['reason']}",
         })
 
     return {
@@ -3267,39 +3376,162 @@ def validate_ai_key(api_key_or_config) -> dict:
     return validate_openai_key(config)
 
 
-def extract_schedule_context(records: dict, schedule: dict | None) -> dict:
+def describe_unassigned_item(records: dict, item: dict) -> str:
+    teacher = item.get("teacherName") or display_name(records, "교사", item.get("teacherCode", ""))
+    subject = item.get("subjectName") or display_name(records, "과목", item.get("subjectCode", ""))
+    class_name = item.get("className") or display_name(records, "학급", item.get("classCode", ""))
+    return f"{teacher} / {subject} / {class_name} {item.get('hours', 1)}시간"
+
+
+def extract_constraint_drafts(records: dict, text: str) -> list[dict]:
+    entity = find_entity_in_text(records, text)
+    if not entity:
+        return []
+    target_type, target_code, target_name = entity
+    days = [day for day in DEFAULT_DAYS if day in text]
+    periods = [int(item) for item in re.findall(r"(\d+)\s*교시", text)]
+    if not days and any(token in text for token in ["매일", "전체요일", "모든 요일"]):
+        days = DEFAULT_DAYS[:]
+    soft_hint = any(token in text for token in ["가능하면", "되도록", "가급적", "선호", "비선호"])
+    hope_hint = any(token in text for token in ["희망", "원해", "넣어", "배정해", "좋아"])
+    avoid_hint = any(token in text for token in ["피", "금지", "빼", "넣지", "하지마", "안되", "불가", "싫"])
+    if hope_hint and not avoid_hint:
+        condition_type = "희망"
+        strength = "soft"
+    elif soft_hint and avoid_hint:
+        condition_type = "비선호"
+        strength = "soft"
+    else:
+        condition_type = "배정금지"
+        strength = "hard"
+    if not periods and not days:
+        return []
+    period_text = ",".join(str(item) for item in periods)
+    title = f"{target_name} {condition_type}"
+    when = " ".join(days + ([f"{period_text}교시"] if period_text else []))
+    return [{
+        "id": uuid.uuid4().hex[:8],
+        "title": f"{title}: {when}".strip(),
+        "targetType": target_type,
+        "targetCode": target_code,
+        "targetName": target_name,
+        "conditionType": condition_type,
+        "days": days,
+        "periods": periods,
+        "periodsText": period_text,
+        "strength": strength,
+        "priority": 5 if strength == "soft" else 10,
+        "description": text,
+    }]
+
+
+def unassigned_advice_steps(records: dict, schedule_context: dict, unassigned: list[dict]) -> list[str]:
+    steps = []
+    for item in unassigned[:5]:
+        steps.append(f"{describe_unassigned_item(records, item)}: 배정금지·연강·점심·특별실 조건을 낮은 우선순위부터 완화해 후보를 다시 비교하세요.")
+    diagnostics = schedule_context.get("diagnostics") or []
+    for item in diagnostics:
+        if item.get("type") == "unassigned" and item.get("reason"):
+            steps.append(item["reason"])
+    if not steps:
+        steps.append("현재 선택된 시간표의 미배정 정보가 없으면 자동배정을 먼저 실행한 뒤 다시 질문하세요.")
+    steps.append("미배정 우선 탐색을 다시 실행하고, 남은 항목은 시간표 보기에서 해당 학급 수업 칸을 선택해 간편수정 후보를 확인하세요.")
+    return steps[:7]
+
+
+def mask_constraint_drafts_for_ai(drafts: list[dict]) -> list[dict]:
+    masked = []
+    for item in drafts:
+        copied = {key: value for key, value in item.items() if key not in {"targetName", "description", "title"}}
+        copied["targetName"] = copied.get("targetCode", "")
+        copied["description"] = "사용자 대화에서 추출한 코드화 제약조건"
+        copied["title"] = "대화 제약조건 초안"
+        masked.append(copied)
+    return masked
+
+
+def mask_text_for_ai(records: dict, text: str) -> str:
+    masked = as_text(text)
+    replacements = []
+    for collection in ENTITY_PREFIXES:
+        for code, item in records.get(collection, {}).items():
+            name = item.get(ENTITY_NAME_FIELDS.get(collection, "")) or item.get("displayName")
+            if name:
+                replacements.append((len(name), name, code))
+    for _, name, code in sorted(replacements, reverse=True):
+        masked = masked.replace(name, code)
+    return masked
+
+
+def mask_object_for_ai(records: dict, value):
+    if isinstance(value, str):
+        return mask_text_for_ai(records, value)
+    if isinstance(value, list):
+        return [mask_object_for_ai(records, item) for item in value]
+    if isinstance(value, dict):
+        return {key: mask_object_for_ai(records, item) for key, item in value.items()}
+    return value
+
+
+def mask_suggestions_for_ai(suggestions: list[dict]) -> list[dict]:
+    masked = []
+    for item in suggestions:
+        copied = deepcopy(item)
+        if copied.get("type") == "constraint_draft":
+            copied["title"] = "대화 제약조건 초안"
+            copied["explanation"] = "사용자 대화에서 요일/교시/대상 코드 기반 제약조건 초안을 추출했습니다."
+            draft = copied.get("draft")
+            if isinstance(draft, dict):
+                copied["draft"] = mask_constraint_drafts_for_ai([draft])[0]
+        masked.append(copied)
+    return masked
+
+
+def extract_schedule_context(records: dict, schedule: dict | None, unassigned=None) -> dict:
+    unassigned = unassigned or []
     if not schedule:
         return {"hasSchedule": False, "validation": None, "diagnostics": []}
-    validation = validate_schedule(records, schedule)
-    diagnostics = diagnose_schedule(records, schedule, validation)
+    validation = validate_schedule(records, schedule, unassigned)
+    diagnostics = diagnose_schedule(records, schedule, validation, unassigned)
     return {
         "hasSchedule": True,
         "validation": validation,
         "diagnostics": diagnostics,
+        "unassigned": unassigned,
     }
 
 
-def ai_chat(records: dict, message: str, api_key_present: bool = False, schedule: dict | None = None, api_key: str = "", ai_config=None) -> dict:
+def ai_chat(records: dict, message: str, api_key_present: bool = False, schedule: dict | None = None, api_key: str = "", ai_config=None, unassigned=None) -> dict:
     config = normalize_ai_config(ai_config, api_key=api_key)
     masked = mask_records_for_ai(records)
-    schedule_context = extract_schedule_context(records, schedule)
+    unassigned = unassigned or []
+    schedule_context = extract_schedule_context(records, schedule, unassigned)
     suggestions = []
     text = message.strip()
     day_hits = [day for day in DEFAULT_DAYS if day in text]
     period_hits = re.findall(r"(\d+)\s*교시", text)
     settings = constraint_settings(records)
+    constraint_drafts = extract_constraint_drafts(records, text)
 
-    if "배정금지" in text or "넣지" in text or "피" in text:
+    if constraint_drafts:
+        draft = constraint_drafts[0]
         suggestions.append({
             "type": "constraint_draft",
-            "title": "배정금지 조건 초안",
+            "title": "대화 제약조건 초안",
+            "draft": draft,
+            "explanation": f"{draft['targetName']}에 대한 {draft['conditionType']} 조건을 만들었습니다. 적용하면 다음 자동배정부터 반영됩니다.",
+        })
+    elif "배정금지" in text or "넣지" in text or "피" in text:
+        suggestions.append({
+            "type": "constraint_draft",
+            "title": "대화 제약조건 입력 도움",
             "draft": {
                 "conditionType": "배정금지",
                 "days": day_hits,
                 "periods": [int(item) for item in period_hits],
                 "strength": "hard",
             },
-            "explanation": "자연어에서 요일/교시 제한 의도를 추출했습니다. 엑셀에는 대상 이름으로 입력하고, 내부 코드는 앱이 자동 생성합니다.",
+            "explanation": "대상 교사명·학급명·과목명·특별실명을 함께 말하면 바로 적용 가능한 제약조건 초안을 만들 수 있습니다.",
         })
     if "연강" in text:
         suggestions.append({
@@ -3316,11 +3548,10 @@ def ai_chat(records: dict, message: str, api_key_present: bool = False, schedule
             "explanation": "점심시간보호가 Y이면 점심 전후 교시에 같은 교사가 모두 배정되는 후보를 제외합니다.",
         })
     if "미배정" in text or "왜" in text:
-        diagnostics = schedule_context.get("diagnostics") or []
         suggestions.append({
             "type": "diagnostic",
             "title": "미배정/오류 진단",
-            "steps": [item["reason"] for item in diagnostics[:5]] or ["현재 선택된 시간표가 없어 업로드 자료 기준으로만 판단했습니다."],
+            "steps": unassigned_advice_steps(records, schedule_context, unassigned),
         })
     if schedule_context.get("hasSchedule"):
         validation = schedule_context["validation"]
@@ -3364,11 +3595,22 @@ def ai_chat(records: dict, message: str, api_key_present: bool = False, schedule
             config,
             "chat_advice",
             {
-                "userMessage": text,
+                "userMessage": mask_text_for_ai(records, text),
                 "maskedRecords": masked,
-                "scheduleContext": schedule_context,
-                "localSuggestions": suggestions,
+                "scheduleContext": mask_object_for_ai(records, schedule_context),
+                "localSuggestions": mask_object_for_ai(records, mask_suggestions_for_ai(suggestions)),
                 "settings": settings,
+                "constraintDrafts": mask_constraint_drafts_for_ai(constraint_drafts),
+                "unassigned": [
+                    {
+                        "teacherCode": item.get("teacherCode"),
+                        "subjectCode": item.get("subjectCode"),
+                        "classCode": item.get("classCode"),
+                        "hours": item.get("hours"),
+                        "reason": item.get("reason"),
+                    }
+                    for item in unassigned
+                ],
             },
         )
     active_advice = remote.get("advice") if remote.get("ok") else local_advice
@@ -3380,6 +3622,7 @@ def ai_chat(records: dict, message: str, api_key_present: bool = False, schedule
         "aiConfig": public_ai_config(config),
         "maskedPayload": masked,
         "scheduleContext": schedule_context,
+        "constraintDrafts": constraint_drafts,
         "remote": remote,
         "advice": active_advice,
         "suggestions": active_advice.get("suggestions", suggestions),
@@ -3608,7 +3851,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 body = read_json_body(self)
                 records = get_records_from_body(body) or {"config": {}, "teachers": {}, "classes": {}, "subjects": {}, "rooms": {}, "loads": [], "constraints": []}
                 ai_config = ai_config_from_body(body, require_validated=True)
-                self.send_json(ai_chat(records, body.get("message", ""), bool(ai_config.get("apiKey") or body.get("apiKey")), body.get("schedule"), ai_config=ai_config))
+                self.send_json(ai_chat(records, body.get("message", ""), bool(ai_config.get("apiKey") or body.get("apiKey")), body.get("schedule"), ai_config=ai_config, unassigned=body.get("unassigned") or []))
                 return
             if path == "/ai/validate-key":
                 body = read_json_body(self)

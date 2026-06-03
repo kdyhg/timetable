@@ -76,9 +76,11 @@
             <label class="field-label" for="preferenceOrder">선호도 순서</label>
             <select id="preferenceOrder" class="select">
               <option value="안배>연강>식사시간">안배 > 연강 > 식사시간</option>
-              <option value="연강>안배>식사시간">연강 > 안배 > 식사시간</option>
-              <option value="식사시간>안배>연강">식사시간 > 안배 > 연강</option>
               <option value="안배>식사시간>연강">안배 > 식사시간 > 연강</option>
+              <option value="연강>안배>식사시간">연강 > 안배 > 식사시간</option>
+              <option value="연강>식사시간>안배">연강 > 식사시간 > 안배</option>
+              <option value="식사시간>안배>연강">식사시간 > 안배 > 연강</option>
+              <option value="식사시간>연강>안배">식사시간 > 연강 > 안배</option>
             </select>
             <div class="preference-grid">
               <label>
@@ -139,7 +141,7 @@
               <span class="button-icon">▶</span>
               AI 자동배정
             </button>
-            <a class="button ghost" href="#manualEditPanel">
+            <a class="button ghost" href="#manualEditPanel" data-tab-target="manual">
               <span class="button-icon">↔</span>
               수동 수정
             </a>
@@ -154,95 +156,116 @@
           </div>
         </div>
 
-        <section class="metrics" id="metrics"></section>
+        <nav class="workspace-tabs" aria-label="작업 보기">
+          <button class="tab-button active" type="button" data-tab-target="overview">검증·후보</button>
+          <button class="tab-button" type="button" data-tab-target="timetable">시간표</button>
+          <button class="tab-button" type="button" data-tab-target="manual">수동수정</button>
+          <button class="tab-button" type="button" data-tab-target="diagnostics">진단</button>
+        </nav>
 
-        <section class="content-grid">
-          <div class="panel wide">
-            <div class="panel-heading">
-              <h2>검증 결과</h2>
-              <a id="reportLink" class="link-button disabled" href="#">오류 리포트</a>
+        <div class="workspace-body">
+          <div class="tabbed-content">
+            <div class="tab-panel active" data-tab-panel="overview">
+              <section class="metrics" id="metrics"></section>
+
+              <section class="content-grid">
+                <div class="panel wide">
+                  <div class="panel-heading">
+                    <h2>검증 결과</h2>
+                    <a id="reportLink" class="link-button disabled" href="#">오류 리포트</a>
+                  </div>
+                  <div id="validationState" class="empty-state">업로드한 엑셀의 오류 셀, 원인, 수정 가이드가 여기에 표시됩니다.</div>
+                  <div id="issueTable" class="issue-table"></div>
+                </div>
+
+                <div class="panel">
+                  <div class="panel-heading">
+                    <h2>후보 시간표</h2>
+                    <span id="candidateBadge" class="badge muted">대기</span>
+                  </div>
+                  <div id="candidateList" class="candidate-list"></div>
+                </div>
+              </section>
             </div>
-            <div id="validationState" class="empty-state">업로드한 엑셀의 오류 셀, 원인, 수정 가이드가 여기에 표시됩니다.</div>
-            <div id="issueTable" class="issue-table"></div>
+
+            <section class="panel tab-panel" data-tab-panel="timetable">
+              <div class="panel-heading">
+                <h2>시간표 보기</h2>
+                <div class="view-controls">
+                  <select id="viewMode" class="select compact">
+                    <option value="class">학급별</option>
+                    <option value="teacher">교사별</option>
+                  </select>
+                  <select id="classSelect" class="select"></select>
+                </div>
+              </div>
+              <div id="scheduleBoard" class="schedule-board"></div>
+            </section>
+
+            <section id="manualEditPanel" class="panel manual-panel tab-panel" data-tab-panel="manual">
+              <div class="panel-heading">
+                <h2>수동 수정</h2>
+                <span class="badge">이동/맞교환</span>
+              </div>
+              <div class="quick-edit-box">
+                <div id="quickEditStatus" class="status-line">수업 칸 선택</div>
+                <div id="quickMoveList" class="move-option-list"></div>
+              </div>
+              <div class="manual-move">
+                <select id="moveMode" class="select compact">
+                  <option value="auto">자동</option>
+                  <option value="move">빈칸 이동</option>
+                  <option value="swap">맞교환</option>
+                </select>
+                <select id="moveClass" class="select compact"></select>
+                <select id="moveFromDay" class="select compact"></select>
+                <input id="moveFromPeriod" class="input compact" type="number" min="1" placeholder="현재" />
+                <select id="moveToDay" class="select compact"></select>
+                <input id="moveToPeriod" class="input compact" type="number" min="1" placeholder="이동" />
+                <button id="moveButton" class="button" type="button">이동</button>
+              </div>
+            </section>
+
+            <section class="panel tab-panel" data-tab-panel="diagnostics">
+              <div class="panel-heading">
+                <h2>진단</h2>
+                <span class="badge">미배정·배정불량</span>
+              </div>
+              <div id="diagnosticPanel" class="diagnostic-panel"></div>
+              <div class="teacher-issue-panel">
+                <div class="section-label">배정불량교사</div>
+                <div id="teacherIssuePanel"></div>
+              </div>
+            </section>
           </div>
 
-          <div class="panel">
-            <div class="panel-heading">
-              <h2>후보 시간표</h2>
-              <span id="candidateBadge" class="badge muted">대기</span>
-            </div>
-            <div id="candidateList" class="candidate-list"></div>
-          </div>
-        </section>
+          <aside class="ai-dock">
+            <section class="panel ai-panel">
+              <div class="panel-heading">
+                <h2>AI 공동작성</h2>
+                <span class="badge">항상 표시</span>
+              </div>
+              <div id="chatAiStatus" class="status-line">왼쪽 시작 패널에서 AI 키를 먼저 검증하세요.</div>
+              <div id="chatConstraintList" class="constraint-draft-list"></div>
+              <div id="chatLog" class="chat-log"></div>
+              <div class="chat-form">
+                <textarea id="chatMessage" class="textarea" rows="3" placeholder="예: 김교사 금요일 6교시는 배정하지 말아줘."></textarea>
+                <button id="chatButton" class="button primary" type="button">
+                  <span class="button-icon">↵</span>
+                  제안 받기
+                </button>
+              </div>
+            </section>
 
-        <section class="panel">
-          <div class="panel-heading">
-            <h2>시간표 보기</h2>
-            <div class="view-controls">
-              <select id="viewMode" class="select compact">
-                <option value="class">학급별</option>
-                <option value="teacher">교사별</option>
-              </select>
-              <select id="classSelect" class="select"></select>
-            </div>
-          </div>
-          <div id="scheduleBoard" class="schedule-board"></div>
-          <div id="diagnosticPanel" class="diagnostic-panel"></div>
-          <div class="teacher-issue-panel">
-            <div class="section-label">배정불량교사</div>
-            <div id="teacherIssuePanel"></div>
-          </div>
-        </section>
-
-        <section id="manualEditPanel" class="panel manual-panel">
-          <div class="panel-heading">
-            <h2>수동 수정</h2>
-            <span class="badge">이동/맞교환</span>
-          </div>
-          <div class="quick-edit-box">
-            <div id="quickEditStatus" class="status-line">수업 칸 선택</div>
-            <div id="quickMoveList" class="move-option-list"></div>
-          </div>
-          <div class="manual-move">
-            <select id="moveMode" class="select compact">
-              <option value="auto">자동</option>
-              <option value="move">빈칸 이동</option>
-              <option value="swap">맞교환</option>
-            </select>
-            <select id="moveClass" class="select compact"></select>
-            <select id="moveFromDay" class="select compact"></select>
-            <input id="moveFromPeriod" class="input compact" type="number" min="1" placeholder="현재" />
-            <select id="moveToDay" class="select compact"></select>
-            <input id="moveToPeriod" class="input compact" type="number" min="1" placeholder="이동" />
-            <button id="moveButton" class="button" type="button">이동</button>
-          </div>
-        </section>
-
-        <section class="content-grid bottom">
-          <div class="panel">
-            <div class="panel-heading">
-              <h2>AI 공동작성</h2>
-              <span class="badge">마스킹</span>
-            </div>
-            <div id="chatAiStatus" class="status-line">왼쪽 시작 패널에서 AI 키를 먼저 검증하세요.</div>
-            <div id="chatLog" class="chat-log"></div>
-            <div class="chat-form">
-              <textarea id="chatMessage" class="textarea" rows="3" placeholder="예: 금요일 6교시는 T001 교사를 배정하지 말아줘."></textarea>
-              <button id="chatButton" class="button primary" type="button">
-                <span class="button-icon">↵</span>
-                제안 받기
-              </button>
-            </div>
-          </div>
-
-          <div class="panel">
-            <div class="panel-heading">
-              <h2>운영 상태</h2>
-              <span class="badge muted">프로토타입</span>
-            </div>
-            <div id="systemLog" class="system-log"></div>
-          </div>
-        </section>
+            <section class="panel">
+              <div class="panel-heading">
+                <h2>운영 상태</h2>
+                <span class="badge muted">프로토타입</span>
+              </div>
+              <div id="systemLog" class="system-log"></div>
+            </section>
+          </aside>
+        </div>
       </main>
     </div>
     <script src="/app.js"></script>
