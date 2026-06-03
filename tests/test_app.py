@@ -73,7 +73,7 @@ class TimetableAppTests(unittest.TestCase):
         self.assertIs(app_module.handler, app_module.AppHandler)
         self.assertIn("class handler(AppHandler)", api_index)
         self.assertEqual(vercel_config["rewrites"][0]["destination"], "/api/index.py")
-        self.assertIn("api/**/*.py", vercel_config["functions"])
+        self.assertNotIn("functions", vercel_config)
 
     def test_storage_mode_detects_vercel_storage_envs(self):
         storage_env = {
