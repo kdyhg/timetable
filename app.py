@@ -1638,14 +1638,24 @@ def get_records_from_body(body: dict) -> dict | None:
         if metadata:
             records = metadata["records"]
         else:
-            records = None
+            records = latest_import_records() if body.get("fallbackLatestImport") else None
     else:
         records = body.get("records")
+        if records is None and body.get("fallbackLatestImport"):
+            records = latest_import_records()
     if records is not None and body.get("effectiveConfig"):
         records = records_with_config(records, body.get("effectiveConfig"))
     if records is not None and body.get("chatConstraints"):
         records = records_with_chat_constraints(records, body.get("chatConstraints"))
     return records
+
+
+def latest_import_records() -> dict | None:
+    for item in list_imports():
+        metadata = load_import(item.get("id", ""))
+        if metadata and metadata.get("records"):
+            return metadata["records"]
+    return None
 
 
 def records_with_config(records: dict, updates: dict | None) -> dict:
@@ -3394,7 +3404,7 @@ def extract_constraint_drafts(records: dict, text: str) -> list[dict]:
         days = DEFAULT_DAYS[:]
     soft_hint = any(token in text for token in ["가능하면", "되도록", "가급적", "선호", "비선호"])
     hope_hint = any(token in text for token in ["희망", "원해", "넣어", "배정해", "좋아"])
-    avoid_hint = any(token in text for token in ["피", "금지", "빼", "넣지", "하지마", "안되", "불가", "싫"])
+    avoid_hint = any(token in text for token in ["피", "금지", "빼", "넣지", "하지마", "하지 말", "말아", "안되", "안돼", "불가", "싫"])
     if hope_hint and not avoid_hint:
         condition_type = "희망"
         strength = "soft"
@@ -3437,6 +3447,46 @@ def unassigned_advice_steps(records: dict, schedule_context: dict, unassigned: l
         steps.append("현재 선택된 시간표의 미배정 정보가 없으면 자동배정을 먼저 실행한 뒤 다시 질문하세요.")
     steps.append("미배정 우선 탐색을 다시 실행하고, 남은 항목은 시간표 보기에서 해당 학급 수업 칸을 선택해 간편수정 후보를 확인하세요.")
     return steps[:7]
+
+
+def chat_requests_repair(text: str) -> bool:
+    value = as_text(text)
+    if "미배정" not in value:
+        return False
+    return any(token in value for token in ["없애", "처리", "줄여", "해결", "배정", "수정", "모두"])
+
+
+def repair_chat_solve_options(records: dict, solve_options: dict | None = None) -> dict:
+    settings = constraint_settings(records)
+    options = deepcopy(solve_options or {})
+    options["assignmentMethod"] = "unassigned-only"
+    options["allowRelaxForUnassigned"] = "Y"
+    options["iterations"] = max(parse_positive_int(options.get("iterations")) or settings.get("metaIterations") or 60, 160)
+    options.setdefault("balanceStrength", settings.get("balanceStrength") or "soft")
+    options.setdefault("protectLunch", "Y" if settings.get("protectLunch") else "N")
+    if settings.get("maxConsecutive"):
+        options.setdefault("maxConsecutive", settings["maxConsecutive"])
+    return options
+
+
+def repair_schedule_by_chat(records: dict, text: str, solve_options: dict | None = None, unassigned=None, ai_config=None) -> tuple[dict | None, dict | None]:
+    if not chat_requests_repair(text) or not records.get("loads"):
+        return None, None
+    before = len(unassigned or [])
+    options = repair_chat_solve_options(records, solve_options)
+    local_ai_config = normalize_ai_config(ai_config)
+    local_ai_config["apiKey"] = ""
+    result = solve_schedule(records, ai_config=local_ai_config, solve_options=options)
+    after = len(result.get("selected", {}).get("unassigned", []))
+    action = {
+        "type": "repair-solve",
+        "applied": True,
+        "beforeUnassigned": before,
+        "afterUnassigned": after,
+        "message": f"미배정 우선 재탐색을 실행했습니다. 미배정 {before}건 → {after}건",
+        "solveOptions": {key: value for key, value in options.items() if key != "apiKey"},
+    }
+    return action, result
 
 
 def mask_constraint_drafts_for_ai(drafts: list[dict]) -> list[dict]:
@@ -3501,7 +3551,7 @@ def extract_schedule_context(records: dict, schedule: dict | None, unassigned=No
     }
 
 
-def ai_chat(records: dict, message: str, api_key_present: bool = False, schedule: dict | None = None, api_key: str = "", ai_config=None, unassigned=None) -> dict:
+def ai_chat(records: dict, message: str, api_key_present: bool = False, schedule: dict | None = None, api_key: str = "", ai_config=None, unassigned=None, solve_options: dict | None = None) -> dict:
     config = normalize_ai_config(ai_config, api_key=api_key)
     masked = mask_records_for_ai(records)
     unassigned = unassigned or []
@@ -3512,6 +3562,14 @@ def ai_chat(records: dict, message: str, api_key_present: bool = False, schedule
     period_hits = re.findall(r"(\d+)\s*교시", text)
     settings = constraint_settings(records)
     constraint_drafts = extract_constraint_drafts(records, text)
+    schedule_action, schedule_result = repair_schedule_by_chat(records, text, solve_options=solve_options, unassigned=unassigned, ai_config=config)
+    if schedule_action:
+        suggestions.append({
+            "type": "schedule_action",
+            "title": "시간표 즉시 수정",
+            "explanation": schedule_action["message"],
+            "steps": [schedule_action["message"], "새 후보 시간표를 화면에 바로 반영했습니다."],
+        })
 
     if constraint_drafts:
         draft = constraint_drafts[0]
@@ -3623,6 +3681,8 @@ def ai_chat(records: dict, message: str, api_key_present: bool = False, schedule
         "maskedPayload": masked,
         "scheduleContext": schedule_context,
         "constraintDrafts": constraint_drafts,
+        "scheduleAction": schedule_action,
+        "scheduleResult": schedule_result,
         "remote": remote,
         "advice": active_advice,
         "suggestions": active_advice.get("suggestions", suggestions),
@@ -3851,7 +3911,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 body = read_json_body(self)
                 records = get_records_from_body(body) or {"config": {}, "teachers": {}, "classes": {}, "subjects": {}, "rooms": {}, "loads": [], "constraints": []}
                 ai_config = ai_config_from_body(body, require_validated=True)
-                self.send_json(ai_chat(records, body.get("message", ""), bool(ai_config.get("apiKey") or body.get("apiKey")), body.get("schedule"), ai_config=ai_config, unassigned=body.get("unassigned") or []))
+                self.send_json(ai_chat(records, body.get("message", ""), bool(ai_config.get("apiKey") or body.get("apiKey")), body.get("schedule"), ai_config=ai_config, unassigned=body.get("unassigned") or [], solve_options=body.get("solveOptions")))
                 return
             if path == "/ai/validate-key":
                 body = read_json_body(self)

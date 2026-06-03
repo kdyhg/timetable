@@ -14,6 +14,10 @@ const state = {
   validatedAiConfig: null,
 };
 
+const STORAGE_KEYS = {
+  importId: "ai-timetable:last-import-id",
+};
+
 const els = {
   healthBadge: document.querySelector("#healthBadge"),
   fileDrop: document.querySelector(".file-drop"),
@@ -110,6 +114,22 @@ function log(message) {
   line.className = "log-line";
   line.textContent = `${new Date().toLocaleTimeString()} · ${message}`;
   els.systemLog.prepend(line);
+}
+
+function storageGet(key) {
+  try {
+    return window.localStorage?.getItem(key) || "";
+  } catch {
+    return "";
+  }
+}
+
+function storageSet(key, value) {
+  try {
+    if (value) window.localStorage?.setItem(key, value);
+  } catch {
+    // Browser storage can be disabled; the server fallback still handles this case.
+  }
 }
 
 function setSelectedFile(file) {
@@ -229,7 +249,8 @@ function updateSolveAvailability() {
 
 function getActiveImport() {
   if (state.currentImport) return state.currentImport;
-  const item = state.imports.find((candidate) => candidate.ok) || state.imports[0] || null;
+  const storedId = storageGet(STORAGE_KEYS.importId);
+  const item = state.imports.find((candidate) => candidate.id === storedId) || state.imports.find((candidate) => candidate.ok) || state.imports[0] || null;
   if (item) {
     renderCurrentImport(item);
   }
@@ -239,7 +260,8 @@ function getActiveImport() {
 function requestBasePayload() {
   const item = getActiveImport();
   return {
-    importId: item?.id || null,
+    importId: item?.id || storageGet(STORAGE_KEYS.importId) || null,
+    fallbackLatestImport: true,
     chatConstraints: state.chatConstraints,
   };
 }
@@ -307,6 +329,9 @@ function renderCurrentImport(item) {
     state.pendingConstraintDrafts = [];
     renderChatConstraints();
   }
+  if (item?.id) {
+    storageSet(STORAGE_KEYS.importId, item.id);
+  }
   setExportsEnabled(false);
   if (!item) {
     els.currentTitle.textContent = "자료를 업로드하세요";
@@ -362,7 +387,8 @@ async function loadImports() {
   state.imports = data.imports.map((item) => ({ ...item, reportUrl: `/imports/${item.id}/report.xlsx` }));
   renderImports();
   if (!state.currentImport && state.imports.length) {
-    renderCurrentImport(state.imports[0]);
+    const storedId = storageGet(STORAGE_KEYS.importId);
+    renderCurrentImport(state.imports.find((item) => item.id === storedId) || state.imports[0]);
   }
 }
 
@@ -465,13 +491,21 @@ function renderTeacherIssues(candidate = state.selectedCandidate) {
     .join("");
 }
 
+function applyScheduleResult(result, message = "시간표 반영 완료") {
+  state.scheduleResult = result;
+  state.selectedCandidate = result.selected;
+  clearQuickMove("수업 칸 선택", false);
+  renderCandidates(result.candidates, result.selected.strategy);
+  renderSchedule(result.selected.schedule);
+  renderDiagnostics(result.selected);
+  renderTeacherIssues(result.selected);
+  setExportsEnabled(true);
+  setActiveTab("timetable");
+  log(message);
+}
+
 async function solveSchedule() {
-  const importItem = getActiveImport();
-  if (!importItem?.id) {
-    alert("먼저 엑셀을 업로드하고 검증을 완료하세요.");
-    updateSolveAvailability();
-    return;
-  }
+  getActiveImport();
   els.solveButton.disabled = true;
   els.solveButton.textContent = "배정 중";
   try {
@@ -485,24 +519,15 @@ async function solveSchedule() {
         solveOptions: getSolveOptions(),
       }),
     });
-    state.scheduleResult = result;
-    state.selectedCandidate = result.selected;
-    clearQuickMove("수업 칸 선택", false);
-    renderCandidates(result.candidates, result.selected.strategy);
-    renderSchedule(result.selected.schedule);
-    renderDiagnostics(result.selected);
-    renderTeacherIssues(result.selected);
-    setActiveTab("timetable");
-    setExportsEnabled(true);
+    applyScheduleResult(result, `자동배정 완료: ${strategyName(result.bestStrategy)} 선택`);
     if (result.aiAdvisor?.advice) {
       const advice = result.aiAdvisor.advice;
       const lines = [advice.summary, ...(advice.suggestions || []).map((item) => `${item.title}: ${(item.steps || []).join(" → ") || item.explanation}`)].filter(Boolean);
       appendChat("assistant", `AI 자동배정 검토\n${lines.join("\n")}`, result.aiAdvisor.remote?.ok ? { responseId: result.aiAdvisor.remote.responseId, model: result.aiAdvisor.remote.model } : null);
     }
-    log(`자동배정 완료: ${strategyName(result.bestStrategy)} 선택`);
   } catch (error) {
     log(error.message);
-    alert(error.message);
+    appendChat("assistant", `자동배정 요청 실패: ${error.message}`);
   } finally {
     els.solveButton.textContent = "▶ AI 자동배정";
     updateSolveAvailability();
@@ -884,7 +909,7 @@ function renderChatConstraints() {
   `;
 }
 
-function applyConstraintDraft(index) {
+async function applyConstraintDraft(index) {
   const draft = state.pendingConstraintDrafts[index];
   if (!draft) return;
   if (!state.chatConstraints.some((item) => sameConstraint(item, draft))) {
@@ -894,6 +919,10 @@ function applyConstraintDraft(index) {
   renderChatConstraints();
   updateSolveAvailability();
   log(`대화 제약 적용: ${constraintLabel(draft)}`);
+  if (state.selectedCandidate) {
+    appendChat("assistant", `제약조건을 적용했습니다. ${constraintLabel(draft)} 조건으로 다시 배정합니다.`);
+    await solveSchedule();
+  }
 }
 
 function removeChatConstraint(index) {
@@ -920,6 +949,7 @@ async function sendChat() {
         schedule: state.selectedCandidate?.schedule || null,
         unassigned: state.selectedCandidate?.unassigned || [],
         effectiveConfig: state.selectedCandidate?.effectiveConfig || null,
+        solveOptions: getSolveOptions(),
       }),
     });
     const suggestionText = response.suggestions
@@ -934,6 +964,10 @@ async function sendChat() {
       state.pendingConstraintDrafts = response.constraintDrafts;
       renderChatConstraints();
       setActiveTab("diagnostics");
+    }
+    if (response.scheduleResult) {
+      applyScheduleResult(response.scheduleResult, response.scheduleAction?.message || "AI 대화로 시간표를 수정했습니다.");
+      appendChat("assistant", response.scheduleAction?.message || "시간표를 새 후보로 바로 반영했습니다.");
     }
     log("AI 제안 생성 완료");
   } catch (error) {

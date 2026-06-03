@@ -78,6 +78,9 @@ class TimetableAppTests(unittest.TestCase):
         self.assertIn("function loadQuickMoveOptions()", script)
         self.assertIn("function setActiveTab", script)
         self.assertIn("chatConstraints: state.chatConstraints", script)
+        self.assertIn("fallbackLatestImport: true", script)
+        self.assertIn("response.scheduleResult", script)
+        self.assertIn("applyScheduleResult(response.scheduleResult", script)
         self.assertIn("document.addEventListener(\"keydown\", handleQuickEditKeydown)", script)
         self.assertNotIn("유전탐색", script)
 
@@ -404,6 +407,34 @@ class TimetableAppTests(unittest.TestCase):
         payload = json.dumps(captured, ensure_ascii=False)
         self.assertIn("T001", payload)
         self.assertNotIn("김교사", payload)
+
+    def test_ai_chat_can_apply_repair_solve_action(self):
+        workbook = create_template_workbook()
+        set_config_value(workbook, "점심시간보호", "N")
+        set_config_value(workbook, "최대연강허용", "7")
+        append_named_row(workbook, "교사", {"교사명": "김교사"})
+        append_named_row(workbook, "학급-계열", {"학급명": "1-1", "학년": "1", "계열": "공통", "담임교사명": "김교사", "가상학급여부": "N"})
+        append_named_row(workbook, "과목", {"과목명": "국어", "단축명": "국", "NEIS과목명": "국어"})
+        append_named_row(workbook, "교사별 시수표", {"교사명": "김교사", "과목명": "국어"})
+        load_sheet = workbook["교사별 시수표"]
+        class_start = len(SPECS_BY_NAME["교사별 시수표"]) + 1
+        load_sheet.cell(row=1, column=class_start).value = "1-1"
+        load_sheet.cell(row=load_sheet.max_row, column=class_start).value = 3
+        validation = validate_workbook(workbook)
+
+        response = ai_chat(validation["records"], "미배정을 모두 없애줘", api_key_present=False, solve_options={"iterations": 12})
+        self.assertEqual(response["scheduleAction"]["type"], "repair-solve")
+        self.assertTrue(response["scheduleAction"]["applied"])
+        self.assertIn("scheduleResult", response)
+        self.assertIn("selected", response["scheduleResult"])
+        self.assertEqual(response["scheduleResult"]["selected"]["unassigned"], [])
+
+    def test_records_from_body_can_fallback_to_latest_import(self):
+        records = {"config": {}, "teachers": {"T001": {"교사명": "김교사"}}, "classes": {}, "subjects": {}, "rooms": {}, "loads": [], "constraints": []}
+        with patch.object(app_module, "list_imports", lambda: [{"id": "latest"}]):
+            with patch.object(app_module, "load_import", lambda import_id: {"records": records} if import_id == "latest" else None):
+                loaded = app_module.get_records_from_body({"fallbackLatestImport": True})
+        self.assertEqual(loaded["teachers"]["T001"]["교사명"], "김교사")
 
     def test_ai_chat_uses_remote_advice_when_validated_key_is_sent(self):
         records = {
