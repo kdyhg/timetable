@@ -18,6 +18,18 @@ python -m pip install -r requirements.txt
 python app.py
 ```
 
+## Vercel 배포
+
+이 저장소는 Vercel Python Functions용 `api/index.py`와 `vercel.json`을 포함합니다. Vercel은 로컬처럼 `python app.py`로 장시간 실행되는 서버를 띄우지 않고, 요청마다 Python 함수의 `handler`를 호출합니다.
+
+```powershell
+vercel
+```
+
+GitHub 연동 배포라면 커밋을 푸쉬한 뒤 Vercel에서 다시 배포하면 됩니다.
+
+주의: Vercel 서버리스 환경에서는 `data/` 같은 로컬 파일 저장소가 영구 보관되지 않습니다. 이 프로토타입은 Vercel에서 런타임 임시 디렉터리를 사용하므로 업로드 이력과 마지막 시간표는 함수 인스턴스가 바뀌면 사라질 수 있습니다. 실제 운영 배포에서는 Vercel Blob, Postgres, Redis 같은 외부 저장소를 붙이는 것이 안전합니다.
+
 ## 주요 API
 
 - `GET /templates/timetable-input.xlsx`: 통합 입력 엑셀 양식 다운로드

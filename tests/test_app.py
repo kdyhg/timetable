@@ -65,6 +65,14 @@ class TimetableAppTests(unittest.TestCase):
         self.assertIn("function getSolveOptions()", script)
         self.assertIn("solveOptions: getSolveOptions()", script)
 
+    def test_vercel_python_entrypoints_are_declared(self):
+        api_index = (app_module.ROOT / "api" / "index.py").read_text(encoding="utf-8")
+        vercel_config = json.loads((app_module.ROOT / "vercel.json").read_text(encoding="utf-8"))
+        self.assertIs(app_module.handler, app_module.AppHandler)
+        self.assertIn("from app import handler", api_index)
+        self.assertEqual(vercel_config["rewrites"][0]["destination"], "/api/index.py")
+        self.assertIn("api/index.py", vercel_config["functions"])
+
     def test_parse_days_accepts_common_weekday_formats(self):
         expected = ["월", "화", "수", "목", "금"]
         self.assertEqual(parse_days("월,화,수,목,금"), expected)

@@ -27,7 +27,10 @@ from openpyxl.worksheet.datavalidation import DataValidation
 
 ROOT = Path(__file__).parent.resolve()
 WEB_DIR = ROOT / "web"
-DATA_DIR = ROOT / "data"
+RUNTIME_DATA_DIR = os.environ.get("TIMETABLE_DATA_DIR")
+if not RUNTIME_DATA_DIR and os.environ.get("VERCEL"):
+    RUNTIME_DATA_DIR = "/tmp/timetable-data"
+DATA_DIR = Path(RUNTIME_DATA_DIR).resolve() if RUNTIME_DATA_DIR else ROOT / "data"
 IMPORT_DIR = DATA_DIR / "imports"
 LAST_SCHEDULE_FILE = DATA_DIR / "last_schedule.json"
 
@@ -3025,6 +3028,10 @@ class AppHandler(BaseHTTPRequestHandler):
             content_type = "application/octet-stream"
         payload = target.read_bytes()
         self.send_bytes(payload, content_type)
+
+
+# Vercel's Python runtime looks for a top-level HTTP handler.
+handler = AppHandler
 
 
 def main():
