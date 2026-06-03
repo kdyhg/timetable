@@ -2007,6 +2007,72 @@ def teacher_distribution_metrics(schedule: dict) -> dict:
     return {"imbalance": imbalance, "emptyWeekdays": empty_weekdays}
 
 
+def teacher_issue_summary(records: dict, schedule: dict, validation: dict | None = None) -> list[dict]:
+    settings = constraint_settings(records)
+    days = schedule.get("days", [])
+    lunch_after = settings.get("lunchAfter") or 0
+    by_teacher = defaultdict(lambda: {"name": "", "days": defaultdict(set), "total": 0})
+    for class_data in schedule.get("classes", {}).values():
+        for day, periods in class_data.get("grid", {}).items():
+            for period_text, cell in periods.items():
+                if not cell or not cell.get("teacherCode"):
+                    continue
+                period = parse_int(period_text)
+                if period is None:
+                    continue
+                teacher = cell["teacherCode"]
+                by_teacher[teacher]["name"] = cell.get("teacherName") or teacher
+                by_teacher[teacher]["days"][day].add(period)
+                if cell.get("source") != "fixed":
+                    by_teacher[teacher]["total"] += 1
+
+    conflict_teachers = set()
+    for violation in (validation or {}).get("violations", []):
+        if violation.get("type") == "teacher_conflict":
+            match = re.search(r"교사\s+(\S+)", violation.get("message", ""))
+            if match:
+                conflict_teachers.add(match.group(1))
+
+    issues = []
+    for teacher, data in by_teacher.items():
+        tags = []
+        details = []
+        day_counts = [len(data["days"].get(day, set())) for day in days]
+        if data["total"] >= max(3, len(days)):
+            empty_days = sum(1 for count in day_counts if count == 0)
+            if day_counts and (max(day_counts) - min(day_counts) >= 3 or empty_days >= 2):
+                tags.append("안배")
+                details.append(f"요일편차 {max(day_counts)}:{min(day_counts)}")
+        consecutive_days = []
+        lunch_days = []
+        for day in days:
+            periods = data["days"].get(day, set())
+            longest = max_consecutive_count(periods)
+            if longest >= 3:
+                consecutive_days.append(f"{day}{longest}")
+            if lunch_after and {lunch_after, lunch_after + 1}.issubset(periods):
+                lunch_days.append(day)
+        if consecutive_days:
+            tags.append("3연강")
+            details.append(" ".join(consecutive_days[:3]))
+        if lunch_days:
+            tags.append("식사")
+            details.append("점심전후 " + ",".join(lunch_days[:3]))
+        if teacher in conflict_teachers:
+            tags.append("중복")
+            details.append("시간중복")
+        if tags:
+            issues.append({
+                "teacherCode": teacher,
+                "teacherName": data["name"] or teacher,
+                "totalHours": data["total"],
+                "issues": tags,
+                "details": details,
+                "severity": "error" if "중복" in tags else "warning",
+            })
+    return sorted(issues, key=lambda item: (-len(item["issues"]), -item["totalHours"], item["teacherName"]))
+
+
 def timetable_quality_score(candidate: dict) -> float:
     validation = candidate.get("validation", {})
     errors = len([item for item in validation.get("violations", []) if item.get("severity") == "error"])
@@ -2108,6 +2174,7 @@ def solve_greedy(records: dict, strategy: str, gene: dict | None = None) -> dict
         "algorithm": "greedy-seed",
         "gene": {key: value for key, value in gene.items() if key != "apiKey"},
         "quality": teacher_distribution_metrics(schedule),
+        "teacherIssues": teacher_issue_summary(records, schedule, validation),
         "score": 0,
     }
     result["score"] = timetable_quality_score(result)
@@ -2126,19 +2193,44 @@ def needs_repair_candidates(candidates: list[dict]) -> bool:
     return any(candidate_error_count(item) or candidate_unassigned_count(item) for item in candidates)
 
 
+def compact_relaxation_text(text: str) -> str:
+    value = as_text(text)
+    if "최대연강" in value or value.startswith("연강"):
+        numbers = re.findall(r"\d+", value)
+        if len(numbers) >= 2:
+            return f"연강 {numbers[0]}→{numbers[1]}"
+        return "연강 완화"
+    if "점심" in value or "식사" in value:
+        return "점심보호 해제"
+    if "균등" in value or "안배" in value:
+        return "안배 완화"
+    if "최대시수" in value or "요일최대" in value:
+        return "요일최대 해제"
+    return value.replace("미배정 방지를 위해 ", "").replace("했습니다.", "")
+
+
+def compact_relaxations(relaxations: list[str]) -> list[str]:
+    compacted = []
+    for item in relaxations or []:
+        text = compact_relaxation_text(item)
+        if text and text not in compacted:
+            compacted.append(text)
+    return compacted
+
+
 def annotate_repair_candidate(candidate: dict, strategy: str, effective_config: dict, relaxations: list[str]) -> dict:
     candidate["strategy"] = strategy
     candidate["aiGenerated"] = True
     candidate["effectiveConfig"] = effective_config
-    candidate["relaxations"] = relaxations
+    candidate["relaxations"] = compact_relaxations(relaxations)
     candidate["score"] = max(0, candidate.get("score", 0) - len(relaxations) * 6)
-    if relaxations:
+    if candidate["relaxations"]:
         candidate.setdefault("diagnostics", []).insert(0, {
             "type": "relaxation",
             "severity": "warning",
             "title": "AI 개선 후보",
-            "reason": " / ".join(relaxations),
-            "suggestion": "이 후보는 표시된 조건 완화를 적용했을 때의 결과입니다. 적용 전 조건 완화가 업무적으로 가능한지 확인하세요.",
+            "reason": " · ".join(candidate["relaxations"]),
+            "suggestion": "완화 조건을 확인하세요.",
         })
     return candidate
 
@@ -2202,22 +2294,23 @@ def relaxation_profiles(records: dict, include_relaxations: bool = True) -> list
     if not include_relaxations or not settings.get("allowRelaxForUnassigned"):
         return profiles
     if settings.get("maxConsecutive") and settings["maxConsecutive"] < max_period:
+        next_limit = min(max_period, settings["maxConsecutive"] + 1)
         profiles.append((
             "relax-consecutive",
-            {"최대연강허용": str(min(max_period, settings["maxConsecutive"] + 1))},
-            [f"미배정 방지를 위해 최대연강허용을 {settings['maxConsecutive']}에서 {min(max_period, settings['maxConsecutive'] + 1)}로 완화했습니다."],
+            {"최대연강허용": str(next_limit)},
+            [f"연강 {settings['maxConsecutive']}→{next_limit}"],
         ))
     if settings.get("protectLunch"):
         profiles.append((
             "relax-lunch",
             {"점심시간보호": "N"},
-            ["미배정 방지를 위해 점심시간보호를 N으로 완화했습니다."],
+            ["점심보호 해제"],
         ))
     if settings.get("teacherDayMaxEnabled"):
         profiles.append((
             "relax-day-max",
             {"교사요일최대적용": "N"},
-            ["미배정 방지를 위해 교사 요일별 최대시수 제한을 완화했습니다."],
+            ["요일최대 해제"],
         ))
     combined = {}
     combined_notes = []
@@ -2257,15 +2350,15 @@ def solve_gene(records: dict, gene: dict, profile: tuple[str, dict, list[str]]) 
     candidate["strategy"] = f"ga-{profile_name}-{strategy}-{gene.get('seed')}"
     candidate["algorithm"] = "metaheuristic-genetic"
     candidate["effectiveConfig"] = {**records.get("config", {}), **updates}
-    candidate["relaxations"] = relaxations
+    candidate["relaxations"] = compact_relaxations(relaxations)
     candidate["aiGenerated"] = bool(relaxations)
-    if relaxations:
+    if candidate["relaxations"]:
         candidate.setdefault("diagnostics", []).insert(0, {
             "type": "relaxation",
             "severity": "warning",
             "title": "미배정 방지 완화",
-            "reason": " / ".join(relaxations),
-            "suggestion": "미배정을 줄이기 위한 자동 완화 후보입니다. 업무적으로 허용 가능한지 확인하세요.",
+            "reason": " · ".join(candidate["relaxations"]),
+            "suggestion": "완화 조건을 확인하세요.",
         })
     return candidate
 
@@ -2749,7 +2842,7 @@ def solve_schedule(records: dict, api_key: str = "", ai_config=None, solve_optio
     needs_relaxation = needs_repair_candidates(strict_candidates)
     repair_candidates = generate_ai_repair_candidates(records, strict_candidates)
     genetic_candidates = solve_metaheuristic(records, include_relaxations=needs_relaxation)
-    candidates = strict_candidates + repair_candidates + genetic_candidates
+    candidates = sorted(genetic_candidates, key=candidate_rank, reverse=True)[:4]
     best = max(candidates, key=candidate_rank)
     ai_summary = summarize_candidate_for_ai(best)
     result = {
@@ -2912,6 +3005,108 @@ def move_schedule(records: dict, schedule: dict, move: dict) -> dict:
         "schedule": updated,
         "validation": validation,
         "diagnostics": diagnostics,
+        "teacherIssues": teacher_issue_summary(records, updated, validation),
+    }
+
+
+def move_option_reason(result: dict, delta: float, mode: str) -> list[str]:
+    reasons = ["맞교환" if mode == "swap" else "빈칸"]
+    violations = result.get("validation", {}).get("violations", [])
+    errors = [item for item in violations if item.get("severity") == "error"]
+    if errors:
+        reason_map = {
+            "teacher_conflict": "교사중복",
+            "room_conflict": "특별실중복",
+            "max_consecutive": "연강초과",
+            "lunch_protection": "식사부족",
+            "load_mismatch": "시수불일치",
+            "forbidden": "금지위반",
+        }
+        reasons.extend(reason_map.get(item.get("type"), "검증오류") for item in errors[:2])
+        return reasons
+    if delta > 2:
+        reasons.append("안배개선")
+    elif delta < -2:
+        reasons.append("안배주의")
+    else:
+        reasons.append("유지")
+    teacher_issues = result.get("teacherIssues", [])
+    if teacher_issues:
+        reasons.append(f"불량{len(teacher_issues)}")
+    return reasons
+
+
+def quick_move_options(records: dict, schedule: dict, source: dict) -> dict:
+    class_code = source.get("classCode")
+    src_day = source.get("day")
+    src_period = str(source.get("period"))
+    class_data = schedule.get("classes", {}).get(class_code)
+    if not class_data:
+        return {"ok": False, "message": "학급을 찾을 수 없습니다.", "options": []}
+    source_cell = class_data.get("grid", {}).get(src_day, {}).get(src_period)
+    if not source_cell:
+        return {"ok": False, "message": "이동할 수업이 없습니다.", "options": []}
+    if source_cell.get("source") == "fixed":
+        return {"ok": False, "message": "고정 일과는 간편수정 대상이 아닙니다.", "options": []}
+
+    base_metrics = teacher_distribution_metrics(schedule)
+    options = []
+    for day in schedule.get("days", []):
+        for period in schedule.get("periods", []):
+            if day == src_day and str(period) == src_period:
+                continue
+            if not class_period_available(schedule, class_code, day, period):
+                continue
+            target_cell = class_data.get("grid", {}).get(day, {}).get(str(period))
+            if target_cell and target_cell.get("source") == "fixed":
+                continue
+            mode = "swap" if target_cell else "move"
+            result = move_schedule(records, schedule, {
+                "mode": mode,
+                "from": {"classCode": class_code, "day": src_day, "period": parse_int(src_period)},
+                "to": {"day": day, "period": period},
+            })
+            if "validation" not in result:
+                options.append({
+                    "day": day,
+                    "period": period,
+                    "mode": mode,
+                    "grade": "bad",
+                    "score": 0,
+                    "reasons": [result.get("message", "불가")],
+                    "target": target_cell,
+                })
+                continue
+            errors = len([item for item in result["validation"].get("violations", []) if item.get("severity") == "error"])
+            after_metrics = teacher_distribution_metrics(result["schedule"])
+            delta = base_metrics.get("imbalance", 0) - after_metrics.get("imbalance", 0)
+            if errors:
+                grade = "bad"
+                score = max(0, 35 - errors * 8)
+            elif delta >= 2:
+                grade = "good"
+                score = 90 + min(9, int(delta))
+            elif delta >= -2:
+                grade = "ok"
+                score = 72
+            else:
+                grade = "warn"
+                score = max(40, 68 + int(delta))
+            options.append({
+                "day": day,
+                "period": period,
+                "mode": mode,
+                "grade": grade,
+                "score": score,
+                "reasons": move_option_reason(result, delta, mode),
+                "target": target_cell,
+                "errorCount": errors,
+            })
+    return {
+        "ok": True,
+        "source": {"classCode": class_code, "day": src_day, "period": parse_int(src_period), "cell": source_cell},
+        "options": sorted(options, key=lambda item: (-item["score"], item["day"], item["period"])),
+        "teacherIssues": teacher_issue_summary(records, schedule, validate_schedule(records, schedule)),
     }
 
 
@@ -2928,6 +3123,7 @@ def save_moved_schedule_result(move_result: dict, body: dict) -> None:
     selected["schedule"] = move_result["schedule"]
     selected["validation"] = move_result.get("validation", {})
     selected["diagnostics"] = move_result.get("diagnostics", [])
+    selected["teacherIssues"] = move_result.get("teacherIssues", [])
     selected["strategy"] = body.get("strategy") or selected.get("strategy", "manual")
     selected["effectiveConfig"] = body.get("effectiveConfig") or selected.get("effectiveConfig", {})
     selected["relaxations"] = body.get("relaxations") or selected.get("relaxations", [])
@@ -2939,6 +3135,7 @@ def save_moved_schedule_result(move_result: dict, body: dict) -> None:
                 "schedule": selected["schedule"],
                 "validation": selected["validation"],
                 "diagnostics": selected["diagnostics"],
+                "teacherIssues": selected["teacherIssues"],
                 "manualEdited": True,
             })
             break
@@ -3384,6 +3581,16 @@ class AppHandler(BaseHTTPRequestHandler):
                     self.send_json({"error": "records/importId와 schedule이 필요합니다."}, status=400)
                     return
                 self.send_json(validate_schedule(records, schedule))
+                return
+            if path == "/schedules/move-options":
+                body = read_json_body(self)
+                records = get_records_from_body(body)
+                schedule = body.get("schedule")
+                source = body.get("from", {})
+                if records is None or schedule is None:
+                    self.send_json({"error": "records/importId와 schedule이 필요합니다."}, status=400)
+                    return
+                self.send_json(quick_move_options(records, schedule, source))
                 return
             if path == "/schedules/move":
                 body = read_json_body(self)

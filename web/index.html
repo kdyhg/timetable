@@ -188,12 +188,20 @@
           </div>
           <div id="scheduleBoard" class="schedule-board"></div>
           <div id="diagnosticPanel" class="diagnostic-panel"></div>
+          <div class="teacher-issue-panel">
+            <div class="section-label">배정불량교사</div>
+            <div id="teacherIssuePanel"></div>
+          </div>
         </section>
 
         <section id="manualEditPanel" class="panel manual-panel">
           <div class="panel-heading">
             <h2>수동 수정</h2>
             <span class="badge">이동/맞교환</span>
+          </div>
+          <div class="quick-edit-box">
+            <div id="quickEditStatus" class="status-line">수업 칸 선택</div>
+            <div id="quickMoveList" class="move-option-list"></div>
           </div>
           <div class="manual-move">
             <select id="moveMode" class="select compact">

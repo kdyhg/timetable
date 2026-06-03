@@ -4,6 +4,9 @@ const state = {
   imports: [],
   scheduleResult: null,
   selectedCandidate: null,
+  quickMoveSource: null,
+  quickMoveOptions: [],
+  quickMoveActive: false,
   apiValidated: false,
   validatedAiConfig: null,
 };
@@ -45,6 +48,9 @@ const els = {
   viewMode: document.querySelector("#viewMode"),
   scheduleBoard: document.querySelector("#scheduleBoard"),
   diagnosticPanel: document.querySelector("#diagnosticPanel"),
+  teacherIssuePanel: document.querySelector("#teacherIssuePanel"),
+  quickEditStatus: document.querySelector("#quickEditStatus"),
+  quickMoveList: document.querySelector("#quickMoveList"),
   moveMode: document.querySelector("#moveMode"),
   moveClass: document.querySelector("#moveClass"),
   moveFromDay: document.querySelector("#moveFromDay"),
@@ -172,11 +178,11 @@ function updateProviderFields(forceDefault = false) {
 function strategyName(strategy) {
   if (strategy?.startsWith("ga-")) {
     const labels = [];
-    if (strategy.includes("relax")) labels.push("조건완화");
-    if (strategy.includes("spread-days")) labels.push("요일균등");
-    if (strategy.includes("spread-periods")) labels.push("교시균등");
+    if (strategy.includes("spread-days")) labels.push("요일안배");
+    if (strategy.includes("spread-periods")) labels.push("교시안배");
     if (strategy.includes("special-room")) labels.push("특별실");
-    return `유전탐색${labels.length ? `: ${labels.join("/")}` : ""}`;
+    if (strategy.includes("relax")) labels.push("미배정완화");
+    return labels.length ? labels.join(" · ") : "균형안";
   }
   return {
     balanced: "균형형",
@@ -284,6 +290,8 @@ function renderCurrentImport(item) {
     renderCandidates([]);
     renderSchedule(null);
     renderDiagnostics(null);
+    renderTeacherIssues(null);
+    clearQuickMove("수업 칸 선택", false);
     return;
   }
   const errorCount = item.issues.filter((issue) => issue.severity === "error").length;
@@ -296,6 +304,8 @@ function renderCurrentImport(item) {
   renderMetrics(item.stats);
   renderIssues(item.issues);
   renderDiagnostics(null);
+  renderTeacherIssues(null);
+  clearQuickMove("수업 칸 선택", false);
   renderImports();
 }
 
@@ -357,20 +367,22 @@ function renderCandidates(candidates = [], selectedStrategy = "") {
   }
   els.candidateBadge.textContent = `${candidates.length}개`;
   els.candidateList.innerHTML = candidates
-    .map((candidate) => {
+    .map((candidate, index) => {
       const selected = candidate.strategy === selectedStrategy ? "selected" : "";
-      const violations = candidate.validation.violations.filter((item) => item.severity === "error").length;
-      const diagnostic = candidate.diagnostics?.find((item) => item.severity !== "success")?.reason || candidate.diagnostics?.[0]?.reason || "";
-      const relaxations = candidate.relaxations?.length ? `<p class="relaxation-note">${escapeHtml(candidate.relaxations.join(" / "))}</p>` : "";
+      const violations = (candidate.validation?.violations || []).filter((item) => item.severity === "error").length;
+      const diagnostic = candidate.diagnostics?.find((item) => item.severity !== "success")?.reason || "";
+      const relaxations = (candidate.relaxations || [])
+        .map((item) => `<span class="relaxation-tag">${escapeHtml(item)}</span>`)
+        .join("");
       return `
         <button class="candidate-item ${selected}" type="button" data-strategy="${escapeHtml(candidate.strategy)}">
           <div class="candidate-title">
-            <span>${escapeHtml(strategyName(candidate.strategy))}</span>
+            <span>후보 ${index + 1} · ${escapeHtml(strategyName(candidate.strategy))}</span>
             <span>${escapeHtml(candidate.score)}점</span>
           </div>
-          <p>미배정 ${candidate.unassigned.length}건 · 검증 오류 ${violations}건</p>
+          <p>미배정 ${(candidate.unassigned || []).length}건 · 검증오류 ${violations}건</p>
           ${diagnostic ? `<p>${escapeHtml(diagnostic)}</p>` : ""}
-          ${relaxations}
+          ${relaxations ? `<div class="relaxation-tags">${relaxations}</div>` : ""}
         </button>
       `;
     })
@@ -398,6 +410,33 @@ function renderDiagnostics(candidate = state.selectedCandidate) {
     .join("");
 }
 
+function renderTeacherIssues(candidate = state.selectedCandidate) {
+  if (!els.teacherIssuePanel) return;
+  const issues = candidate?.teacherIssues || [];
+  if (!candidate) {
+    els.teacherIssuePanel.innerHTML = `<div class="empty-state compact">자동배정 후 배정불량교사가 표시됩니다.</div>`;
+    return;
+  }
+  if (!issues.length) {
+    els.teacherIssuePanel.innerHTML = `<div class="teacher-issue-row success"><strong>배정불량교사 없음</strong><span>안배·식사·연강 기준에서 큰 이상이 없습니다.</span></div>`;
+    return;
+  }
+  els.teacherIssuePanel.innerHTML = issues
+    .map((item) => {
+      const tags = (item.issues || []).map((tag) => `<span>${escapeHtml(tag)}</span>`).join("");
+      const details = (item.details || []).slice(0, 2).join(" · ");
+      return `
+        <div class="teacher-issue-row ${escapeHtml(item.severity || "warning")}">
+          <strong>${escapeHtml(item.teacherName || item.teacherCode)}</strong>
+          <em>${escapeHtml(item.totalHours || 0)}시간</em>
+          <div class="teacher-issue-tags">${tags}</div>
+          <small>${escapeHtml(details)}</small>
+        </div>
+      `;
+    })
+    .join("");
+}
+
 async function solveSchedule() {
   if (!state.currentImport) return;
   els.solveButton.disabled = true;
@@ -415,9 +454,11 @@ async function solveSchedule() {
     });
     state.scheduleResult = result;
     state.selectedCandidate = result.selected;
+    clearQuickMove("수업 칸 선택", false);
     renderCandidates(result.candidates, result.selected.strategy);
     renderSchedule(result.selected.schedule);
     renderDiagnostics(result.selected);
+    renderTeacherIssues(result.selected);
     setExportsEnabled(true);
     if (result.aiAdvisor?.advice) {
       const advice = result.aiAdvisor.advice;
@@ -487,6 +528,67 @@ function renderCellContent(cell, mode) {
   `;
 }
 
+function quickOptionKey(day, period) {
+  return `${day}::${Number(period)}`;
+}
+
+function findQuickMoveOption(day, period) {
+  const key = quickOptionKey(day, period);
+  return state.quickMoveOptions.find((item) => quickOptionKey(item.day, item.period) === key) || null;
+}
+
+function isQuickMoveSource(classCode, day, period) {
+  const source = state.quickMoveSource;
+  return Boolean(source && source.classCode === classCode && source.day === day && Number(source.period) === Number(period));
+}
+
+function setQuickEditStatus(message, variant = "") {
+  if (!els.quickEditStatus) return;
+  els.quickEditStatus.textContent = message;
+  els.quickEditStatus.classList.toggle("ok", variant === "ok");
+  els.quickEditStatus.classList.toggle("error", variant === "error");
+}
+
+function renderQuickMoveList() {
+  if (!els.quickMoveList) return;
+  const gradeLabels = { good: "좋음", ok: "가능", warn: "주의", bad: "불가" };
+  if (!state.quickMoveSource) {
+    els.quickMoveList.innerHTML = `<div class="empty-state compact">수업 칸을 선택하세요.</div>`;
+    return;
+  }
+  if (!state.quickMoveActive) {
+    els.quickMoveList.innerHTML = `<div class="empty-state compact">Enter를 누르면 이동 후보가 표시됩니다.</div>`;
+    return;
+  }
+  if (!state.quickMoveOptions.length) {
+    els.quickMoveList.innerHTML = `<div class="empty-state compact">이동 가능한 칸이 없습니다.</div>`;
+    return;
+  }
+  els.quickMoveList.innerHTML = state.quickMoveOptions
+    .slice(0, 12)
+    .map((option) => {
+      const label = gradeLabels[option.grade] || "가능";
+      const reasons = (option.reasons || []).slice(0, 2).join(" · ");
+      return `
+        <button class="move-option-item ${escapeHtml(option.grade)}" type="button" data-option-key="${escapeHtml(quickOptionKey(option.day, option.period))}">
+          <strong>${escapeHtml(option.day)} ${escapeHtml(option.period)}교시</strong>
+          <span>${escapeHtml(option.mode === "swap" ? "맞교환" : "이동")} · ${escapeHtml(label)}</span>
+          <small>${escapeHtml(reasons)}</small>
+        </button>
+      `;
+    })
+    .join("");
+}
+
+function clearQuickMove(message = "수업 칸 선택", redraw = true) {
+  state.quickMoveSource = null;
+  state.quickMoveOptions = [];
+  state.quickMoveActive = false;
+  setQuickEditStatus(message);
+  renderQuickMoveList();
+  if (redraw) drawSelectedSchedule();
+}
+
 function drawSelectedSchedule() {
   const schedule = state.selectedCandidate?.schedule;
   if (!schedule) return;
@@ -509,8 +611,13 @@ function drawSelectedSchedule() {
           }
           const raw = entityData.grid[day][String(period)];
           const cell = Array.isArray(raw) ? raw[0] : raw;
+          const option = mode === "class" ? findQuickMoveOption(day, period) : null;
+          const cellClasses = [];
+          if (mode === "class" && isQuickMoveSource(entityCode, day, period)) cellClasses.push("quick-source");
+          if (option) cellClasses.push("quick-option", `quick-${option.grade || "ok"}`);
           const attrs = mode === "class" ? `data-day="${escapeHtml(day)}" data-period="${period}" data-class-code="${escapeHtml(entityCode)}" data-has-cell="${cell ? "1" : "0"}" data-source="${escapeHtml(cell?.source || "")}"` : "";
-          return `<td ${attrs}>${renderCellContent(cell, mode)}</td>`;
+          const note = option ? `<div class="move-option-note">${escapeHtml(option.grade === "good" ? "좋음" : option.grade === "warn" ? "주의" : option.grade === "bad" ? "불가" : "가능")}</div>` : "";
+          return `<td class="${cellClasses.join(" ")}" ${attrs}>${renderCellContent(cell, mode)}${note}</td>`;
         })
         .join("");
       return `<tr><th>${escapeHtml(day)}</th>${cells}</tr>`;
@@ -539,34 +646,76 @@ function populateMoveControls(schedule) {
   fillSelect(els.moveToDay, schedule.days || []);
 }
 
-function handleScheduleCellClick(event) {
+async function handleScheduleCellClick(event) {
   if (els.viewMode.value !== "class") return;
   const cell = event.target.closest("td[data-day]");
   if (!cell || cell.dataset.source === "fixed") return;
+  const quickOption = state.quickMoveActive ? findQuickMoveOption(cell.dataset.day, Number(cell.dataset.period)) : null;
+  if (quickOption) {
+    await applyQuickMoveOption(quickOption);
+    return;
+  }
   els.moveClass.value = cell.dataset.classCode;
   if (cell.dataset.hasCell === "1") {
     els.moveFromDay.value = cell.dataset.day;
     els.moveFromPeriod.value = cell.dataset.period;
+    state.quickMoveSource = {
+      classCode: cell.dataset.classCode,
+      day: cell.dataset.day,
+      period: Number(cell.dataset.period),
+    };
+    state.quickMoveOptions = [];
+    state.quickMoveActive = false;
+    setQuickEditStatus(`${cell.dataset.day} ${cell.dataset.period}교시 선택됨 · Enter`);
+    renderQuickMoveList();
+    drawSelectedSchedule();
   } else {
     els.moveToDay.value = cell.dataset.day;
     els.moveToPeriod.value = cell.dataset.period;
   }
 }
 
-async function applyManualMove() {
+async function loadQuickMoveOptions() {
+  if (!state.currentImport || !state.selectedCandidate || !state.quickMoveSource) {
+    setQuickEditStatus("이동할 수업 칸을 먼저 선택하세요.", "error");
+    return;
+  }
+  setQuickEditStatus("이동 후보 계산 중");
+  try {
+    const result = await api("/schedules/move-options", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        importId: state.currentImport.id,
+        schedule: state.selectedCandidate.schedule,
+        from: state.quickMoveSource,
+      }),
+    });
+    if (!result.ok) {
+      state.quickMoveOptions = [];
+      state.quickMoveActive = false;
+      setQuickEditStatus(result.message || "이동 후보를 만들 수 없습니다.", "error");
+      renderQuickMoveList();
+      drawSelectedSchedule();
+      return;
+    }
+    state.quickMoveOptions = result.options || [];
+    state.quickMoveActive = true;
+    if (result.teacherIssues) {
+      state.selectedCandidate.teacherIssues = result.teacherIssues;
+      renderTeacherIssues(state.selectedCandidate);
+    }
+    setQuickEditStatus(`이동 후보 ${state.quickMoveOptions.length}개`, state.quickMoveOptions.length ? "ok" : "error");
+    renderQuickMoveList();
+    drawSelectedSchedule();
+  } catch (error) {
+    setQuickEditStatus(error.message, "error");
+    log(error.message);
+  }
+}
+
+async function submitManualMove(move) {
   if (!state.currentImport || !state.selectedCandidate) return;
-  const move = {
-    mode: els.moveMode.value,
-    from: {
-      classCode: els.moveClass.value,
-      day: els.moveFromDay.value,
-      period: Number(els.moveFromPeriod.value),
-    },
-    to: {
-      day: els.moveToDay.value,
-      period: Number(els.moveToPeriod.value),
-    },
-  };
   try {
     const result = await api("/schedules/move", {
       method: "POST",
@@ -588,24 +737,70 @@ async function applyManualMove() {
     state.selectedCandidate.schedule = result.schedule;
     state.selectedCandidate.validation = result.validation || state.selectedCandidate.validation;
     state.selectedCandidate.diagnostics = result.diagnostics || state.selectedCandidate.diagnostics;
+    state.selectedCandidate.teacherIssues = result.teacherIssues || state.selectedCandidate.teacherIssues || [];
     state.selectedCandidate.manualEdited = true;
     const candidate = state.scheduleResult?.candidates?.find((item) => item.strategy === state.selectedCandidate.strategy);
     if (candidate) {
       candidate.schedule = state.selectedCandidate.schedule;
       candidate.validation = state.selectedCandidate.validation;
       candidate.diagnostics = state.selectedCandidate.diagnostics;
+      candidate.teacherIssues = state.selectedCandidate.teacherIssues;
       candidate.manualEdited = true;
     }
     if (state.scheduleResult?.selected?.strategy === state.selectedCandidate.strategy) {
       state.scheduleResult.selected = state.selectedCandidate;
     }
+    clearQuickMove("수정 완료", false);
     renderCandidates(state.scheduleResult?.candidates || [], state.selectedCandidate.strategy);
     renderSchedule(state.selectedCandidate.schedule);
     renderDiagnostics(state.selectedCandidate);
+    renderTeacherIssues(state.selectedCandidate);
     log(result.message);
   } catch (error) {
     log(error.message);
     alert(error.message);
+  }
+}
+
+async function applyQuickMoveOption(option) {
+  if (!state.quickMoveSource || !option) return;
+  const move = {
+    mode: option.mode || "auto",
+    from: state.quickMoveSource,
+    to: {
+      day: option.day,
+      period: Number(option.period),
+    },
+  };
+  await submitManualMove(move);
+}
+
+async function applyManualMove() {
+  const move = {
+    mode: els.moveMode.value,
+    from: {
+      classCode: els.moveClass.value,
+      day: els.moveFromDay.value,
+      period: Number(els.moveFromPeriod.value),
+    },
+    to: {
+      day: els.moveToDay.value,
+      period: Number(els.moveToPeriod.value),
+    },
+  };
+  await submitManualMove(move);
+}
+
+function handleQuickEditKeydown(event) {
+  const tagName = event.target?.tagName;
+  if (["INPUT", "TEXTAREA", "SELECT", "BUTTON"].includes(tagName)) return;
+  if (event.key === "Enter") {
+    event.preventDefault();
+    loadQuickMoveOptions();
+  }
+  if (event.key === "Escape") {
+    event.preventDefault();
+    clearQuickMove("간편수정 취소");
   }
 }
 
@@ -726,14 +921,29 @@ function wireEvents() {
     if (!button || !state.scheduleResult) return;
     const candidate = state.scheduleResult.candidates.find((item) => item.strategy === button.dataset.strategy);
     state.selectedCandidate = candidate;
+    clearQuickMove("수업 칸 선택", false);
     renderCandidates(state.scheduleResult.candidates, candidate.strategy);
     renderSchedule(candidate.schedule);
     renderDiagnostics(candidate);
+    renderTeacherIssues(candidate);
   });
-  els.viewMode.addEventListener("change", () => renderSchedule(state.selectedCandidate?.schedule));
-  els.classSelect.addEventListener("change", drawSelectedSchedule);
+  els.viewMode.addEventListener("change", () => {
+    clearQuickMove("수업 칸 선택", false);
+    renderSchedule(state.selectedCandidate?.schedule);
+  });
+  els.classSelect.addEventListener("change", () => {
+    clearQuickMove("수업 칸 선택", false);
+    drawSelectedSchedule();
+  });
   els.scheduleBoard.addEventListener("click", handleScheduleCellClick);
+  els.quickMoveList?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-option-key]");
+    if (!button) return;
+    const option = state.quickMoveOptions.find((item) => quickOptionKey(item.day, item.period) === button.dataset.optionKey);
+    applyQuickMoveOption(option);
+  });
   els.moveButton.addEventListener("click", applyManualMove);
+  document.addEventListener("keydown", handleQuickEditKeydown);
   els.apiCheckButton.addEventListener("click", validateApiKey);
   els.aiProvider.addEventListener("change", () => updateProviderFields(true));
   for (const input of [els.apiKey, els.aiModel, els.aiBaseUrl]) {
@@ -752,6 +962,8 @@ async function boot() {
   renderIssues([]);
   renderCandidates([]);
   renderSchedule(null);
+  renderTeacherIssues(null);
+  renderQuickMoveList();
   updateProviderFields(false);
   appendChat("assistant", "엑셀에는 이름으로 입력하세요. 저는 서버가 자동 코드화한 자료만 보고 제안합니다.");
   wireEvents();

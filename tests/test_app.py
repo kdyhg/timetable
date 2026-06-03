@@ -5,7 +5,7 @@ from collections import defaultdict
 from unittest.mock import patch
 
 import app as app_module
-from app import SPECS_BY_NAME, ai_chat, create_template_workbook, move_schedule, parse_days, routed_request_path, save_moved_schedule_result, solve_schedule, teacher_balance_penalty, validate_ai_key, validate_workbook
+from app import SPECS_BY_NAME, ai_chat, create_template_workbook, move_schedule, parse_days, quick_move_options, routed_request_path, save_moved_schedule_result, solve_schedule, teacher_balance_penalty, teacher_issue_summary, validate_ai_key, validate_schedule, validate_workbook
 
 
 def append_named_row(workbook, sheet_name, values):
@@ -62,10 +62,16 @@ class TimetableAppTests(unittest.TestCase):
         self.assertIn('id="solveMethod"', html)
         self.assertIn('id="preferenceOrder"', html)
         self.assertIn('id="allowRelaxForUnassigned"', html)
+        self.assertIn('id="quickEditStatus"', html)
+        self.assertIn('id="quickMoveList"', html)
+        self.assertIn('id="teacherIssuePanel"', html)
         self.assertLess(preference_index, manual_panel_index)
         self.assertLess(manual_link_index, manual_panel_index)
         self.assertIn("function getSolveOptions()", script)
         self.assertIn("solveOptions: getSolveOptions()", script)
+        self.assertIn("function loadQuickMoveOptions()", script)
+        self.assertIn("document.addEventListener(\"keydown\", handleQuickEditKeydown)", script)
+        self.assertNotIn("유전탐색", script)
 
     def test_vercel_python_entrypoints_are_declared(self):
         api_index = (app_module.ROOT / "api" / "index.py").read_text(encoding="utf-8")
@@ -584,13 +590,18 @@ class TimetableAppTests(unittest.TestCase):
         self.assertTrue(validation["ok"])
         result = solve_schedule(validation["records"])
         self.assertGreater(result["repairSummary"]["repairCandidateCount"], 0)
-        strict_best = max(result["candidates"][:3], key=lambda item: item["score"])
-        self.assertGreater(len(strict_best["unassigned"]), 0)
+        self.assertLessEqual(len(result["candidates"]), 4)
+        self.assertTrue(all(candidate["algorithm"] == "metaheuristic-genetic" for candidate in result["candidates"]))
+        self.assertTrue(all(candidate["strategy"].startswith("ga-") for candidate in result["candidates"]))
         selected = result["selected"]
         self.assertTrue(selected["aiGenerated"])
         self.assertEqual(selected["unassigned"], [])
-        self.assertIn("점심시간보호를 N", " / ".join(selected["relaxations"]))
-        self.assertIn("최대연강허용", " / ".join(selected["relaxations"]))
+        relaxations = " / ".join(selected["relaxations"])
+        self.assertIn("점심보호 해제", relaxations)
+        self.assertIn("연강 4→5", relaxations)
+        serialized = json.dumps(result["candidates"], ensure_ascii=False)
+        self.assertNotIn("미배정 방지를 위해", serialized)
+        self.assertNotIn("완화했습니다", serialized)
 
     def test_manual_move_result_is_saved_for_exports(self):
         workbook = create_template_workbook()
@@ -628,6 +639,63 @@ class TimetableAppTests(unittest.TestCase):
         saved = app_module.load_last_schedule()
         self.assertTrue(saved["selected"]["manualEdited"])
         self.assertIsNotNone(saved["selected"]["schedule"]["classes"]["C001"]["grid"]["금"]["7"])
+
+    def test_quick_move_options_rank_available_slots(self):
+        workbook = create_template_workbook()
+        set_config_value(workbook, "점심시간보호", "N")
+        set_config_value(workbook, "최대연강허용", "7")
+        append_named_row(workbook, "교사", {"교사명": "김교사"})
+        append_named_row(workbook, "학급-계열", {"학급명": "1-1", "학년": "1", "계열": "공통", "담임교사명": "김교사", "가상학급여부": "N"})
+        append_named_row(workbook, "과목", {"과목명": "국어", "단축명": "국", "NEIS과목명": "국어"})
+        append_named_row(workbook, "교사별 시수표", {"교사명": "김교사", "과목명": "국어"})
+        load_sheet = workbook["교사별 시수표"]
+        class_start = len(SPECS_BY_NAME["교사별 시수표"]) + 1
+        load_sheet.cell(row=1, column=class_start).value = "1-1"
+        load_sheet.cell(row=load_sheet.max_row, column=class_start).value = 2
+        validation = validate_workbook(workbook)
+        selected = solve_schedule(validation["records"])["selected"]
+        grid = selected["schedule"]["classes"]["C001"]["grid"]
+        source = None
+        for day in selected["schedule"]["days"]:
+            for period in selected["schedule"]["periods"]:
+                if grid[day][str(period)]:
+                    source = {"classCode": "C001", "day": day, "period": period}
+                    break
+            if source:
+                break
+
+        options = quick_move_options(validation["records"], selected["schedule"], source)
+        self.assertTrue(options["ok"])
+        self.assertGreater(len(options["options"]), 0)
+        self.assertIn(options["options"][0]["grade"], {"good", "ok", "warn", "bad"})
+        self.assertIn(options["options"][0]["mode"], {"move", "swap"})
+        self.assertIn("teacherIssues", options)
+
+    def test_teacher_issue_summary_flags_bad_teacher_distribution(self):
+        workbook = create_template_workbook()
+        set_config_value(workbook, "점심시간후교시", "4")
+        set_config_value(workbook, "점심시간보호", "Y")
+        set_config_value(workbook, "최대연강허용", "2")
+        append_named_row(workbook, "교사", {"교사명": "김교사"})
+        append_named_row(workbook, "학급-계열", {"학급명": "1-1", "학년": "1", "계열": "공통", "담임교사명": "김교사", "가상학급여부": "N"})
+        append_named_row(workbook, "과목", {"과목명": "국어", "단축명": "국", "NEIS과목명": "국어"})
+        append_named_row(workbook, "교사별 시수표", {"교사명": "김교사", "과목명": "국어"})
+        load_sheet = workbook["교사별 시수표"]
+        class_start = len(SPECS_BY_NAME["교사별 시수표"]) + 1
+        load_sheet.cell(row=1, column=class_start).value = "1-1"
+        load_sheet.cell(row=load_sheet.max_row, column=class_start).value = 5
+        validation = validate_workbook(workbook)
+        records = validation["records"]
+        schedule = app_module.empty_schedule(records)
+        entry = app_module.entry_for_load(records["loads"][0], records, 1)
+        for period in range(1, 6):
+            schedule["classes"]["C001"]["grid"]["월"][str(period)] = dict(entry)
+
+        issues = teacher_issue_summary(records, schedule, validate_schedule(records, schedule))
+        tags = issues[0]["issues"]
+        self.assertIn("안배", tags)
+        self.assertIn("3연강", tags)
+        self.assertIn("식사", tags)
 
     def test_manual_move_mode_controls_move_and_swap(self):
         workbook = create_template_workbook()
