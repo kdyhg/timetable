@@ -57,10 +57,13 @@ class TimetableAppTests(unittest.TestCase):
         self.assertIn('data-start-step="excel"', html)
         self.assertIn('data-start-step="constraints"', html)
         self.assertIn('data-start-step="preferences"', html)
+        self.assertIn('data-start-step="solving"', html)
         self.assertIn('id="initialConstraintText"', html)
         self.assertIn('id="startSolveButton"', html)
+        self.assertIn('class="loading-spinner"', html)
         self.assertIn("position: fixed", styles)
         self.assertIn(".start-panel.completed", styles)
+        self.assertIn("@keyframes spin", styles)
 
     def test_solve_preferences_and_manual_edit_are_visible(self):
         html = (app_module.ROOT / "web" / "index.html").read_text(encoding="utf-8")
@@ -91,6 +94,9 @@ class TimetableAppTests(unittest.TestCase):
         self.assertIn("fallbackLastSchedule: true", script)
         self.assertIn("function setStartStep", script)
         self.assertIn("function completeSetup()", script)
+        self.assertIn("function solveScheduleFromSetup()", script)
+        self.assertIn('setStartStep("solving")', script)
+        self.assertIn('setStartStep("preferences")', script)
         self.assertIn("createInitialConstraintDraft", script)
         self.assertIn("response.scheduleResult", script)
         self.assertIn("applyScheduleResult(response.scheduleResult", script)

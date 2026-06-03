@@ -234,7 +234,7 @@ function setExportsEnabled(enabled) {
   }
 }
 
-const startSteps = ["api", "excel", "constraints", "preferences"];
+const startSteps = ["api", "excel", "constraints", "preferences", "solving"];
 
 function setStartStep(stepName) {
   const step = startSteps.includes(stepName) ? stepName : "api";
@@ -244,15 +244,16 @@ function setStartStep(stepName) {
   }
   state.startStep = step;
   const stepIndex = startSteps.indexOf(step);
+  const progressIndex = step === "solving" ? startSteps.indexOf("preferences") : stepIndex;
   for (const panel of document.querySelectorAll("[data-start-step]")) {
     panel.classList.toggle("active", panel.dataset.startStep === step);
   }
   for (const item of document.querySelectorAll("[data-progress-step]")) {
     const index = startSteps.indexOf(item.dataset.progressStep);
-    item.classList.toggle("active", index <= stepIndex);
+    item.classList.toggle("active", index <= progressIndex);
   }
   if (els.startStepBadge) {
-    els.startStepBadge.textContent = `${stepIndex + 1}/4`;
+    els.startStepBadge.textContent = step === "solving" ? "진행 중" : `${stepIndex + 1}/4`;
   }
 }
 
@@ -569,12 +570,22 @@ async function solveSchedule() {
       const lines = [advice.summary, ...(advice.suggestions || []).map((item) => `${item.title}: ${(item.steps || []).join(" → ") || item.explanation}`)].filter(Boolean);
       appendChat("assistant", `AI 자동배정 검토\n${lines.join("\n")}`, result.aiAdvisor.remote?.ok ? { responseId: result.aiAdvisor.remote.responseId, model: result.aiAdvisor.remote.model } : null);
     }
+    return true;
   } catch (error) {
     log(error.message);
     appendChat("assistant", `자동배정 요청 실패: ${error.message}`);
+    return false;
   } finally {
     els.solveButton.textContent = "▶ AI 자동배정";
     updateSolveAvailability();
+  }
+}
+
+async function solveScheduleFromSetup() {
+  setStartStep("solving");
+  const ok = await solveSchedule();
+  if (!ok && !state.setupComplete) {
+    setStartStep("preferences");
   }
 }
 
@@ -1139,7 +1150,7 @@ function wireEvents() {
   els.uploadButton.addEventListener("click", uploadWorkbook);
   els.refreshImports.addEventListener("click", () => loadImports().catch((error) => log(error.message)));
   els.solveButton.addEventListener("click", solveSchedule);
-  els.startSolveButton?.addEventListener("click", solveSchedule);
+  els.startSolveButton?.addEventListener("click", solveScheduleFromSetup);
   els.initialConstraintButton?.addEventListener("click", createInitialConstraintDraft);
   els.skipConstraintButton?.addEventListener("click", () => setStartStep("preferences"));
   els.importList.addEventListener("click", (event) => {
