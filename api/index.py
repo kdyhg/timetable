@@ -6,4 +6,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app import handler  # noqa: E402,F401
+from app import AppHandler  # noqa: E402
+
+
+class handler(AppHandler):
+    pass

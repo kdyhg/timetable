@@ -71,9 +71,9 @@ class TimetableAppTests(unittest.TestCase):
         api_index = (app_module.ROOT / "api" / "index.py").read_text(encoding="utf-8")
         vercel_config = json.loads((app_module.ROOT / "vercel.json").read_text(encoding="utf-8"))
         self.assertIs(app_module.handler, app_module.AppHandler)
-        self.assertIn("from app import handler", api_index)
+        self.assertIn("class handler(AppHandler)", api_index)
         self.assertEqual(vercel_config["rewrites"][0]["destination"], "/api/index.py")
-        self.assertIn("api/index.py", vercel_config["functions"])
+        self.assertIn("api/**/*.py", vercel_config["functions"])
 
     def test_storage_mode_detects_vercel_storage_envs(self):
         storage_env = {
