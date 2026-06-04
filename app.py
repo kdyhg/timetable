@@ -1804,9 +1804,21 @@ def get_records_from_body(body: dict) -> dict | None:
         if metadata:
             records = metadata["records"]
         else:
-            records = latest_import_records() if body.get("fallbackLatestImport") else None
+            records = None
+            if body.get("fallbackLastSchedule"):
+                last_import_id = last_schedule_import_id()
+                if last_import_id:
+                    metadata = load_import(last_import_id)
+                    records = metadata.get("records") if metadata else None
+            if records is None and body.get("fallbackLatestImport"):
+                records = latest_import_records()
     else:
         records = body.get("records")
+        if records is None and body.get("fallbackLastSchedule"):
+            last_import_id = last_schedule_import_id()
+            if last_import_id:
+                metadata = load_import(last_import_id)
+                records = metadata.get("records") if metadata else None
         if records is None and body.get("fallbackLatestImport"):
             records = latest_import_records()
     if records is not None and body.get("effectiveConfig"):
@@ -1835,6 +1847,45 @@ def latest_import_records() -> dict | None:
         if metadata and metadata.get("records"):
             return metadata["records"]
     return None
+
+
+def latest_import_id() -> str:
+    for item in list_imports():
+        import_id = as_text(item.get("id", ""))
+        if import_id and load_import(import_id):
+            return import_id
+    return ""
+
+
+def last_schedule_import_id() -> str:
+    last = load_last_schedule() or {}
+    return as_text(
+        last.get("importId")
+        or (last.get("solveSession") or {}).get("importId")
+        or ((last.get("selected") or {}).get("importId"))
+    )
+
+
+def import_id_from_body(body: dict | None = None) -> str:
+    body = body or {}
+    import_id = as_text(body.get("importId"))
+    if import_id and load_import(import_id):
+        return import_id
+    if body.get("fallbackLastSchedule"):
+        import_id = last_schedule_import_id()
+        if import_id:
+            return import_id
+    if body.get("fallbackLatestImport"):
+        import_id = latest_import_id()
+        if import_id:
+            return import_id
+    return import_id
+
+
+def missing_records_message(body: dict | None = None) -> str:
+    if body and body.get("fallbackLastSchedule"):
+        return "이전 배정의 입력 엑셀 자료를 찾지 못했습니다. 엑셀을 다시 업로드하세요."
+    return "importId 또는 records가 필요합니다."
 
 
 def records_with_config(records: dict, updates: dict | None) -> dict:
@@ -2089,6 +2140,95 @@ def soft_constraint_score(records: dict, entry: dict, day: str, period: int, max
         else:
             score += priority * 0.7
     return score
+
+
+def constraint_targets_load(constraint: dict, load: dict) -> bool:
+    target_map = {
+        "교사": load.get("teacherCode"),
+        "학급": load.get("classCode"),
+        "과목": load.get("subjectCode"),
+        "특별실": load.get("roomCode"),
+    }
+    return bool(target_map.get(constraint.get("targetType")) == constraint.get("targetCode"))
+
+
+def load_constraint_count(records: dict, load: dict) -> tuple[float, float]:
+    days, max_period = schedule_dimensions(records)
+    hard_score = 0.0
+    soft_score = 0.0
+    for constraint in records.get("constraints", []):
+        if not constraint_targets_load(constraint, load):
+            continue
+        priority = parse_positive_int(constraint.get("priority")) or 5
+        day_count = len(constraint.get("days") or days)
+        period_count = len(parse_period_tokens(constraint.get("periodsText"), max_period))
+        coverage = max(1.0, min(8.0, day_count * period_count / max(1, max_period)))
+        if constraint.get("strength") == "soft" or constraint.get("conditionType") in {"희망", "비선호"}:
+            soft_score += priority + coverage
+        else:
+            hard_score += priority * 1.4 + coverage
+    return hard_score, soft_score
+
+
+def load_available_slot_count(records: dict, schedule: dict, load: dict, block_size: int, teacher_busy, room_busy, forbidden, max_period: int) -> int:
+    entry = entry_for_load(load, records, block_size)
+    count = 0
+    for day in schedule.get("days", []):
+        for period in schedule.get("periods", []):
+            if slot_free(schedule, load["classCode"], day, period, block_size, teacher_busy, room_busy, entry, max_period, forbidden):
+                count += 1
+    return count
+
+
+def load_constraint_pressure(records: dict, schedule: dict, load: dict, block_size: int, teacher_busy, room_busy, forbidden, max_period: int) -> dict:
+    hard_score, soft_score = load_constraint_count(records, load)
+    available_slots = load_available_slot_count(records, schedule, load, block_size, teacher_busy, room_busy, forbidden, max_period)
+    slot_pressure = 180.0 if available_slots <= 0 else max(0.0, 70.0 - available_slots) * 2.1
+    score = (
+        slot_pressure
+        + hard_score * 16.0
+        + soft_score * 6.0
+        + (28.0 if load.get("roomCode") else 0.0)
+        + (22.0 if load.get("syncGroup") else 0.0)
+        + max(0, block_size - 1) * 24.0
+        + (parse_positive_int(load.get("weeklyHours")) or 0) * 1.8
+    )
+    return {
+        "score": score,
+        "availableSlots": available_slots,
+        "hardScore": hard_score,
+        "softScore": soft_score,
+    }
+
+
+def sync_occurrence_available_slot_count(records: dict, schedule: dict, occurrence: dict, teacher_busy, room_busy, forbidden, settings: dict, max_period: int) -> int:
+    count = 0
+    for day in schedule.get("days", []):
+        for period in schedule.get("periods", []):
+            if sync_slot_free(schedule, occurrence, records, day, period, teacher_busy, room_busy, forbidden, settings):
+                count += 1
+    return count
+
+
+def sync_occurrence_constraint_pressure(records: dict, schedule: dict, occurrence: dict, teacher_busy, room_busy, forbidden, settings: dict, max_period: int) -> dict:
+    entries = sync_occurrence_entries(occurrence, records)
+    available_slots = sync_occurrence_available_slot_count(records, schedule, occurrence, teacher_busy, room_busy, forbidden, settings, max_period)
+    hard_score = 0.0
+    soft_score = 0.0
+    for unit in occurrence.get("units", []):
+        load_hard, load_soft = load_constraint_count(records, unit.get("load", {}))
+        hard_score += load_hard
+        soft_score += load_soft
+    slot_pressure = 240.0 if available_slots <= 0 else max(0.0, 70.0 - available_slots) * 2.4
+    score = slot_pressure + hard_score * 14.0 + soft_score * 5.0 + len(entries) * 18.0
+    if any(entry.get("roomCode") for entry in entries):
+        score += 24.0
+    return {
+        "score": score,
+        "availableSlots": available_slots,
+        "hardScore": hard_score,
+        "softScore": soft_score,
+    }
 
 
 def entry_for_load(load: dict, records: dict, block_size: int) -> dict:
@@ -2500,17 +2640,33 @@ def solve_greedy(records: dict, strategy: str, gene: dict | None = None) -> dict
     room_busy = defaultdict(set)
     unassigned = []
     apply_fixed_periods(records, schedule, teacher_busy)
+    pressure_cache = {}
+
+    def block_pressure(load: dict, block_size: int) -> dict:
+        key = (load.get("row"), load.get("teacherCode"), load.get("subjectCode"), load.get("classCode"), block_size)
+        if key not in pressure_cache:
+            pressure_cache[key] = load_constraint_pressure(records, schedule, load, block_size, teacher_busy, room_busy, forbidden, max_period)
+        return pressure_cache[key]
 
     sync_occurrences = [
         occurrence
         for bundle in records.get("syncBundles", [])
         for occurrence in bundle.get("occurrences", [])
     ]
-    if randomness:
-        sync_occurrences = sync_occurrences[:]
-        rng.shuffle(sync_occurrences)
-    else:
-        sync_occurrences.sort(key=lambda item: (item.get("syncGroup", ""), item.get("syncOccurrenceId", "")))
+    sync_pressure_cache = {}
+
+    def occurrence_pressure(occurrence: dict) -> dict:
+        occurrence_id = occurrence.get("syncOccurrenceId", "")
+        if occurrence_id not in sync_pressure_cache:
+            sync_pressure_cache[occurrence_id] = sync_occurrence_constraint_pressure(records, schedule, occurrence, teacher_busy, room_busy, forbidden, settings, max_period)
+        return sync_pressure_cache[occurrence_id]
+
+    def sync_order_key(occurrence: dict):
+        pressure = occurrence_pressure(occurrence)
+        jitter = rng.uniform(-0.35, 0.35) * randomness if randomness else 0.0
+        return (-(pressure["score"] + jitter), pressure["availableSlots"], occurrence.get("syncGroup", ""), occurrence.get("syncOccurrenceId", ""))
+
+    sync_occurrences.sort(key=sync_order_key)
 
     for occurrence in sync_occurrences:
         candidates = []
@@ -2566,18 +2722,24 @@ def solve_greedy(records: dict, strategy: str, gene: dict | None = None) -> dict
             continue
         for block_size in parse_block_pattern(load.get("continuousPattern"), load["weeklyHours"]):
             blocks.append((load, block_size))
-    if strategy in {"spread-days", "spread-periods", "genetic-balanced"}:
-        blocks.sort(key=lambda item: (-item[1], item[0]["teacherCode"], item[0]["classCode"], item[0]["subjectCode"]))
-    elif strategy == "unassigned-first":
-        blocks.sort(key=lambda item: (-item[0]["weeklyHours"], -item[1], item[0]["teacherCode"]))
-    if strategy == "special-room-first":
-        blocks.sort(key=lambda item: (0 if item[0].get("roomCode") else 1, -item[1], item[0]["teacherCode"]))
-    elif strategy == "balanced":
-        blocks.sort(key=lambda item: (-item[1], item[0]["classCode"], item[0]["subjectCode"]))
-    elif strategy == "gap-light":
-        blocks.sort(key=lambda item: (item[0]["teacherCode"], -item[1], item[0]["classCode"]))
-    if randomness:
-        blocks = [item for _, item in sorted(enumerate(blocks), key=lambda pair: pair[0] + rng.random() * randomness)]
+
+    def block_order_key(item):
+        load, block_size = item
+        pressure = block_pressure(load, block_size)
+        jitter = rng.uniform(-0.35, 0.35) * randomness if randomness else 0.0
+        primary = -(pressure["score"] + jitter)
+        common = (pressure["availableSlots"], -block_size, load["teacherCode"], load["classCode"], load["subjectCode"])
+        if strategy == "special-room-first":
+            return (primary, 0 if load.get("roomCode") else 1, *common)
+        if strategy == "unassigned-first":
+            return (primary, -(parse_positive_int(load.get("weeklyHours")) or 0), *common)
+        if strategy == "gap-light":
+            return (primary, load["teacherCode"], *common)
+        if strategy in {"spread-days", "spread-periods", "genetic-balanced", "constraint-first"}:
+            return (primary, *common)
+        return (primary, load["classCode"], load["subjectCode"], *common)
+
+    blocks.sort(key=block_order_key)
 
     for load, block_size in blocks:
         entry = entry_for_load(load, records, block_size)
@@ -2940,11 +3102,11 @@ def initial_genes(records: dict, rng: random.Random | None = None, seed_base: in
     settings = constraint_settings(records)
     iterations = iterations or settings.get("metaIterations") or 60
     method = settings.get("assignmentMethod", "fixed-first")
-    strategies = ["genetic-balanced", "spread-days", "spread-periods", "balanced", "gap-light", "special-room-first", "unassigned-first"]
+    strategies = ["constraint-first", "genetic-balanced", "spread-days", "spread-periods", "special-room-first", "unassigned-first", "balanced", "gap-light"]
     if method == "unassigned-only":
-        strategies = ["unassigned-first", "spread-days", "genetic-balanced", "balanced"]
+        strategies = ["constraint-first", "unassigned-first", "spread-days", "genetic-balanced", "special-room-first", "balanced"]
     elif method == "from-start":
-        strategies = ["spread-days", "spread-periods", "genetic-balanced", "balanced"]
+        strategies = ["constraint-first", "spread-days", "spread-periods", "genetic-balanced", "balanced"]
     genes = []
     seed_base = seed_base or rng.randint(1, 1_000_000)
     for index in range(max(12, iterations)):
@@ -3016,7 +3178,7 @@ def solve_metaheuristic(records: dict, include_relaxations: bool = True, seed: i
             parent_b = elites[(index * 3 + 1) % len(elites)].get("gene", {})
             child_gene = crossover_gene(parent_a, parent_b, rng, generation)
             if normalize_search_strength(search_strength) == "strong" and rng.random() < 0.35:
-                child_gene["strategy"] = rng.choice(["genetic-balanced", "spread-days", "spread-periods", "balanced", "gap-light", "special-room-first", "unassigned-first"])
+                child_gene["strategy"] = rng.choice(["constraint-first", "genetic-balanced", "spread-days", "spread-periods", "balanced", "gap-light", "special-room-first", "unassigned-first"])
                 child_gene["randomness"] = min(1.7, float(child_gene.get("randomness", 0.4)) + rng.uniform(0.05, 0.28))
             profile = profiles[index % len(profiles)]
             children.append(solve_gene(records, child_gene, profile))
@@ -3623,7 +3785,7 @@ def build_ai_solve_advisor(records: dict, ai_summary: dict, ai_config=None) -> d
     }
 
 
-def solve_schedule(records: dict, api_key: str = "", ai_config=None, solve_options: dict | None = None, persist: bool = True, advisor: bool = True) -> dict:
+def solve_schedule(records: dict, api_key: str = "", ai_config=None, solve_options: dict | None = None, persist: bool = True, advisor: bool = True, import_id: str = "") -> dict:
     solve_options = solve_options or {}
     started_at = time.monotonic()
     run_id = uuid.uuid4().hex[:12]
@@ -3662,6 +3824,7 @@ def solve_schedule(records: dict, api_key: str = "", ai_config=None, solve_optio
     result = {
         "runId": run_id,
         "seed": seed,
+        "importId": as_text(import_id),
         "recordSignature": record_signature,
         "createdAt": now_iso(),
         "bestStrategy": best["strategy"],
@@ -3779,7 +3942,7 @@ def solve_session_chunk_options(solve_options: dict | None, chunk_index: int) ->
 def run_solve_session_chunk(records: dict, session: dict) -> tuple[dict, bool]:
     chunk_index = parse_positive_int(session.get("chunkCount")) or 0
     chunk_options = solve_session_chunk_options(session.get("solveOptions") or {}, chunk_index)
-    result = solve_schedule(records, ai_config={}, solve_options=chunk_options, persist=False, advisor=False)
+    result = solve_schedule(records, ai_config={}, solve_options=chunk_options, persist=False, advisor=False, import_id=as_text(session.get("importId")))
     previous_best = session.get("bestResult")
     previous_rank = solve_result_rank(previous_best)
     new_rank = solve_result_rank(result)
@@ -3814,9 +3977,10 @@ def solve_session_response(session: dict, best_changed: bool = False) -> dict:
     }
 
 
-def start_solve_session(records: dict, solve_options: dict | None = None) -> dict:
+def start_solve_session(records: dict, solve_options: dict | None = None, import_id: str = "") -> dict:
     session = {
         "id": uuid.uuid4().hex[:12],
+        "importId": as_text(import_id),
         "startedAt": now_iso(),
         "startedAtEpoch": time.time(),
         "solveOptions": {key: value for key, value in (solve_options or {}).items() if key != "apiKey"},
@@ -3856,11 +4020,14 @@ def accept_solve_session(session_id: str) -> dict:
     result = deepcopy(session["bestResult"])
     result["solveSession"] = {
         "sessionId": session_id,
+        "importId": as_text(session.get("importId")),
         "chunkCount": session.get("chunkCount", 0),
         "attemptCount": session.get("attemptCount", 0),
         "elapsedMs": session.get("elapsedMs", 0),
         "acceptedBestSummary": session.get("bestSummary") or solve_best_summary(result),
     }
+    if session.get("importId"):
+        result["importId"] = as_text(session.get("importId"))
     result["progressMessage"] = "현재까지의 최선안을 반영했습니다."
     save_last_schedule(result)
     append_operation_log("solve_accept", {
@@ -4372,6 +4539,10 @@ def apply_schedule_proposal(records: dict, proposal: dict) -> dict:
     schedule = selected.get("schedule")
     if not schedule:
         return {"ok": False, "error": "적용할 시간표가 없습니다."}
+    import_id = as_text(schedule_result.get("importId") or selected.get("importId") or last_schedule_import_id())
+    if import_id:
+        schedule_result["importId"] = import_id
+        selected["importId"] = import_id
     validation = validate_schedule(records, schedule, selected.get("unassigned") or [])
     selected["validation"] = validation
     selected["diagnostics"] = diagnose_schedule(records, schedule, validation, selected.get("unassigned") or [])
@@ -4400,7 +4571,12 @@ def save_moved_schedule_result(move_result: dict, body: dict) -> None:
     }
     if body.get("recordSignature"):
         last["recordSignature"] = body.get("recordSignature")
+    import_id = as_text(body.get("importId") or last.get("importId") or last_schedule_import_id())
+    if import_id:
+        last["importId"] = import_id
     selected = last.setdefault("selected", {})
+    if import_id:
+        selected["importId"] = import_id
     selected["schedule"] = move_result["schedule"]
     selected["validation"] = move_result.get("validation", {})
     selected["diagnostics"] = move_result.get("diagnostics", [])
@@ -5125,23 +5301,23 @@ class AppHandler(BaseHTTPRequestHandler):
                 body = read_json_body(self)
                 records = get_records_from_body(body)
                 if records is None:
-                    self.send_json({"error": "importId 또는 records가 필요합니다."}, status=400)
+                    self.send_json({"error": missing_records_message(body)}, status=400)
                     return
-                self.send_json(solve_schedule(records, ai_config=ai_config_from_body(body, require_validated=True), solve_options=body.get("solveOptions")))
+                self.send_json(solve_schedule(records, ai_config=ai_config_from_body(body, require_validated=True), solve_options=body.get("solveOptions"), import_id=import_id_from_body(body)))
                 return
             if path == "/schedules/solve/start":
                 body = read_json_body(self)
                 records = get_records_from_body(body)
                 if records is None:
-                    self.send_json({"error": "importId 또는 records가 필요합니다."}, status=400)
+                    self.send_json({"error": missing_records_message(body)}, status=400)
                     return
-                self.send_json(start_solve_session(records, solve_options=body.get("solveOptions")))
+                self.send_json(start_solve_session(records, solve_options=body.get("solveOptions"), import_id=import_id_from_body(body)))
                 return
             if path == "/schedules/solve/continue":
                 body = read_json_body(self)
                 records = get_records_from_body(body)
                 if records is None:
-                    self.send_json({"error": "importId 또는 records가 필요합니다."}, status=400)
+                    self.send_json({"error": missing_records_message(body)}, status=400)
                     return
                 result = continue_solve_session(records, as_text(body.get("sessionId")))
                 self.send_json(result, status=200 if result.get("ok") else 404)

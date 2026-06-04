@@ -115,6 +115,9 @@ class TimetableAppTests(unittest.TestCase):
         self.assertIn("/schedules/solve/start", script)
         self.assertIn("/schedules/solve/continue", script)
         self.assertIn("/schedules/solve/accept", script)
+        self.assertIn("function requestBasePayloadForSolve()", script)
+        self.assertIn("function scheduleResultImportId", script)
+        self.assertIn("await requestBasePayloadForSolve()", script)
         self.assertIn("/ai/chat/local", script)
         self.assertIn('id="acceptBestSolveButton"', html)
         self.assertIn('id="acceptBestSolveOverlayButton"', html)
@@ -141,7 +144,7 @@ class TimetableAppTests(unittest.TestCase):
         validation = validate_workbook(workbook)
         self.assertTrue(validation["ok"])
         with patch.object(app_module, "save_last_schedule") as save_last_schedule:
-            started = app_module.start_solve_session(validation["records"], {"iterations": 12, "searchStrength": "fast"})
+            started = app_module.start_solve_session(validation["records"], {"iterations": 12, "searchStrength": "fast"}, import_id="import-abc")
             self.assertTrue(started["ok"])
             self.assertTrue(started["canAccept"])
             continued = app_module.continue_solve_session(validation["records"], started["sessionId"])
@@ -150,7 +153,16 @@ class TimetableAppTests(unittest.TestCase):
             accepted = app_module.accept_solve_session(started["sessionId"])
             self.assertIn("selected", accepted)
             self.assertIn("solveSession", accepted)
+            self.assertEqual(accepted["importId"], "import-abc")
+            self.assertEqual(accepted["solveSession"]["importId"], "import-abc")
             save_last_schedule.assert_called_once()
+
+    def test_records_can_fallback_to_last_schedule_import_id_for_resolve(self):
+        records = {"config": {}, "teachers": {}, "classes": {}, "subjects": {}, "rooms": {}, "loads": []}
+        with patch.object(app_module, "load_last_schedule", return_value={"importId": "import-last"}), patch.object(app_module, "load_import", return_value={"records": records}):
+            resolved = app_module.get_records_from_body({"fallbackLastSchedule": True, "fallbackLatestImport": True})
+        self.assertIs(resolved, records)
+        self.assertEqual(app_module.missing_records_message({"fallbackLastSchedule": True}), "이전 배정의 입력 엑셀 자료를 찾지 못했습니다. 엑셀을 다시 업로드하세요.")
 
     def test_sync_group_class_lane_hours_validate_and_move_together(self):
         workbook = create_template_workbook()
@@ -443,6 +455,41 @@ class TimetableAppTests(unittest.TestCase):
         off_penalty = teacher_balance_penalty(teacher_busy, "T001", "월", 3, {**settings, "balanceStrength": "off"})
         self.assertGreater(soft_penalty, 0)
         self.assertEqual(off_penalty, 0)
+
+    def test_constraint_pressure_prioritizes_constrained_lessons(self):
+        records = {
+            "config": {"일일최대교시": "7"},
+            "teachers": {"T001": {"교사명": "제약교사"}, "T002": {"교사명": "일반교사"}},
+            "classes": {"C001": {"학급명": "1-1"}, "C002": {"학급명": "1-2"}},
+            "subjects": {"S001": {"과목명": "물리"}, "S002": {"과목명": "국어"}},
+            "rooms": {"R001": {"특별실명": "실험실"}},
+            "loads": [
+                {"teacherCode": "T001", "subjectCode": "S001", "classCode": "C001", "weeklyHours": 1, "roomCode": "R001"},
+                {"teacherCode": "T002", "subjectCode": "S002", "classCode": "C002", "weeklyHours": 1, "roomCode": ""},
+            ],
+            "constraints": [{
+                "targetType": "교사",
+                "targetCode": "T001",
+                "conditionType": "배정금지",
+                "strength": "hard",
+                "days": ["월", "화", "수", "목", "금"],
+                "periodsText": "1,2,3,4,5",
+                "priority": 10,
+            }],
+        }
+        schedule = app_module.empty_schedule(records)
+        teacher_busy = defaultdict(set)
+        room_busy = defaultdict(set)
+        forbidden = app_module.build_forbidden_index(records)
+        _, max_period = app_module.schedule_dimensions(records)
+
+        constrained = app_module.load_constraint_pressure(records, schedule, records["loads"][0], 1, teacher_busy, room_busy, forbidden, max_period)
+        easy = app_module.load_constraint_pressure(records, schedule, records["loads"][1], 1, teacher_busy, room_busy, forbidden, max_period)
+        self.assertGreater(constrained["score"], easy["score"])
+        self.assertLess(constrained["availableSlots"], easy["availableSlots"])
+
+        genes = app_module.initial_genes(records, rng=app_module.random.Random(1), seed_base=1, iterations=12)
+        self.assertEqual(genes[0]["strategy"], "constraint-first")
 
     def test_metaheuristic_solver_spreads_teacher_load_across_weekdays(self):
         workbook = create_template_workbook()
