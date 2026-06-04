@@ -262,6 +262,58 @@ class TimetableAppTests(unittest.TestCase):
                         moved_slots.add((day, period))
         self.assertEqual(moved_slots, {(move_option["day"], move_option["period"])})
 
+    def test_sync_group_occurrences_are_recombined_to_avoid_teacher_duplication(self):
+        workbook = create_template_workbook()
+        set_config_value(workbook, "점심시간보호", "N")
+        set_config_value(workbook, "최대연강허용", "7")
+        append_named_row(workbook, "교사", {"교사명": "김중복"})
+        append_named_row(workbook, "교사", {"교사명": "박대체"})
+        append_named_row(workbook, "교사", {"교사명": "이대체"})
+        append_named_row(workbook, "학급-계열", {"학급명": "3-1", "학년": "3", "계열": "공통", "담임교사명": "김중복", "가상학급여부": "N"})
+        append_named_row(workbook, "학급-계열", {"학급명": "3-2", "학년": "3", "계열": "공통", "담임교사명": "박대체", "가상학급여부": "N"})
+        append_named_row(workbook, "과목", {"과목명": "언매", "단축명": "언", "NEIS과목명": "언매"})
+        append_named_row(workbook, "과목", {"과목명": "화작", "단축명": "화", "NEIS과목명": "화작"})
+        append_named_row(workbook, "교사별 시수표", {"교사명": "김중복", "과목명": "언매", "동시그룹": "G3"})
+        append_named_row(workbook, "교사별 시수표", {"교사명": "박대체", "과목명": "화작", "동시그룹": "G3"})
+        append_named_row(workbook, "교사별 시수표", {"교사명": "김중복", "과목명": "언매", "동시그룹": "G3"})
+        append_named_row(workbook, "교사별 시수표", {"교사명": "이대체", "과목명": "화작", "동시그룹": "G3"})
+        load_sheet = workbook["교사별 시수표"]
+        class_start = len(SPECS_BY_NAME["교사별 시수표"]) + 1
+        load_sheet.cell(row=1, column=class_start).value = "3-1"
+        load_sheet.cell(row=1, column=class_start + 1).value = "3-2"
+        load_sheet.cell(row=load_sheet.max_row - 3, column=class_start).value = 1
+        load_sheet.cell(row=load_sheet.max_row - 2, column=class_start).value = 1
+        load_sheet.cell(row=load_sheet.max_row - 1, column=class_start + 1).value = 1
+        load_sheet.cell(row=load_sheet.max_row, column=class_start + 1).value = 1
+        validation = validate_workbook(workbook)
+        self.assertTrue(validation["ok"], validation["issues"])
+        bundle = validation["records"]["syncBundles"][0]
+        self.assertEqual(len(bundle["occurrences"]), 2)
+        for occurrence in bundle["occurrences"]:
+            self.assertFalse(app_module.sync_occurrence_teacher_conflicts(occurrence), occurrence)
+        selected = solve_schedule(validation["records"], solve_options={"iterations": 8, "searchStrength": "fast"}, persist=False, advisor=False)["selected"]
+        self.assertEqual(len(selected.get("unassigned", [])), 0)
+
+    def test_sync_group_unavoidable_teacher_duplication_is_upload_error(self):
+        workbook = create_template_workbook()
+        append_named_row(workbook, "교사", {"교사명": "김중복"})
+        append_named_row(workbook, "학급-계열", {"학급명": "1-1", "학년": "1", "계열": "공통", "담임교사명": "김중복", "가상학급여부": "N"})
+        append_named_row(workbook, "학급-계열", {"학급명": "1-2", "학년": "1", "계열": "공통", "담임교사명": "김중복", "가상학급여부": "N"})
+        append_named_row(workbook, "과목", {"과목명": "국어", "단축명": "국", "NEIS과목명": "국어"})
+        append_named_row(workbook, "교사별 시수표", {"교사명": "김중복", "과목명": "국어", "동시그룹": "G1"})
+        append_named_row(workbook, "교사별 시수표", {"교사명": "김중복", "과목명": "국어", "동시그룹": "G1"})
+        load_sheet = workbook["교사별 시수표"]
+        class_start = len(SPECS_BY_NAME["교사별 시수표"]) + 1
+        load_sheet.cell(row=1, column=class_start).value = "1-1"
+        load_sheet.cell(row=1, column=class_start + 1).value = "1-2"
+        load_sheet.cell(row=load_sheet.max_row - 1, column=class_start).value = 1
+        load_sheet.cell(row=load_sheet.max_row, column=class_start + 1).value = 1
+        validation = validate_workbook(workbook)
+        self.assertFalse(validation["ok"])
+        issues_text = json.dumps(validation["issues"], ensure_ascii=False)
+        self.assertIn("동시그룹", issues_text)
+        self.assertIn("동시에 필요", issues_text)
+
     def test_sync_group_class_lane_hour_mismatch_is_upload_error(self):
         workbook = create_template_workbook()
         append_named_row(workbook, "교사", {"교사명": "김국어"})

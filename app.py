@@ -4,6 +4,7 @@ import base64
 import csv
 import hashlib
 import io
+import itertools
 import json
 import mimetypes
 import os
@@ -1198,6 +1199,223 @@ def sync_lane_key_for_load(load: dict) -> str:
     return f"{as_text(load.get('syncGroup'))}::{as_text(load.get('classCode'))}"
 
 
+def sync_unit_identity(load: dict) -> tuple:
+    return (
+        as_text(load.get("row")),
+        as_text(load.get("teacherCode")),
+        as_text(load.get("subjectCode")),
+        as_text(load.get("classCode")),
+    )
+
+
+def sync_unit_sort_key(records: dict, load: dict) -> tuple:
+    return (
+        as_text(load.get("subjectName")),
+        as_text(load.get("teacherName")),
+        parse_positive_int(load.get("row")) or 0,
+        display_name(records, "학급", as_text(load.get("classCode"))),
+    )
+
+
+def sync_lane_permutations(records: dict, units: list[dict], limit: int = 720) -> list[list[dict]]:
+    ordered = sorted(units, key=lambda item: sync_unit_sort_key(records, item))
+    if len(ordered) <= 1:
+        return [ordered]
+    seen = set()
+    output = []
+    if len(ordered) <= 6:
+        for perm in itertools.permutations(ordered):
+            key = tuple(sync_unit_identity(item) for item in perm)
+            if key in seen:
+                continue
+            seen.add(key)
+            output.append(list(perm))
+            if len(output) >= limit:
+                break
+    else:
+        for offset in range(len(ordered)):
+            perm = ordered[offset:] + ordered[:offset]
+            key = tuple(sync_unit_identity(item) for item in perm)
+            if key not in seen:
+                seen.add(key)
+                output.append(perm)
+        reversed_order = list(reversed(ordered))
+        for offset in range(len(reversed_order)):
+            perm = reversed_order[offset:] + reversed_order[:offset]
+            key = tuple(sync_unit_identity(item) for item in perm)
+            if key not in seen:
+                seen.add(key)
+                output.append(perm)
+    return output or [ordered]
+
+
+def sync_teacher_conflicts_for_units(units: list[dict]) -> list[dict]:
+    by_teacher = defaultdict(list)
+    for unit in units:
+        load = unit.get("load") if isinstance(unit, dict) else {}
+        load = load or unit
+        teacher_code = as_text(load.get("teacherCode"))
+        if teacher_code:
+            by_teacher[teacher_code].append(unit)
+    conflicts = []
+    for teacher_code, teacher_units in sorted(by_teacher.items(), key=lambda item: item[0]):
+        if len(teacher_units) <= 1:
+            continue
+        load = (teacher_units[0].get("load") or teacher_units[0]) if isinstance(teacher_units[0], dict) else {}
+        conflicts.append({
+            "teacherCode": teacher_code,
+            "teacherName": as_text(load.get("teacherName")),
+            "count": len(teacher_units),
+            "units": teacher_units,
+            "classNames": [
+                as_text((unit.get("load") or unit).get("className"))
+                for unit in teacher_units
+                if isinstance(unit, dict)
+            ],
+        })
+    return conflicts
+
+
+def sync_arrangement_conflicts(arranged_units: dict[str, list[dict]]) -> list[dict]:
+    if not arranged_units:
+        return []
+    total_hours = max(len(units) for units in arranged_units.values())
+    conflicts = []
+    for index in range(total_hours):
+        units = []
+        for class_code, class_units in arranged_units.items():
+            if index < len(class_units):
+                units.append({"classCode": class_code, "load": class_units[index]})
+        for conflict in sync_teacher_conflicts_for_units(units):
+            conflict["occurrenceIndex"] = index
+            conflicts.append(conflict)
+    return conflicts
+
+
+def exact_sync_arrangement(records: dict, lane_permutations: dict[str, list[list[dict]]], total_hours: int) -> dict[str, list[dict]] | None:
+    if total_hours > 6 or len(lane_permutations) > 18:
+        return None
+    lanes = sorted(
+        lane_permutations,
+        key=lambda class_code: (len(lane_permutations[class_code]), display_name(records, "학급", class_code)),
+    )
+    used_by_occurrence = [set() for _ in range(total_hours)]
+    assigned = {}
+    node_count = 0
+    node_limit = 120000
+
+    def search(position: int) -> bool:
+        nonlocal node_count
+        node_count += 1
+        if node_count > node_limit:
+            return False
+        if position >= len(lanes):
+            return True
+        class_code = lanes[position]
+        for permutation in lane_permutations[class_code]:
+            blocked = False
+            for index, load in enumerate(permutation):
+                teacher_code = as_text(load.get("teacherCode"))
+                if teacher_code and teacher_code in used_by_occurrence[index]:
+                    blocked = True
+                    break
+            if blocked:
+                continue
+            assigned[class_code] = permutation
+            for index, load in enumerate(permutation):
+                teacher_code = as_text(load.get("teacherCode"))
+                if teacher_code:
+                    used_by_occurrence[index].add(teacher_code)
+            if search(position + 1):
+                return True
+            for index, load in enumerate(permutation):
+                teacher_code = as_text(load.get("teacherCode"))
+                if teacher_code:
+                    used_by_occurrence[index].discard(teacher_code)
+            assigned.pop(class_code, None)
+        return False
+
+    return deepcopy(assigned) if search(0) else None
+
+
+def greedy_sync_arrangement(records: dict, lane_permutations: dict[str, list[list[dict]]], total_hours: int) -> dict[str, list[dict]]:
+    used_by_occurrence = [set() for _ in range(total_hours)]
+    arranged = {}
+    lanes = sorted(
+        lane_permutations,
+        key=lambda class_code: (len(lane_permutations[class_code]), display_name(records, "학급", class_code)),
+    )
+    for class_code in lanes:
+        def permutation_score(permutation: list[dict]) -> tuple:
+            duplicate_count = 0
+            load_balance = 0
+            for index, load in enumerate(permutation):
+                teacher_code = as_text(load.get("teacherCode"))
+                if teacher_code and teacher_code in used_by_occurrence[index]:
+                    duplicate_count += 1
+                load_balance += len(used_by_occurrence[index])
+            return (
+                duplicate_count,
+                load_balance,
+                tuple(sync_unit_identity(item) for item in permutation),
+            )
+
+        chosen = min(lane_permutations[class_code], key=permutation_score)
+        arranged[class_code] = chosen
+        for index, load in enumerate(chosen):
+            teacher_code = as_text(load.get("teacherCode"))
+            if teacher_code:
+                used_by_occurrence[index].add(teacher_code)
+    return arranged
+
+
+def repair_sync_arrangement(arranged_units: dict[str, list[dict]], max_steps: int = 400) -> dict[str, list[dict]]:
+    arranged = deepcopy(arranged_units)
+    for _ in range(max_steps):
+        conflicts = sync_arrangement_conflicts(arranged)
+        if not conflicts:
+            break
+        current_count = sum(item.get("count", 0) - 1 for item in conflicts)
+        best_swap = None
+        best_count = current_count
+        total_hours = max(len(units) for units in arranged.values()) if arranged else 0
+        for conflict in conflicts:
+            source_index = conflict.get("occurrenceIndex", 0)
+            for unit in conflict.get("units", []):
+                class_code = as_text(unit.get("classCode"))
+                if class_code not in arranged:
+                    continue
+                for target_index in range(total_hours):
+                    if target_index == source_index:
+                        continue
+                    trial = deepcopy(arranged)
+                    trial[class_code][source_index], trial[class_code][target_index] = trial[class_code][target_index], trial[class_code][source_index]
+                    trial_conflicts = sync_arrangement_conflicts(trial)
+                    trial_count = sum(item.get("count", 0) - 1 for item in trial_conflicts)
+                    if trial_count < best_count:
+                        best_count = trial_count
+                        best_swap = (class_code, source_index, target_index)
+        if not best_swap:
+            break
+        class_code, source_index, target_index = best_swap
+        arranged[class_code][source_index], arranged[class_code][target_index] = arranged[class_code][target_index], arranged[class_code][source_index]
+    return arranged
+
+
+def arrange_sync_lane_units(records: dict, lane_units: dict[str, list[dict]], total_hours: int) -> tuple[dict[str, list[dict]], str, list[dict]]:
+    lane_permutations = {
+        class_code: sync_lane_permutations(records, units)
+        for class_code, units in lane_units.items()
+    }
+    exact = exact_sync_arrangement(records, lane_permutations, total_hours)
+    if exact is not None:
+        return exact, "exact-teacher-dedup", []
+    arranged = greedy_sync_arrangement(records, lane_permutations, total_hours)
+    arranged = repair_sync_arrangement(arranged)
+    conflicts = sync_arrangement_conflicts(arranged)
+    return arranged, "greedy-swap-teacher-dedup", conflicts
+
+
 def build_sync_bundles(records: dict, issues: list[dict] | None = None) -> list[dict]:
     """Build simultaneous-class bundles from 교사별 시수표 동시그룹 values."""
     grouped = defaultdict(list)
@@ -1248,11 +1466,30 @@ def build_sync_bundles(records: dict, issues: list[dict] | None = None) -> list[
                     units.append(load)
             lane_units[class_code] = units
 
+        arranged_units, arrangement_method, teacher_conflicts = arrange_sync_lane_units(records, lane_units, total_hours)
+        if teacher_conflicts and issues is not None:
+            for conflict in teacher_conflicts:
+                occurrence_number = (parse_nonnegative_int(conflict.get("occurrenceIndex")) or 0) + 1
+                teacher_name = conflict.get("teacherName") or display_name(records, "교사", conflict.get("teacherCode", ""))
+                class_detail = ", ".join(item for item in conflict.get("classNames", []) if item)
+                for unit in conflict.get("units", []):
+                    load = unit.get("load") or unit
+                    add_issue(
+                        issues,
+                        "error",
+                        sheet_name,
+                        load.get("row", 2),
+                        sync_column,
+                        f"동시그룹 '{group_code}' {occurrence_number}회차 후보에서 {teacher_name} 교사가 {conflict.get('count', 0)}개 학급에 동시에 필요합니다.",
+                        f"자동 재조합으로도 교사 중복을 없애지 못했습니다. {class_detail}의 교사 또는 동시그룹 구성을 조정하세요.",
+                    )
+            continue
+
         occurrences = []
         for index in range(total_hours):
             occurrence_id = f"{group_code}:{index + 1}"
             units = []
-            for class_code, units_for_lane in sorted(lane_units.items(), key=lambda item: display_name(records, "학급", item[0])):
+            for class_code, units_for_lane in sorted(arranged_units.items(), key=lambda item: display_name(records, "학급", item[0])):
                 if index >= len(units_for_lane):
                     continue
                 load = units_for_lane[index]
@@ -1273,6 +1510,7 @@ def build_sync_bundles(records: dict, issues: list[dict] | None = None) -> list[
         bundles.append({
             "syncGroup": group_code,
             "laneHours": lane_hours,
+            "arrangementMethod": arrangement_method,
             "occurrences": occurrences,
         })
 
@@ -2398,6 +2636,22 @@ def sync_occurrence_entries(occurrence: dict, records: dict) -> list[dict]:
     return entries
 
 
+def sync_occurrence_teacher_conflicts(occurrence: dict) -> list[dict]:
+    return sync_teacher_conflicts_for_units(occurrence.get("units", []))
+
+
+def sync_occurrence_failure_reason(occurrence: dict, records: dict) -> str:
+    conflicts = sync_occurrence_teacher_conflicts(occurrence)
+    if conflicts:
+        parts = []
+        for conflict in conflicts[:3]:
+            teacher_name = conflict.get("teacherName") or display_name(records, "교사", conflict.get("teacherCode", ""))
+            class_names = ", ".join(item for item in conflict.get("classNames", []) if item)
+            parts.append(f"{teacher_name}({class_names})")
+        return f"동시그룹 {occurrence.get('syncGroup', '')} 회차 내부에 같은 교사 중복이 있습니다: {'; '.join(parts)}."
+    return f"동시그룹 {occurrence.get('syncGroup', '')} 전체가 들어갈 공통 교시를 찾지 못했습니다. 이미 배치된 동시수업, 학급 빈칸, 교사 시간 중복을 함께 확인하세요."
+
+
 def sync_slot_free(schedule, occurrence: dict, records: dict, day: str, period: int, teacher_busy, room_busy, forbidden, settings: dict) -> bool:
     seen_classes = set()
     seen_teachers = set()
@@ -2722,6 +2976,7 @@ def solve_greedy(records: dict, strategy: str, gene: dict | None = None) -> dict
             _, day, period = min(candidates, key=lambda item: item[0])
             place_sync_occurrence(schedule, occurrence, records, day, period, teacher_busy, room_busy)
             continue
+        reason = sync_occurrence_failure_reason(occurrence, records)
         for entry in entries:
             unassigned.append({
                 "teacherCode": entry["teacherCode"],
@@ -2734,7 +2989,7 @@ def solve_greedy(records: dict, strategy: str, gene: dict | None = None) -> dict
                 "syncGroup": entry.get("syncGroup", ""),
                 "syncOccurrenceId": entry.get("syncOccurrenceId", ""),
                 "syncLaneKey": entry.get("syncLaneKey", ""),
-                "reason": f"동시그룹 {entry.get('syncGroup', '')} 전체가 들어갈 공통 교시를 찾지 못했습니다.",
+                "reason": reason,
             })
 
     blocks = []
