@@ -100,6 +100,11 @@
               <h3>시간표를 만들고 있습니다</h3>
               <p>미배정을 줄이는 후보를 비교하고, 연강·점심·균등배분 조건을 함께 검토하는 중입니다.</p>
             </div>
+            <div class="solve-progress-card">
+              <div id="solveProgressMessage" class="status-line">탐색을 시작하고 있습니다.</div>
+              <div id="solveProgressStats" class="solve-progress-stats"></div>
+              <button id="acceptBestSolveButton" class="button primary hidden" type="button">현재 최선안 사용</button>
+            </div>
             <div id="solveFailureBox" class="solve-failure hidden">
               <strong id="solveFailureTitle">자동배정 실패</strong>
               <p id="solveFailureMessage"></p>
@@ -239,6 +244,11 @@
               <div id="chatAiStatus" class="status-line">왼쪽 시작 패널에서 AI 키를 먼저 검증하세요.</div>
               <div id="chatConstraintList" class="constraint-draft-list"></div>
               <div id="chatLog" class="chat-log"></div>
+              <div id="chatPendingBox" class="chat-pending hidden">
+                <div class="mini-spinner" aria-hidden="true"></div>
+                <span id="chatPendingMessage">AI가 답변을 준비하고 있습니다.</span>
+                <button id="chatUseLocalButton" class="mini-button ghost hidden" type="button">지금 답변하기</button>
+              </div>
               <div class="chat-form">
                 <textarea id="chatMessage" class="textarea" rows="3" placeholder="예: 김교사 금요일 6교시는 배정하지 말아줘."></textarea>
                 <button id="chatButton" class="button primary" type="button">
@@ -356,6 +366,11 @@
       <div class="loading-spinner" role="status" aria-label="AI 자동배정 진행 중"></div>
       <strong>시간표를 다시 탐색하고 있습니다</strong>
       <span>강력형 탐색으로 여러 seed와 완화 조합을 비교합니다.</span>
+      <div class="solve-progress-card">
+        <div id="solveOverlayProgressMessage" class="status-line">탐색을 시작하고 있습니다.</div>
+        <div id="solveOverlayProgressStats" class="solve-progress-stats"></div>
+        <button id="acceptBestSolveOverlayButton" class="button primary hidden" type="button">현재 최선안 사용</button>
+      </div>
     </div>
     <script src="/app.js"></script>
   </body>

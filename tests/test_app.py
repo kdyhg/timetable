@@ -112,8 +112,125 @@ class TimetableAppTests(unittest.TestCase):
         self.assertIn("openChangePreview", script)
         self.assertIn("/schedules/move-preview", script)
         self.assertIn("/schedules/proposals/apply", script)
+        self.assertIn("/schedules/solve/start", script)
+        self.assertIn("/schedules/solve/continue", script)
+        self.assertIn("/schedules/solve/accept", script)
+        self.assertIn("/ai/chat/local", script)
+        self.assertIn('id="acceptBestSolveButton"', html)
+        self.assertIn('id="acceptBestSolveOverlayButton"', html)
+        self.assertIn('id="chatUseLocalButton"', html)
+        self.assertIn("현재 최선안 사용", html)
+        self.assertIn("지금 답변하기", html)
+        self.assertNotIn("timeBudgetSeconds", script)
+        self.assertNotIn("skipped_timeout_guard", script)
         self.assertIn("document.addEventListener(\"keydown\", handleQuickEditKeydown)", script)
         self.assertNotIn("유전탐색", script)
+
+    def test_progressive_solve_session_accept_persists_best_only_on_accept(self):
+        workbook = create_template_workbook()
+        set_config_value(workbook, "점심시간보호", "N")
+        set_config_value(workbook, "최대연강허용", "7")
+        append_named_row(workbook, "교사", {"교사명": "김교사"})
+        append_named_row(workbook, "학급-계열", {"학급명": "1-1", "학년": "1", "계열": "공통", "담임교사명": "김교사", "가상학급여부": "N"})
+        append_named_row(workbook, "과목", {"과목명": "국어", "단축명": "국", "NEIS과목명": "국어"})
+        append_named_row(workbook, "교사별 시수표", {"교사명": "김교사", "과목명": "국어"})
+        load_sheet = workbook["교사별 시수표"]
+        class_start = len(SPECS_BY_NAME["교사별 시수표"]) + 1
+        load_sheet.cell(row=1, column=class_start).value = "1-1"
+        load_sheet.cell(row=load_sheet.max_row, column=class_start).value = 1
+        validation = validate_workbook(workbook)
+        self.assertTrue(validation["ok"])
+        with patch.object(app_module, "save_last_schedule") as save_last_schedule:
+            started = app_module.start_solve_session(validation["records"], {"iterations": 12, "searchStrength": "fast"})
+            self.assertTrue(started["ok"])
+            self.assertTrue(started["canAccept"])
+            continued = app_module.continue_solve_session(validation["records"], started["sessionId"])
+            self.assertTrue(continued["ok"])
+            save_last_schedule.assert_not_called()
+            accepted = app_module.accept_solve_session(started["sessionId"])
+            self.assertIn("selected", accepted)
+            self.assertIn("solveSession", accepted)
+            save_last_schedule.assert_called_once()
+
+    def test_sync_group_lane_hours_validate_and_move_together(self):
+        workbook = create_template_workbook()
+        set_config_value(workbook, "점심시간보호", "N")
+        set_config_value(workbook, "최대연강허용", "7")
+        append_named_row(workbook, "교사", {"교사명": "김국어"})
+        append_named_row(workbook, "교사", {"교사명": "박수학"})
+        append_named_row(workbook, "학급-계열", {"학급명": "1-1", "학년": "1", "계열": "공통", "담임교사명": "김국어", "가상학급여부": "N"})
+        append_named_row(workbook, "학급-계열", {"학급명": "1-2", "학년": "1", "계열": "공통", "담임교사명": "박수학", "가상학급여부": "N"})
+        append_named_row(workbook, "과목", {"과목명": "국어", "단축명": "국", "NEIS과목명": "국어"})
+        append_named_row(workbook, "과목", {"과목명": "수학", "단축명": "수", "NEIS과목명": "수학"})
+        append_named_row(workbook, "교사별 시수표", {"교사명": "김국어", "과목명": "국어", "동시그룹": "G1"})
+        append_named_row(workbook, "교사별 시수표", {"교사명": "박수학", "과목명": "수학", "동시그룹": "G1"})
+        load_sheet = workbook["교사별 시수표"]
+        class_start = len(SPECS_BY_NAME["교사별 시수표"]) + 1
+        load_sheet.cell(row=1, column=class_start).value = "1-1"
+        load_sheet.cell(row=1, column=class_start + 1).value = "1-2"
+        load_sheet.cell(row=load_sheet.max_row - 1, column=class_start).value = 2
+        load_sheet.cell(row=load_sheet.max_row, column=class_start + 1).value = 2
+        validation = validate_workbook(workbook)
+        self.assertTrue(validation["ok"], validation["issues"])
+        self.assertEqual(len(validation["records"].get("syncBundles", [])), 1)
+        selected = solve_schedule(validation["records"], solve_options={"iterations": 12, "searchStrength": "fast"})["selected"]
+        by_occurrence = defaultdict(set)
+        for class_data in selected["schedule"]["classes"].values():
+            for day in selected["schedule"]["days"]:
+                for period in selected["schedule"]["periods"]:
+                    cell = class_data["grid"][day][str(period)]
+                    if cell and cell.get("syncOccurrenceId"):
+                        by_occurrence[cell["syncOccurrenceId"]].add((day, period))
+        self.assertTrue(by_occurrence)
+        self.assertTrue(all(len(slots) == 1 for slots in by_occurrence.values()))
+
+        source = None
+        source_occurrence = None
+        for day in selected["schedule"]["days"]:
+            for period in selected["schedule"]["periods"]:
+                cell = selected["schedule"]["classes"]["C001"]["grid"][day][str(period)]
+                if cell and cell.get("syncOccurrenceId"):
+                    source = {"classCode": "C001", "day": day, "period": period}
+                    source_occurrence = cell["syncOccurrenceId"]
+                    break
+            if source:
+                break
+        options = quick_move_options(validation["records"], selected["schedule"], source)
+        move_option = next(item for item in options["options"] if item["mode"] == "move")
+        moved = move_schedule(validation["records"], selected["schedule"], {
+            "mode": "move",
+            "from": source,
+            "to": {"day": move_option["day"], "period": move_option["period"]},
+        })
+        self.assertIn("validation", moved)
+        moved_slots = set()
+        for class_data in moved["schedule"]["classes"].values():
+            for day in moved["schedule"]["days"]:
+                for period in moved["schedule"]["periods"]:
+                    cell = class_data["grid"][day][str(period)]
+                    if cell and cell.get("syncOccurrenceId") == source_occurrence:
+                        moved_slots.add((day, period))
+        self.assertEqual(moved_slots, {(move_option["day"], move_option["period"])})
+
+    def test_sync_group_lane_hour_mismatch_is_upload_error(self):
+        workbook = create_template_workbook()
+        append_named_row(workbook, "교사", {"교사명": "김국어"})
+        append_named_row(workbook, "교사", {"교사명": "박수학"})
+        append_named_row(workbook, "학급-계열", {"학급명": "1-1", "학년": "1", "계열": "공통", "담임교사명": "김국어", "가상학급여부": "N"})
+        append_named_row(workbook, "학급-계열", {"학급명": "1-2", "학년": "1", "계열": "공통", "담임교사명": "박수학", "가상학급여부": "N"})
+        append_named_row(workbook, "과목", {"과목명": "국어", "단축명": "국", "NEIS과목명": "국어"})
+        append_named_row(workbook, "과목", {"과목명": "수학", "단축명": "수", "NEIS과목명": "수학"})
+        append_named_row(workbook, "교사별 시수표", {"교사명": "김국어", "과목명": "국어", "동시그룹": "G1"})
+        append_named_row(workbook, "교사별 시수표", {"교사명": "박수학", "과목명": "수학", "동시그룹": "G1"})
+        load_sheet = workbook["교사별 시수표"]
+        class_start = len(SPECS_BY_NAME["교사별 시수표"]) + 1
+        load_sheet.cell(row=1, column=class_start).value = "1-1"
+        load_sheet.cell(row=1, column=class_start + 1).value = "1-2"
+        load_sheet.cell(row=load_sheet.max_row - 1, column=class_start).value = 2
+        load_sheet.cell(row=load_sheet.max_row, column=class_start + 1).value = 1
+        validation = validate_workbook(workbook)
+        self.assertFalse(validation["ok"])
+        self.assertIn("동시그룹", json.dumps(validation["issues"], ensure_ascii=False))
 
     def test_vercel_python_entrypoints_are_declared(self):
         api_index = (app_module.ROOT / "api" / "index.py").read_text(encoding="utf-8")

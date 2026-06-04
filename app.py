@@ -35,6 +35,7 @@ if not RUNTIME_DATA_DIR and os.environ.get("VERCEL"):
     RUNTIME_DATA_DIR = "/tmp/timetable-data"
 DATA_DIR = Path(RUNTIME_DATA_DIR).resolve() if RUNTIME_DATA_DIR else ROOT / "data"
 IMPORT_DIR = DATA_DIR / "imports"
+SOLVE_SESSION_DIR = DATA_DIR / "solve_sessions"
 LAST_SCHEDULE_FILE = DATA_DIR / "last_schedule.json"
 OPERATION_LOG_FILE = DATA_DIR / "operation_log.jsonl"
 
@@ -220,6 +221,7 @@ EXAMPLE_ROWS = {
 
 def ensure_dirs() -> None:
     IMPORT_DIR.mkdir(parents=True, exist_ok=True)
+    SOLVE_SESSION_DIR.mkdir(parents=True, exist_ok=True)
 
 
 SENSITIVE_LOG_KEYS = {"apiKey", "api_key", "authorization", "Authorization", "x-goog-api-key", "token", "secret"}
@@ -854,6 +856,7 @@ def validate_workbook(wb: Workbook) -> dict:
         "fixedPeriods": [],
         "constraints": [],
         "syncGroups": [],
+        "syncBundles": [],
         "continuous": [],
         "coTeachers": [],
         "neis": [],
@@ -911,6 +914,7 @@ def validate_workbook(wb: Workbook) -> dict:
     parse_loads(wb, records, issues)
     parse_constraints(wb, records, issues)
     parse_sync_groups(wb, records, issues)
+    build_sync_bundles(records, issues)
     parse_continuous(wb, records, issues)
     parse_co_teachers(wb, records, issues)
     parse_neis(wb, records, issues)
@@ -1175,6 +1179,93 @@ def parse_sync_groups(wb, records, issues):
         })
 
 
+def sync_lane_key_for_load(load: dict) -> str:
+    return f"{as_text(load.get('syncGroup'))}::{as_text(load.get('subjectCode'))}"
+
+
+def build_sync_bundles(records: dict, issues: list[dict] | None = None) -> list[dict]:
+    """Build simultaneous-class bundles from 교사별 시수표 동시그룹 values."""
+    grouped = defaultdict(list)
+    for load in records.get("loads", []):
+        group = as_text(load.get("syncGroup"))
+        if group:
+            grouped[group].append(load)
+
+    bundles = []
+    occurrence_sizes = {}
+    sheet_name = SHEET_SPECS[5][0]
+    headers = SPECS_BY_NAME[sheet_name]
+    sync_column = get_column_letter(column_index(headers, "동시그룹")) if "동시그룹" in headers else "E"
+
+    for group_code, loads in sorted(grouped.items(), key=lambda item: item[0]):
+        lanes = defaultdict(list)
+        for load in loads:
+            lanes[as_text(load.get("subjectCode"))].append(load)
+
+        lane_hours = {
+            subject_code: sum(parse_positive_int(load.get("weeklyHours")) or 0 for load in lane_loads)
+            for subject_code, lane_loads in lanes.items()
+        }
+        nonzero_totals = {hours for hours in lane_hours.values() if hours > 0}
+        if len(nonzero_totals) > 1 and issues is not None:
+            detail = ", ".join(
+                f"{display_name(records, '과목', subject_code)} {hours}시간"
+                for subject_code, hours in sorted(lane_hours.items(), key=lambda item: display_name(records, "과목", item[0]))
+            )
+            for load in loads:
+                add_issue(
+                    issues,
+                    "error",
+                    sheet_name,
+                    load.get("row", 2),
+                    sync_column,
+                    f"동시그룹 '{group_code}'의 과목별 합산 시수가 같아야 합니다.",
+                    f"현재 {detail}입니다. 같은 동시그룹의 과목 lane 시수를 동일하게 맞춰주세요.",
+                )
+            continue
+
+        total_hours = next(iter(nonzero_totals), 0)
+        lane_units = {}
+        for subject_code, lane_loads in lanes.items():
+            units = []
+            for load in sorted(lane_loads, key=lambda item: (item.get("className", ""), item.get("teacherName", ""), item.get("row", 0))):
+                for _ in range(parse_positive_int(load.get("weeklyHours")) or 0):
+                    units.append(load)
+            lane_units[subject_code] = units
+
+        occurrences = []
+        for index in range(total_hours):
+            occurrence_id = f"{group_code}:{index + 1}"
+            units = []
+            for subject_code, units_for_lane in sorted(lane_units.items(), key=lambda item: display_name(records, "과목", item[0])):
+                if index >= len(units_for_lane):
+                    continue
+                load = units_for_lane[index]
+                lane_key = f"{group_code}::{subject_code}"
+                units.append({
+                    "laneKey": lane_key,
+                    "subjectCode": subject_code,
+                    "load": load,
+                })
+            if units:
+                occurrences.append({
+                    "syncGroup": group_code,
+                    "syncOccurrenceId": occurrence_id,
+                    "units": units,
+                })
+                occurrence_sizes[occurrence_id] = len(units)
+
+        bundles.append({
+            "syncGroup": group_code,
+            "laneHours": lane_hours,
+            "occurrences": occurrences,
+        })
+
+    records["syncBundles"] = bundles
+    records["_syncOccurrenceSize"] = occurrence_sizes
+    return bundles
+
+
 def parse_continuous(wb, records, issues):
     sheet = "연속수업"
     headers = SPECS_BY_NAME[sheet]
@@ -1239,6 +1330,7 @@ def summarize_records(records) -> dict:
         "fixedPeriodCount": len(records.get("fixedPeriods", [])),
         "constraintCount": len(records.get("constraints", [])),
         "syncGroupCount": len(records.get("syncGroups", [])),
+        "syncBundleCount": len(records.get("syncBundles", [])),
         "continuousCount": len(records.get("continuous", [])),
         "coTeacherCount": len(records.get("coTeachers", [])),
     }
@@ -1721,6 +1813,8 @@ def get_records_from_body(body: dict) -> dict | None:
         records = records_with_config(records, body.get("effectiveConfig"))
     if records is not None and body.get("chatConstraints"):
         records = records_with_chat_constraints(records, body.get("chatConstraints"))
+    if records is not None and "syncBundles" not in records:
+        build_sync_bundles(records, None)
     return records
 
 
@@ -1919,19 +2013,6 @@ def solve_run_seed(solve_options: dict | None) -> int:
     return random.SystemRandom().randint(1, 2_147_483_647)
 
 
-def solve_time_budget_seconds(solve_options: dict | None) -> int:
-    explicit = parse_positive_int((solve_options or {}).get("timeBudgetSeconds"))
-    if explicit:
-        return max(5, min(explicit, 280))
-    if os.environ.get("VERCEL"):
-        return 55
-    return 0
-
-
-def deadline_reached(deadline: float | None) -> bool:
-    return bool(deadline and time.monotonic() >= deadline)
-
-
 def preference_weights(settings: dict) -> dict:
     order_text = settings.get("preferenceOrder") or ""
     tokens = [part.strip() for part in re.split(r"[>,/]+", order_text) if part.strip()]
@@ -2027,6 +2108,15 @@ def entry_for_load(load: dict, records: dict, block_size: int) -> dict:
         "blockSize": block_size,
         "source": "auto",
     }
+
+
+def sync_entry_for_unit(unit: dict, records: dict) -> dict:
+    load = unit["load"]
+    entry = entry_for_load(load, records, 1)
+    entry["syncGroup"] = as_text(load.get("syncGroup"))
+    entry["syncOccurrenceId"] = unit.get("syncOccurrenceId", "")
+    entry["syncLaneKey"] = unit.get("laneKey", sync_lane_key_for_load(load))
+    return entry
 
 
 def fixed_entry(item: dict) -> dict:
@@ -2135,6 +2225,64 @@ def place_entry(schedule, class_code, day, start_period, size, teacher_busy, roo
         teacher_busy[entry["teacherCode"]].add((day, period))
         if entry.get("roomCode"):
             room_busy[entry["roomCode"]].add((day, period))
+
+
+def sync_occurrence_entries(occurrence: dict, records: dict) -> list[dict]:
+    entries = []
+    occurrence_id = occurrence.get("syncOccurrenceId", "")
+    for unit in occurrence.get("units", []):
+        prepared = dict(unit)
+        prepared["syncOccurrenceId"] = occurrence_id
+        entries.append(sync_entry_for_unit(prepared, records))
+    return entries
+
+
+def sync_slot_free(schedule, occurrence: dict, records: dict, day: str, period: int, teacher_busy, room_busy, forbidden, settings: dict) -> bool:
+    seen_classes = set()
+    seen_teachers = set()
+    seen_rooms = set()
+    for entry in sync_occurrence_entries(occurrence, records):
+        class_code = entry.get("classCode")
+        teacher_code = entry.get("teacherCode")
+        room_code = entry.get("roomCode")
+        if class_code in seen_classes:
+            return False
+        if teacher_code and teacher_code in seen_teachers:
+            return False
+        if room_code and room_code in seen_rooms:
+            return False
+        seen_classes.add(class_code)
+        if teacher_code:
+            seen_teachers.add(teacher_code)
+        if room_code:
+            seen_rooms.add(room_code)
+        if not class_period_available(schedule, class_code, day, period):
+            return False
+        if schedule["classes"][class_code]["grid"][day][str(period)]:
+            return False
+        if teacher_code and (day, period) in teacher_busy[teacher_code]:
+            return False
+        if room_code and (day, period) in room_busy[room_code]:
+            return False
+        if hard_forbidden(forbidden, entry, day, period):
+            return False
+        if teacher_code and violates_teacher_flow(teacher_busy, teacher_code, day, [period], settings):
+            return False
+        if teacher_code and teacher_day_max_penalty(teacher_busy, teacher_code, day, 1, settings) is None:
+            return False
+    return True
+
+
+def place_sync_occurrence(schedule, occurrence: dict, records: dict, day: str, period: int, teacher_busy, room_busy) -> None:
+    for entry in sync_occurrence_entries(occurrence, records):
+        class_code = entry["classCode"]
+        cell = deepcopy(entry)
+        cell["blockIndex"] = 1
+        schedule["classes"][class_code]["grid"][day][str(period)] = cell
+        if cell.get("teacherCode"):
+            teacher_busy[cell["teacherCode"]].add((day, period))
+        if cell.get("roomCode"):
+            room_busy[cell["roomCode"]].add((day, period))
 
 
 def day_subject_count(schedule, class_code, day, subject_code) -> int:
@@ -2328,7 +2476,7 @@ def teacher_issue_summary(records: dict, schedule: dict, validation: dict | None
                 "details": details,
                 "severity": "error" if "중복" in tags else "warning",
             })
-    return sorted(issues, key=lambda item: (-len(item["issues"]), -item["totalHours"], item["teacherName"]))
+    return sorted(issues, key=lambda item: item["teacherName"])
 
 
 def timetable_quality_score(candidate: dict) -> float:
@@ -2353,8 +2501,69 @@ def solve_greedy(records: dict, strategy: str, gene: dict | None = None) -> dict
     unassigned = []
     apply_fixed_periods(records, schedule, teacher_busy)
 
+    sync_occurrences = [
+        occurrence
+        for bundle in records.get("syncBundles", [])
+        for occurrence in bundle.get("occurrences", [])
+    ]
+    if randomness:
+        sync_occurrences = sync_occurrences[:]
+        rng.shuffle(sync_occurrences)
+    else:
+        sync_occurrences.sort(key=lambda item: (item.get("syncGroup", ""), item.get("syncOccurrenceId", "")))
+
+    for occurrence in sync_occurrences:
+        candidates = []
+        day_order = list(days)
+        period_order = list(range(1, max_period + 1))
+        if randomness:
+            rng.shuffle(day_order)
+            rng.shuffle(period_order)
+        entries = sync_occurrence_entries(occurrence, records)
+        for day_index, day in enumerate(day_order):
+            for period in period_order:
+                if not sync_slot_free(schedule, occurrence, records, day, period, teacher_busy, room_busy, forbidden, settings):
+                    continue
+                same_day = sum(day_subject_count(schedule, entry["classCode"], day, entry["subjectCode"]) for entry in entries)
+                teacher_load = sum(teacher_day_count(teacher_busy, entry["teacherCode"], day) for entry in entries if entry.get("teacherCode"))
+                balance_penalty = sum(
+                    teacher_balance_penalty(teacher_busy, entry["teacherCode"], day, period, settings)
+                    for entry in entries
+                    if entry.get("teacherCode")
+                )
+                constraint_penalty = sum(soft_constraint_score(records, entry, day, period, max_period) for entry in entries)
+                day_max_penalty = sum(
+                    teacher_day_max_penalty(teacher_busy, entry["teacherCode"], day, 1, settings) or 0
+                    for entry in entries
+                    if entry.get("teacherCode")
+                )
+                score = teacher_load * 1.6 + same_day * 2.4 * weights["sameSubject"] + balance_penalty * 1.25 + constraint_penalty + day_max_penalty + day_index * 0.05
+                if randomness:
+                    score += rng.uniform(-0.4, 0.4) * randomness
+                candidates.append((score, day, period))
+        if candidates:
+            _, day, period = min(candidates, key=lambda item: item[0])
+            place_sync_occurrence(schedule, occurrence, records, day, period, teacher_busy, room_busy)
+            continue
+        for entry in entries:
+            unassigned.append({
+                "teacherCode": entry["teacherCode"],
+                "teacherName": entry.get("teacherName") or display_name(records, "교사", entry["teacherCode"]),
+                "subjectCode": entry["subjectCode"],
+                "subjectName": entry.get("subjectName") or display_name(records, "과목", entry["subjectCode"]),
+                "classCode": entry["classCode"],
+                "className": entry.get("className") or display_name(records, "학급", entry["classCode"]),
+                "hours": 1,
+                "syncGroup": entry.get("syncGroup", ""),
+                "syncOccurrenceId": entry.get("syncOccurrenceId", ""),
+                "syncLaneKey": entry.get("syncLaneKey", ""),
+                "reason": f"동시그룹 {entry.get('syncGroup', '')} 전체가 들어갈 공통 교시를 찾지 못했습니다.",
+            })
+
     blocks = []
     for load in records.get("loads", []):
+        if as_text(load.get("syncGroup")):
+            continue
         for block_size in parse_block_pattern(load.get("continuousPattern"), load["weeklyHours"]):
             blocks.append((load, block_size))
     if strategy in {"spread-days", "spread-periods", "genetic-balanced"}:
@@ -2433,7 +2642,7 @@ def solve_greedy(records: dict, strategy: str, gene: dict | None = None) -> dict
         diagnostics.insert(0, {
             "type": "repair",
             "severity": "success",
-            "title": "미배정 후처리",
+            "title": "미배정 자동 보정 기록",
             "reason": note,
             "suggestion": "검증 결과를 확인하세요.",
         })
@@ -2507,6 +2716,9 @@ def repair_unassigned_blocks(records: dict, schedule: dict, unassigned: list[dic
     periods = list(schedule.get("periods", []))
 
     for item in unassigned:
+        if item.get("syncOccurrenceId"):
+            remaining.append(item)
+            continue
         load = load_for_unassigned(records, item)
         block_size = parse_positive_int(item.get("hours")) or 1
         if not load:
@@ -2776,7 +2988,7 @@ def crossover_gene(parent_a: dict, parent_b: dict, rng: random.Random, generatio
     }
 
 
-def solve_metaheuristic(records: dict, include_relaxations: bool = True, seed: int | None = None, search_strength: str = "strong", return_stats: bool = False, deadline: float | None = None):
+def solve_metaheuristic(records: dict, include_relaxations: bool = True, seed: int | None = None, search_strength: str = "strong", return_stats: bool = False):
     settings = constraint_settings(records)
     iterations = search_iteration_budget(settings, normalize_search_strength(search_strength))
     seed = seed or solve_run_seed(None)
@@ -2788,13 +3000,8 @@ def solve_metaheuristic(records: dict, include_relaxations: bool = True, seed: i
     timed_out = False
     for gene in genes[: max(10, min(len(genes), iterations))]:
         for profile in profiles:
-            if deadline_reached(deadline):
-                timed_out = True
-                break
             population.append(solve_gene(records, gene, profile))
             attempt_count += 1
-        if timed_out:
-            break
     if not population:
         population = [
             solve_gene(records, genes[0] if genes else {"seed": seed, "strategy": "balanced", "randomness": 0.0}, profiles[0])
@@ -2802,15 +3009,9 @@ def solve_metaheuristic(records: dict, include_relaxations: bool = True, seed: i
         attempt_count += 1
     generations = search_generation_budget(iterations, normalize_search_strength(search_strength))
     for generation in range(generations):
-        if timed_out or deadline_reached(deadline):
-            timed_out = True
-            break
         elites = sorted(population, key=candidate_rank, reverse=True)[: max(4, min(10, len(population)))]
         children = []
         for index in range(max(6, iterations // 8)):
-            if deadline_reached(deadline):
-                timed_out = True
-                break
             parent_a = elites[index % len(elites)].get("gene", {})
             parent_b = elites[(index * 3 + 1) % len(elites)].get("gene", {})
             child_gene = crossover_gene(parent_a, parent_b, rng, generation)
@@ -2821,8 +3022,6 @@ def solve_metaheuristic(records: dict, include_relaxations: bool = True, seed: i
             children.append(solve_gene(records, child_gene, profile))
             attempt_count += 1
         population = elites + children
-        if timed_out:
-            break
         if any(candidate_unassigned_count(candidate) == 0 and candidate_error_count(candidate) == 0 for candidate in elites):
             if generation >= (2 if normalize_search_strength(search_strength) != "strong" else 4):
                 break
@@ -3400,7 +3599,7 @@ def local_solve_advice(ai_summary: dict) -> dict:
     }
 
 
-def build_ai_solve_advisor(records: dict, ai_summary: dict, ai_config=None, allow_remote: bool = True) -> dict:
+def build_ai_solve_advisor(records: dict, ai_summary: dict, ai_config=None) -> dict:
     config = normalize_ai_config(ai_config)
     context = {
         "maskedRecords": mask_records_for_ai(records),
@@ -3409,11 +3608,11 @@ def build_ai_solve_advisor(records: dict, ai_summary: dict, ai_config=None, allo
     }
     local_advice = local_solve_advice(ai_summary)
     provider_label = config.get("providerLabel", "AI")
-    remote = call_ai_advisor(config, "solve_review", context) if allow_remote and as_text(config.get("apiKey")) else {
+    remote = call_ai_advisor(config, "solve_review", context) if as_text(config.get("apiKey")) else {
         "ok": False,
-        "status": "skipped_timeout_guard" if as_text(config.get("apiKey")) and not allow_remote else "not-configured",
+        "status": "not-configured",
         "provider": provider_label,
-        "message": f"{provider_label} 원격 조언은 시간 제한 보호를 위해 건너뛰었습니다." if as_text(config.get("apiKey")) and not allow_remote else f"{provider_label} API 키가 없어 로컬 진단만 사용했습니다.",
+        "message": f"{provider_label} API 키가 없어 로컬 진단만 사용했습니다.",
     }
     return {
         "mode": f"{config.get('provider')}-advisor" if remote.get("ok") else "local-fallback",
@@ -3424,13 +3623,11 @@ def build_ai_solve_advisor(records: dict, ai_summary: dict, ai_config=None, allo
     }
 
 
-def solve_schedule(records: dict, api_key: str = "", ai_config=None, solve_options: dict | None = None, persist: bool = True) -> dict:
+def solve_schedule(records: dict, api_key: str = "", ai_config=None, solve_options: dict | None = None, persist: bool = True, advisor: bool = True) -> dict:
     solve_options = solve_options or {}
     started_at = time.monotonic()
     run_id = uuid.uuid4().hex[:12]
     seed = solve_run_seed(solve_options)
-    time_budget = solve_time_budget_seconds(solve_options)
-    deadline = started_at + time_budget if time_budget else None
     search_strength = normalize_search_strength(solve_options.get("searchStrength"))
     variation_mode = normalize_variation_mode(solve_options.get("variationMode"))
     records = apply_solve_options(records, solve_options)
@@ -3447,7 +3644,7 @@ def solve_schedule(records: dict, api_key: str = "", ai_config=None, solve_optio
         candidate.setdefault("aiGenerated", False)
     needs_relaxation = needs_repair_candidates(strict_candidates)
     repair_candidates = generate_ai_repair_candidates(records, strict_candidates)
-    genetic_candidates, genetic_stats = solve_metaheuristic(records, include_relaxations=needs_relaxation, seed=seed, search_strength=search_strength, return_stats=True, deadline=deadline)
+    genetic_candidates, genetic_stats = solve_metaheuristic(records, include_relaxations=needs_relaxation, seed=seed, search_strength=search_strength, return_stats=True)
     annotate_candidate_signatures(genetic_candidates)
     previous_result = load_last_schedule() if variation_mode == "quality-first" else None
     best, best_changed, selection_source = select_quality_first_candidate(records, genetic_candidates, variation_mode, previous_result)
@@ -3455,8 +3652,13 @@ def solve_schedule(records: dict, api_key: str = "", ai_config=None, solve_optio
     candidates = selected_candidate_list(best, genetic_candidates, limit=4)
     ai_summary = summarize_candidate_for_ai(best)
     elapsed_ms = int((time.monotonic() - started_at) * 1000)
-    timed_out = bool(genetic_stats.get("timedOut") or deadline_reached(deadline))
-    allow_remote_advisor = not deadline or time.monotonic() < deadline - 8
+    ai_advisor = build_ai_solve_advisor(records, ai_summary, config) if advisor else {
+        "mode": "local-progress",
+        "privacy": "진행형 탐색 중에는 원격 AI 조언을 건너뛰고 배정 엔진 결과만 갱신합니다.",
+        "aiConfig": public_ai_config(config),
+        "remote": {"ok": False, "status": "not-run", "provider": config.get("providerLabel", "AI"), "message": "진행형 탐색 chunk에서는 원격 AI를 호출하지 않았습니다."},
+        "advice": local_solve_advice(ai_summary),
+    }
     result = {
         "runId": run_id,
         "seed": seed,
@@ -3466,13 +3668,13 @@ def solve_schedule(records: dict, api_key: str = "", ai_config=None, solve_optio
         "candidates": candidates,
         "selected": best,
         "aiSummary": ai_summary,
-        "aiAdvisor": build_ai_solve_advisor(records, ai_summary, config, allow_remote=allow_remote_advisor),
+        "aiAdvisor": ai_advisor,
         "attemptCount": genetic_stats.get("attemptCount", 0),
         "bestChanged": best_changed,
         "bestSignature": best["signature"],
-        "timedOut": timed_out,
+        "timedOut": False,
         "elapsedMs": elapsed_ms,
-        "progressMessage": "시간 제한 내 현재까지의 최선 후보를 반환했습니다." if timed_out else "자동배정 탐색이 완료되었습니다.",
+        "progressMessage": "자동배정 탐색 chunk가 완료되었습니다.",
         "searchStats": {
             **genetic_stats,
             "variationMode": variation_mode,
@@ -3495,7 +3697,7 @@ def solve_schedule(records: dict, api_key: str = "", ai_config=None, solve_optio
         "runId": run_id,
         "seed": seed,
         "elapsedMs": elapsed_ms,
-        "timedOut": timed_out,
+        "timedOut": False,
         "attemptCount": result["attemptCount"],
         "unassigned": len(best.get("unassigned", [])),
         "errors": ai_summary.get("errorCount", 0),
@@ -3507,11 +3709,175 @@ def solve_schedule(records: dict, api_key: str = "", ai_config=None, solve_optio
     return result
 
 
+def solve_result_rank(result: dict | None):
+    if not result:
+        return (-10**9, -10**9, -10**9, -10**9)
+    return candidate_rank((result or {}).get("selected", {}))
+
+
+def solve_best_summary(result: dict | None) -> dict:
+    selected = (result or {}).get("selected", {})
+    validation = selected.get("validation", {})
+    violations = validation.get("violations", [])
+    teacher_issues = selected.get("teacherIssues", [])
+    return {
+        "unassigned": len(selected.get("unassigned", [])),
+        "errors": len([item for item in violations if item.get("severity") == "error"]),
+        "lunchShortage": len([item for item in violations if item.get("type") == "lunch_protection"]),
+        "consecutive": len([item for item in violations if item.get("type") == "max_consecutive"]),
+        "imbalance": len([item for item in teacher_issues if any("안배" in as_text(tag) for tag in item.get("issues", []))]),
+        "score": selected.get("score", 0),
+        "signature": candidate_signature(selected) if selected else "",
+    }
+
+
+def solve_session_key(session_id: str) -> str:
+    return f"solve_session:{session_id}"
+
+
+def save_solve_session(session: dict) -> None:
+    session_id = session.get("id")
+    if not session_id:
+        return
+    if postgres_url():
+        save_state_postgres(solve_session_key(session_id), session)
+        return
+    redis_url, redis_token = redis_config()
+    if redis_url and redis_token:
+        save_state_redis(solve_session_key(session_id), session)
+        return
+    ensure_dirs()
+    (SOLVE_SESSION_DIR / f"{session_id}.json").write_text(json.dumps(session, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_solve_session(session_id: str) -> dict | None:
+    if not session_id:
+        return None
+    if postgres_url():
+        return load_state_postgres(solve_session_key(session_id))
+    redis_url, redis_token = redis_config()
+    if redis_url and redis_token:
+        return load_state_redis(solve_session_key(session_id))
+    path = SOLVE_SESSION_DIR / f"{session_id}.json"
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def solve_session_chunk_options(solve_options: dict | None, chunk_index: int) -> dict:
+    options = deepcopy(solve_options or {})
+    strength = normalize_search_strength(options.get("searchStrength"))
+    chunk_iterations = {"fast": 24, "balanced": 36, "strong": 48}[strength]
+    requested = parse_positive_int(options.get("iterations")) or chunk_iterations
+    options["iterations"] = max(18, min(requested, chunk_iterations))
+    options["searchStrength"] = strength
+    options["variationMode"] = "random"
+    options["seed"] = solve_run_seed(None) + chunk_index * 1009
+    return options
+
+
+def run_solve_session_chunk(records: dict, session: dict) -> tuple[dict, bool]:
+    chunk_index = parse_positive_int(session.get("chunkCount")) or 0
+    chunk_options = solve_session_chunk_options(session.get("solveOptions") or {}, chunk_index)
+    result = solve_schedule(records, ai_config={}, solve_options=chunk_options, persist=False, advisor=False)
+    previous_best = session.get("bestResult")
+    previous_rank = solve_result_rank(previous_best)
+    new_rank = solve_result_rank(result)
+    new_signature = result.get("bestSignature") or candidate_signature(result.get("selected", {}))
+    previous_signature = (previous_best or {}).get("bestSignature") or candidate_signature((previous_best or {}).get("selected", {}))
+    best_changed = False
+    if not previous_best or new_rank > previous_rank or (new_rank == previous_rank and new_signature != previous_signature):
+        session["bestResult"] = result
+        best_changed = True
+    session["chunkCount"] = chunk_index + 1
+    session["attemptCount"] = (parse_positive_int(session.get("attemptCount")) or 0) + (parse_positive_int(result.get("attemptCount")) or 0)
+    session["lastResultSummary"] = solve_best_summary(result)
+    session["bestSummary"] = solve_best_summary(session.get("bestResult"))
+    session["lastUpdatedAt"] = now_iso()
+    session["elapsedMs"] = int((time.time() - float(session.get("startedAtEpoch", time.time()))) * 1000)
+    return result, best_changed
+
+
+def solve_session_response(session: dict, best_changed: bool = False) -> dict:
+    return {
+        "ok": True,
+        "sessionId": session.get("id"),
+        "startedAt": session.get("startedAt"),
+        "elapsedMs": session.get("elapsedMs", 0),
+        "chunkCount": session.get("chunkCount", 0),
+        "attemptCount": session.get("attemptCount", 0),
+        "bestChanged": best_changed,
+        "bestSummary": session.get("bestSummary") or solve_best_summary(session.get("bestResult")),
+        "lastResultSummary": session.get("lastResultSummary") or {},
+        "canAccept": bool(session.get("bestResult")),
+        "progressMessage": "탐색을 계속 진행 중입니다. 20초 이후 현재 최선안을 사용할 수 있습니다.",
+    }
+
+
+def start_solve_session(records: dict, solve_options: dict | None = None) -> dict:
+    session = {
+        "id": uuid.uuid4().hex[:12],
+        "startedAt": now_iso(),
+        "startedAtEpoch": time.time(),
+        "solveOptions": {key: value for key, value in (solve_options or {}).items() if key != "apiKey"},
+        "chunkCount": 0,
+        "attemptCount": 0,
+        "bestResult": None,
+    }
+    _, best_changed = run_solve_session_chunk(records, session)
+    save_solve_session(session)
+    append_operation_log("solve_start", {
+        "sessionId": session["id"],
+        "attemptCount": session.get("attemptCount"),
+        "bestSummary": session.get("bestSummary"),
+    })
+    return solve_session_response(session, best_changed=best_changed)
+
+
+def continue_solve_session(records: dict, session_id: str) -> dict:
+    session = load_solve_session(session_id)
+    if not session:
+        return {"ok": False, "error": "진행 중인 자동배정 탐색 세션을 찾을 수 없습니다."}
+    _, best_changed = run_solve_session_chunk(records, session)
+    save_solve_session(session)
+    append_operation_log("solve_continue", {
+        "sessionId": session_id,
+        "chunkCount": session.get("chunkCount"),
+        "attemptCount": session.get("attemptCount"),
+        "bestSummary": session.get("bestSummary"),
+    })
+    return solve_session_response(session, best_changed=best_changed)
+
+
+def accept_solve_session(session_id: str) -> dict:
+    session = load_solve_session(session_id)
+    if not session or not session.get("bestResult"):
+        return {"ok": False, "error": "현재 최선안을 찾을 수 없습니다. 자동배정을 먼저 시작하세요."}
+    result = deepcopy(session["bestResult"])
+    result["solveSession"] = {
+        "sessionId": session_id,
+        "chunkCount": session.get("chunkCount", 0),
+        "attemptCount": session.get("attemptCount", 0),
+        "elapsedMs": session.get("elapsedMs", 0),
+        "acceptedBestSummary": session.get("bestSummary") or solve_best_summary(result),
+    }
+    result["progressMessage"] = "현재까지의 최선안을 반영했습니다."
+    save_last_schedule(result)
+    append_operation_log("solve_accept", {
+        "sessionId": session_id,
+        "chunkCount": session.get("chunkCount"),
+        "attemptCount": session.get("attemptCount"),
+        "bestSummary": result["solveSession"]["acceptedBestSummary"],
+    })
+    return result
+
+
 def validate_schedule(records: dict, schedule: dict, unassigned=None) -> dict:
     unassigned = unassigned or []
     violations = []
     teacher_slots = defaultdict(list)
     room_slots = defaultdict(list)
+    sync_slots = defaultdict(list)
     counts = Counter()
     settings = constraint_settings(records)
     forbidden = build_forbidden_index(records)
@@ -3536,6 +3902,14 @@ def validate_schedule(records: dict, schedule: dict, unassigned=None) -> dict:
                 teacher_slots[(cell["teacherCode"], day, period)].append(class_code)
                 if cell.get("roomCode"):
                     room_slots[(cell["roomCode"], day, period)].append(class_code)
+                if cell.get("syncOccurrenceId"):
+                    sync_slots[cell["syncOccurrenceId"]].append({
+                        "classCode": class_code,
+                        "day": day,
+                        "period": period,
+                        "syncGroup": cell.get("syncGroup", ""),
+                        "syncLaneKey": cell.get("syncLaneKey", ""),
+                    })
                 counts[(cell["teacherCode"], cell["subjectCode"], class_code)] += 1
                 if hard_forbidden(forbidden, cell, day, period):
                     violations.append({
@@ -3577,6 +3951,23 @@ def validate_schedule(records: dict, schedule: dict, unassigned=None) -> dict:
                 "message": f"특별실 {display_name(records, '특별실', room)}이 {day} {period}교시에 {', '.join(display_names(records, '학급', classes))}에 중복 배정되었습니다.",
             })
 
+    expected_sync_sizes = records.get("_syncOccurrenceSize") or {}
+    for occurrence_id, slots in sync_slots.items():
+        positions = {(item["day"], item["period"]) for item in slots}
+        if len(positions) > 1:
+            violations.append({
+                "severity": "error",
+                "type": "sync_group_split",
+                "message": f"동시그룹 occurrence {occurrence_id}가 서로 다른 시간에 나뉘어 배정되었습니다.",
+            })
+        expected_size = parse_positive_int(expected_sync_sizes.get(occurrence_id))
+        if expected_size and len(slots) != expected_size:
+            violations.append({
+                "severity": "error",
+                "type": "sync_group_incomplete",
+                "message": f"동시그룹 occurrence {occurrence_id}는 {expected_size}개 lane이 동시에 있어야 하지만 {len(slots)}개만 배정되었습니다.",
+            })
+
     expected_counts = Counter()
     load_display = {}
     for load in records.get("loads", []):
@@ -3608,6 +3999,102 @@ def validate_schedule(records: dict, schedule: dict, unassigned=None) -> dict:
     }
 
 
+def schedule_cell(schedule: dict, class_code: str, day: str, period) -> dict | None:
+    return (schedule.get("classes", {}).get(class_code, {}).get("grid", {}).get(day, {}) or {}).get(str(period))
+
+
+def sync_occurrence_cells(schedule: dict, occurrence_id: str) -> list[dict]:
+    cells = []
+    if not occurrence_id:
+        return cells
+    for class_code, class_data in schedule.get("classes", {}).items():
+        for day in schedule.get("days", []):
+            for period in schedule.get("periods", []):
+                cell = class_data.get("grid", {}).get(day, {}).get(str(period))
+                if cell and cell.get("syncOccurrenceId") == occurrence_id:
+                    cells.append({
+                        "classCode": class_code,
+                        "day": day,
+                        "period": period,
+                        "cell": cell,
+                    })
+    return cells
+
+
+def cell_belongs_to_occurrence(cell: dict | None, occurrence_id: str) -> bool:
+    return bool(cell and cell.get("syncOccurrenceId") == occurrence_id)
+
+
+def can_place_sync_cells_at(schedule: dict, cells: list[dict], day: str, period: int, allowed_occurrences: set[str]) -> tuple[bool, str]:
+    for item in cells:
+        class_code = item["classCode"]
+        if not class_period_available(schedule, class_code, day, period):
+            return False, f"{class_code}의 {day} {period}교시가 요일별시수 범위를 벗어납니다."
+        target = schedule_cell(schedule, class_code, day, period)
+        if target and target.get("syncOccurrenceId") not in allowed_occurrences:
+            return False, f"{class_code}의 {day} {period}교시에 다른 수업이 있어 동시그룹 전체 이동이 어렵습니다."
+    return True, ""
+
+
+def finish_move_result(records: dict, schedule: dict, action: str) -> dict:
+    validation = validate_schedule(records, schedule)
+    diagnostics = diagnose_schedule(records, schedule, validation)
+    return {
+        "ok": validation["ok"],
+        "message": f"{action}을 적용했습니다." if validation["ok"] else f"{action} 후 검증 오류가 있습니다.",
+        "schedule": schedule,
+        "validation": validation,
+        "diagnostics": diagnostics,
+        "teacherIssues": teacher_issue_summary(records, schedule, validation),
+    }
+
+
+def move_sync_occurrence(records: dict, updated: dict, move: dict, source_cell: dict) -> dict:
+    mode = as_text(move.get("mode")) or "auto"
+    src = move.get("from", {})
+    dst = move.get("to", {})
+    src_day = src.get("day")
+    src_period = parse_int(src.get("period"))
+    dst_day = dst.get("day")
+    dst_period = parse_int(dst.get("period"))
+    if dst_period is None:
+        return {"ok": False, "message": "이동할 교시가 올바르지 않습니다.", "schedule": updated}
+    source_occurrence_id = source_cell.get("syncOccurrenceId")
+    source_cells = sync_occurrence_cells(updated, source_occurrence_id)
+    if not source_cells:
+        return {"ok": False, "message": "동시그룹 묶음을 찾을 수 없습니다.", "schedule": updated}
+    class_code = src.get("classCode")
+    target_cell = schedule_cell(updated, class_code, dst_day, dst_period)
+    target_occurrence_id = target_cell.get("syncOccurrenceId") if target_cell else ""
+    if mode == "move" and target_cell and not cell_belongs_to_occurrence(target_cell, source_occurrence_id):
+        return {"ok": False, "message": "동시그룹 이동은 비어 있는 같은 시간대 칸으로만 이동할 수 있습니다.", "schedule": updated}
+    if mode == "swap" and not target_occurrence_id:
+        return {"ok": False, "message": "동시그룹 맞교환은 다른 동시그룹 묶음과만 가능합니다.", "schedule": updated}
+
+    if target_occurrence_id and target_occurrence_id != source_occurrence_id:
+        target_cells = sync_occurrence_cells(updated, target_occurrence_id)
+        source_ok, source_message = can_place_sync_cells_at(updated, source_cells, dst_day, dst_period, {source_occurrence_id, target_occurrence_id})
+        target_ok, target_message = can_place_sync_cells_at(updated, target_cells, src_day, src_period, {source_occurrence_id, target_occurrence_id})
+        if not source_ok or not target_ok:
+            return {"ok": False, "message": source_message or target_message, "schedule": updated}
+        for item in source_cells + target_cells:
+            updated["classes"][item["classCode"]]["grid"][item["day"]][str(item["period"])] = None
+        for item in source_cells:
+            updated["classes"][item["classCode"]]["grid"][dst_day][str(dst_period)] = item["cell"]
+        for item in target_cells:
+            updated["classes"][item["classCode"]]["grid"][src_day][str(src_period)] = item["cell"]
+        return finish_move_result(records, updated, "동시그룹 맞교환")
+
+    ok, message = can_place_sync_cells_at(updated, source_cells, dst_day, dst_period, {source_occurrence_id})
+    if not ok:
+        return {"ok": False, "message": message, "schedule": updated}
+    for item in source_cells:
+        updated["classes"][item["classCode"]]["grid"][item["day"]][str(item["period"])] = None
+    for item in source_cells:
+        updated["classes"][item["classCode"]]["grid"][dst_day][str(dst_period)] = item["cell"]
+    return finish_move_result(records, updated, "동시그룹 이동")
+
+
 def move_schedule(records: dict, schedule: dict, move: dict) -> dict:
     updated = deepcopy(schedule)
     mode = as_text(move.get("mode")) or "auto"
@@ -3626,6 +4113,8 @@ def move_schedule(records: dict, schedule: dict, move: dict) -> dict:
         return {"ok": False, "message": "이동할 배정이 없습니다.", "schedule": schedule}
     if cell.get("source") == "fixed":
         return {"ok": False, "message": "고정 일과는 엑셀의 고정 일과 시트에서 수정하세요.", "schedule": schedule}
+    if cell.get("syncOccurrenceId"):
+        return move_sync_occurrence(records, updated, move, cell)
     dst_period_int = parse_int(dst_period)
     if not class_period_available(updated, class_code, dst_day, dst_period_int):
         return {"ok": False, "message": "대상 교시는 해당 학급의 요일별시수 범위를 벗어납니다.", "schedule": schedule}
@@ -3643,16 +4132,7 @@ def move_schedule(records: dict, schedule: dict, move: dict) -> dict:
         grid[dst_day][dst_period] = cell
         grid[src_day][src_period] = None
         action = "이동"
-    validation = validate_schedule(records, updated)
-    diagnostics = diagnose_schedule(records, updated, validation)
-    return {
-        "ok": validation["ok"],
-        "message": f"{action}을 적용했습니다." if validation["ok"] else f"{action} 후 검증 오류가 있습니다.",
-        "schedule": updated,
-        "validation": validation,
-        "diagnostics": diagnostics,
-        "teacherIssues": teacher_issue_summary(records, updated, validation),
-    }
+    return finish_move_result(records, updated, action)
 
 
 def violation_signature(violation: dict) -> tuple:
@@ -3777,6 +4257,35 @@ def quick_move_options(records: dict, schedule: dict, source: dict) -> dict:
 
 
 def affected_teacher_codes_for_move(schedule: dict, move: dict, result_schedule: dict | None = None) -> list[str]:
+    if result_schedule:
+        codes = set()
+        for source_schedule in [schedule, result_schedule]:
+            for class_data in source_schedule.get("classes", {}).values():
+                for day in source_schedule.get("days", []):
+                    for period in source_schedule.get("periods", []):
+                        cell = class_data.get("grid", {}).get(day, {}).get(str(period))
+                        if cell and cell.get("teacherCode"):
+                            codes.add(cell["teacherCode"])
+        changed = []
+        for teacher_code in codes:
+            before = json.dumps(teacher_schedule_cells(schedule, teacher_code), ensure_ascii=False, sort_keys=True, default=str)
+            after = json.dumps(teacher_schedule_cells(result_schedule, teacher_code), ensure_ascii=False, sort_keys=True, default=str)
+            if before != after:
+                changed.append(teacher_code)
+        src = move.get("from", {})
+        dst = move.get("to", {})
+        class_code = src.get("classCode")
+        for source_schedule, day, period in [
+            (schedule, src.get("day"), str(src.get("period"))),
+            (schedule, dst.get("day"), str(dst.get("period"))),
+            (result_schedule, src.get("day"), str(src.get("period"))),
+            (result_schedule, dst.get("day"), str(dst.get("period"))),
+        ]:
+            cell = schedule_cell(source_schedule, class_code, day, period)
+            teacher_code = cell.get("teacherCode") if isinstance(cell, dict) else ""
+            if teacher_code and teacher_code not in changed:
+                changed.append(teacher_code)
+        return changed
     codes = []
     src = move.get("from", {})
     dst = move.get("to", {})
@@ -3842,6 +4351,7 @@ def move_preview(records: dict, schedule: dict, move: dict) -> dict:
         }
         for teacher_code in teacher_codes
     ]
+    affected.sort(key=lambda item: item.get("teacherName", ""))
     return {
         "ok": bool(result.get("validation")) and result.get("ok", False),
         "message": result.get("message", ""),
@@ -4619,6 +5129,28 @@ class AppHandler(BaseHTTPRequestHandler):
                     return
                 self.send_json(solve_schedule(records, ai_config=ai_config_from_body(body, require_validated=True), solve_options=body.get("solveOptions")))
                 return
+            if path == "/schedules/solve/start":
+                body = read_json_body(self)
+                records = get_records_from_body(body)
+                if records is None:
+                    self.send_json({"error": "importId 또는 records가 필요합니다."}, status=400)
+                    return
+                self.send_json(start_solve_session(records, solve_options=body.get("solveOptions")))
+                return
+            if path == "/schedules/solve/continue":
+                body = read_json_body(self)
+                records = get_records_from_body(body)
+                if records is None:
+                    self.send_json({"error": "importId 또는 records가 필요합니다."}, status=400)
+                    return
+                result = continue_solve_session(records, as_text(body.get("sessionId")))
+                self.send_json(result, status=200 if result.get("ok") else 404)
+                return
+            if path == "/schedules/solve/accept":
+                body = read_json_body(self)
+                result = accept_solve_session(as_text(body.get("sessionId")))
+                self.send_json(result, status=200 if result.get("selected") else 404)
+                return
             if path == "/schedules/validate":
                 body = read_json_body(self)
                 records = get_records_from_body(body)
@@ -4668,6 +5200,19 @@ class AppHandler(BaseHTTPRequestHandler):
                     self.send_json({"error": "importId 또는 records가 필요합니다."}, status=400)
                     return
                 self.send_json(apply_schedule_proposal(records, body.get("proposal") or body.get("scheduleProposal") or body))
+                return
+            if path == "/ai/chat/local":
+                body = read_json_body(self)
+                records = get_records_from_body(body) or {"config": {}, "teachers": {}, "classes": {}, "subjects": {}, "rooms": {}, "loads": [], "constraints": []}
+                quick_options = deepcopy(body.get("solveOptions") or {})
+                quick_options["iterations"] = min(parse_positive_int(quick_options.get("iterations")) or 24, 24)
+                response = ai_chat(records, body.get("message", ""), False, body.get("schedule"), ai_config={}, unassigned=body.get("unassigned") or [], solve_options=quick_options)
+                response["localOnly"] = True
+                append_operation_log("ai_chat_local", {
+                    "proposal": bool(response.get("scheduleProposal")),
+                    "constraintDrafts": len(response.get("constraintDrafts") or []),
+                })
+                self.send_json(response)
                 return
             if path == "/ai/chat":
                 body = read_json_body(self)
