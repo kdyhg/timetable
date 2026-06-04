@@ -531,7 +531,7 @@ async function api(path, options = {}) {
     const rawMessage = data?.error || data?.message || data || `요청 실패: ${response.status}`;
     let message = String(rawMessage);
     if (message.includes("FUNCTION_INVOCATION_TIMEOUT")) {
-      message = "서버 응답이 중단되었습니다. 진행형 탐색을 다시 시작하거나 최근 오류 로그를 확인하세요.";
+      message = "서버 응답이 중단되었습니다. 배정 chunk가 Vercel 제한보다 오래 걸렸습니다. 다시 시작하면 더 짧은 chunk로 이어서 탐색합니다.";
     }
     throw new Error(message);
   }
@@ -888,12 +888,14 @@ function showSolveFailure(error, context, options = {}) {
     els.solveFailureBox?.classList.remove("hidden");
     if (els.solveFailureMessage) els.solveFailureMessage.textContent = message;
   } else {
-    if (options.keepProgress) {
-      for (const node of [els.solveProgressMessage, els.solveOverlayProgressMessage]) {
-        if (node) node.textContent = `현재 최선안 반영 실패: ${message}`;
-      }
-    } else {
-      hideSolveProgress();
+    els.solveOverlay?.classList.remove("hidden");
+    const prefix = options.keepProgress ? "현재 최선안 반영 실패" : "자동배정 실패";
+    for (const node of [els.solveProgressMessage, els.solveOverlayProgressMessage]) {
+      if (node) node.textContent = `${prefix}: ${message}`;
+    }
+    const failureStats = `<div class="diagnostic-row error"><strong>요청이 끊겼습니다</strong><span>${escapeHtml(message)}</span><small>최근 오류 로그를 확인하거나 자동배정을 다시 시작하세요.</small></div>`;
+    for (const node of [els.solveProgressStats, els.solveOverlayProgressStats]) {
+      if (node && !options.keepProgress) node.innerHTML = failureStats;
     }
     appendChat("assistant", `자동배정 요청 실패: ${message}`);
   }
@@ -1037,6 +1039,7 @@ function perfectEnough(summary = {}) {
 async function solveSchedule(context = "workspace") {
   if (state.solveInProgress) return false;
   getActiveImport();
+  let hadError = false;
   state.solveInProgress = true;
   state.solveSessionId = "";
   state.solveAcceptedResult = null;
@@ -1095,6 +1098,7 @@ async function solveSchedule(context = "workspace") {
     }
     return true;
   } catch (error) {
+    hadError = true;
     showSolveFailure(error, context);
     return false;
   } finally {
@@ -1108,7 +1112,7 @@ async function solveSchedule(context = "workspace") {
     els.solveButton.textContent = "▶ AI 자동배정";
     if (els.startSolveButton) els.startSolveButton.disabled = false;
     if (els.solvePreferenceConfirm) els.solvePreferenceConfirm.disabled = false;
-    if (!(context === "setup" && !state.setupComplete)) hideSolveProgress();
+    if (!hadError && !(context === "setup" && !state.setupComplete)) hideSolveProgress();
     updateSolveAvailability();
   }
 }

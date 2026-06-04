@@ -35,8 +35,9 @@ except Exception:  # pragma: no cover - exercised when optional dependency is ab
 
 ROOT = Path(__file__).parent.resolve()
 WEB_DIR = ROOT / "web"
+VERCEL_RUNTIME = bool(os.environ.get("VERCEL"))
 RUNTIME_DATA_DIR = os.environ.get("TIMETABLE_DATA_DIR")
-if not RUNTIME_DATA_DIR and os.environ.get("VERCEL"):
+if not RUNTIME_DATA_DIR and VERCEL_RUNTIME:
     RUNTIME_DATA_DIR = "/tmp/timetable-data"
 DATA_DIR = Path(RUNTIME_DATA_DIR).resolve() if RUNTIME_DATA_DIR else ROOT / "data"
 IMPORT_DIR = DATA_DIR / "imports"
@@ -323,6 +324,15 @@ def parse_int(value, default=None):
         return default
     try:
         return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return default
+
+
+def parse_float(value, default=None):
+    if value is None or as_text(value) == "":
+        return default
+    try:
+        return float(str(value).strip())
     except (TypeError, ValueError):
         return default
 
@@ -3187,9 +3197,9 @@ def crossover_gene(parent_a: dict, parent_b: dict, rng: random.Random, generatio
     }
 
 
-def solve_metaheuristic(records: dict, include_relaxations: bool = True, seed: int | None = None, search_strength: str = "strong", return_stats: bool = False, repair_mode: str = "constraint", active_profiles: list[str] | None = None):
+def solve_metaheuristic(records: dict, include_relaxations: bool = True, seed: int | None = None, search_strength: str = "strong", return_stats: bool = False, repair_mode: str = "constraint", active_profiles: list[str] | None = None, iterations_override: int | None = None):
     settings = constraint_settings(records)
-    iterations = search_iteration_budget(settings, normalize_search_strength(search_strength))
+    iterations = parse_positive_int(iterations_override) or search_iteration_budget(settings, normalize_search_strength(search_strength))
     seed = seed or solve_run_seed(None)
     rng = random.Random(seed)
     repair_mode = normalize_repair_mode(repair_mode)
@@ -3508,8 +3518,15 @@ def solve_cp_sat_candidate(records: dict, solve_options: dict | None = None, see
             model.AddAtMostOne(variables)
     model.Minimize(sum(objective_terms))
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = float(options.get("cpTimeLimitSeconds") or 8)
-    solver.parameters.num_search_workers = int(options.get("cpWorkers") or 4)
+    default_cp_limit = 1.4 if VERCEL_RUNTIME else 8.0
+    requested_cp_limit = parse_float(options.get("cpTimeLimitSeconds"), default_cp_limit)
+    cp_limit_cap = 2.5 if VERCEL_RUNTIME else 12.0
+    if as_text(options.get("serverChunkMode")) == "short":
+        cp_limit_cap = 1.8 if VERCEL_RUNTIME else 6.0
+    solver.parameters.max_time_in_seconds = max(0.2, min(float(requested_cp_limit or default_cp_limit), cp_limit_cap))
+    worker_default = 2 if VERCEL_RUNTIME else 4
+    worker_cap = 2 if VERCEL_RUNTIME else 8
+    solver.parameters.num_search_workers = max(1, min(parse_positive_int(options.get("cpWorkers")) or worker_default, worker_cap))
     if seed:
         solver.parameters.random_seed = int(seed % 2_000_000_000)
     status = solver.Solve(model)
@@ -4213,7 +4230,10 @@ def solve_schedule(records: dict, api_key: str = "", ai_config=None, solve_optio
     if cp_sat_available():
         cp_candidate, cp_stats = solve_cp_sat_candidate(records, solve_options=solve_options, seed=seed)
         if cp_candidate:
-            cp_candidate, mutation_count = hard_safe_local_search(records, cp_candidate, seed=seed, max_steps=60 if search_strength == "fast" else 160)
+            default_steps = 24 if VERCEL_RUNTIME else (60 if search_strength == "fast" else 160)
+            requested_steps = parse_positive_int(solve_options.get("localSearchSteps")) or default_steps
+            step_cap = 36 if VERCEL_RUNTIME else 240
+            cp_candidate, mutation_count = hard_safe_local_search(records, cp_candidate, seed=seed, max_steps=max(4, min(requested_steps, step_cap)))
             cp_stats["phase"] = "ga-quality"
             cp_stats["hardSafeMutationCount"] = mutation_count
     strict_candidates = [
@@ -4227,7 +4247,7 @@ def solve_schedule(records: dict, api_key: str = "", ai_config=None, solve_optio
         candidate.setdefault("aiGenerated", False)
     needs_relaxation = needs_repair_candidates(strict_candidates)
     repair_candidates = generate_ai_repair_candidates(records, strict_candidates)
-    genetic_candidates, genetic_stats = solve_metaheuristic(records, include_relaxations=needs_relaxation, seed=seed, search_strength=search_strength, return_stats=True, repair_mode=repair_mode, active_profiles=active_profiles)
+    genetic_candidates, genetic_stats = solve_metaheuristic(records, include_relaxations=needs_relaxation, seed=seed, search_strength=search_strength, return_stats=True, repair_mode=repair_mode, active_profiles=active_profiles, iterations_override=parse_positive_int(solve_options.get("iterations")))
     cp_candidates = [cp_candidate] if cp_candidate else []
     all_candidates = cp_candidates + genetic_candidates + repair_candidates
     annotate_candidate_signatures(all_candidates)
@@ -4583,8 +4603,21 @@ def solve_session_chunk_options(solve_options: dict | None, chunk_index: int, se
         chunk_iterations = {"fast": 30, "balanced": 44, "strong": 60}[strength]
     elif repair_mode == "deep":
         chunk_iterations = {"fast": 36, "balanced": 54, "strong": 72}[strength]
+    if VERCEL_RUNTIME:
+        chunk_iterations = min(chunk_iterations, {"fast": 10, "balanced": 14, "strong": 18}[strength])
     requested = parse_positive_int(options.get("iterations")) or chunk_iterations
     options["iterations"] = max(18, min(requested, chunk_iterations))
+    if VERCEL_RUNTIME:
+        options["iterations"] = max(8, min(options["iterations"], chunk_iterations))
+    cp_default = 1.2 if VERCEL_RUNTIME else 4.0
+    if repair_mode == "deep":
+        cp_default = 1.5 if VERCEL_RUNTIME else 5.0
+    requested_cp = parse_float(options.get("cpTimeLimitSeconds"), cp_default)
+    options["cpTimeLimitSeconds"] = max(0.4, min(float(requested_cp or cp_default), 1.8 if VERCEL_RUNTIME else 8.0))
+    local_steps_default = {"fast": 10, "balanced": 16, "strong": 24}[strength] if VERCEL_RUNTIME else {"fast": 40, "balanced": 80, "strong": 140}[strength]
+    options["localSearchSteps"] = max(4, min(parse_positive_int(options.get("localSearchSteps")) or local_steps_default, 36 if VERCEL_RUNTIME else 180))
+    if VERCEL_RUNTIME:
+        options["serverChunkMode"] = "short"
     options["searchStrength"] = strength
     options["variationMode"] = "random"
     options["seed"] = solve_run_seed(None) + chunk_index * 1009
@@ -4598,6 +4631,15 @@ def run_solve_session_chunk(records: dict, session: dict, ai_config=None) -> tup
     chunk_index = parse_positive_int(session.get("chunkCount")) or 0
     session["recordsSnapshot"] = records
     chunk_options = solve_session_chunk_options(session.get("solveOptions") or {}, chunk_index, session)
+    append_operation_log("solve_chunk_begin", {
+        "sessionId": session.get("id"),
+        "chunkIndex": chunk_index + 1,
+        "repairMode": chunk_options.get("repairMode"),
+        "iterations": chunk_options.get("iterations"),
+        "cpTimeLimitSeconds": chunk_options.get("cpTimeLimitSeconds"),
+        "localSearchSteps": chunk_options.get("localSearchSteps"),
+        "serverChunkMode": chunk_options.get("serverChunkMode", ""),
+    })
     result = solve_schedule(records, ai_config={}, solve_options=chunk_options, persist=False, advisor=False, import_id=as_text(session.get("importId")))
     previous_best = session.get("bestResult")
     previous_rank = solve_result_rank(previous_best)
