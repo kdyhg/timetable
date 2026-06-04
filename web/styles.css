@@ -477,6 +477,50 @@ body.setup-complete .start-panel {
   font-weight: 800;
 }
 
+.solve-progress-details {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 6px;
+  padding-top: 4px;
+}
+
+.solve-progress-row {
+  display: grid;
+  grid-template-columns: 94px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  font-size: 12px;
+}
+
+.solve-progress-row span {
+  color: var(--muted);
+  font-weight: 800;
+}
+
+.solve-progress-row strong {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1.35;
+}
+
+.solve-profile-chip {
+  display: inline-block;
+  margin: 0 4px 4px 0;
+  padding: 3px 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.solve-profile-chip.warn {
+  border-color: #f5d27a;
+  background: #fff8df;
+}
+
 .solve-failure {
   display: grid;
   gap: 10px;

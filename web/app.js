@@ -21,6 +21,8 @@ const state = {
   solveStartedAt: 0,
   solveAcceptVisible: false,
   solveAcceptRequested: false,
+  solveAcceptInProgress: false,
+  solveAcceptedResult: null,
   pendingMovePreview: null,
   pendingScheduleProposal: null,
   pendingPreviewKind: "",
@@ -196,6 +198,19 @@ function storageSet(key, value) {
   } catch {
     // Browser storage can be disabled; the server fallback still handles this case.
   }
+}
+
+function scheduleResultImportId(result = state.scheduleResult) {
+  return (
+    result?.importId ||
+    result?.solveSession?.importId ||
+    result?.selected?.importId ||
+    ""
+  );
+}
+
+function rememberImportId(importId) {
+  if (importId) storageSet(STORAGE_KEYS.importId, importId);
 }
 
 function normalizeImport(item) {
@@ -478,12 +493,33 @@ function getActiveImport() {
 
 function requestBasePayload() {
   const item = getActiveImport();
+  const importId = item?.id || storageGet(STORAGE_KEYS.importId) || scheduleResultImportId() || null;
   return {
-    importId: item?.id || storageGet(STORAGE_KEYS.importId) || null,
+    importId,
     fallbackLatestImport: true,
     fallbackLastSchedule: true,
     chatConstraints: state.chatConstraints,
   };
+}
+
+async function requestBasePayloadForSolve() {
+  const payload = requestBasePayload();
+  if (payload.importId) return payload;
+  try {
+    const result = await api("/schedules/current");
+    const importId = scheduleResultImportId(result.scheduleResult);
+    if (importId) {
+      rememberImportId(importId);
+      if (!state.scheduleResult && result.scheduleResult) {
+        state.scheduleResult = result.scheduleResult;
+        state.selectedCandidate = result.scheduleResult.selected || null;
+      }
+      return { ...payload, importId };
+    }
+  } catch (error) {
+    log(error.message);
+  }
+  throw new Error("이전 배정의 입력 엑셀 자료를 찾지 못했습니다. 엑셀을 다시 업로드하거나 업로드 이력에서 선택하세요.");
 }
 
 async function api(path, options = {}) {
@@ -506,6 +542,7 @@ async function restoreCurrentSchedule(activateTab = false) {
   if (!result.ok || !result.scheduleResult?.selected?.schedule) {
     throw new Error(result.error || "현재 시간표를 불러오지 못했습니다. 자동배정을 먼저 실행하세요.");
   }
+  rememberImportId(scheduleResultImportId(result.scheduleResult));
   applyScheduleResult(result.scheduleResult, "현재 시간표 복구 완료", { activateTab });
   return true;
 }
@@ -789,6 +826,7 @@ function renderTeacherIssues(candidate = state.selectedCandidate) {
 
 function applyScheduleResult(result, message = "시간표 반영 완료", options = {}) {
   const activateTab = options.activateTab !== false;
+  rememberImportId(scheduleResultImportId(result));
   state.scheduleResult = result;
   state.selectedCandidate = result.selected;
   clearQuickMove("수업 칸 선택", false);
@@ -842,14 +880,20 @@ function hideSolveProgress() {
   els.acceptBestSolveOverlayButton?.classList.add("hidden");
 }
 
-function showSolveFailure(error, context) {
+function showSolveFailure(error, context, options = {}) {
   const message = error?.message || "자동배정 요청을 처리하지 못했습니다.";
   if (context === "setup" && !state.setupComplete) {
     setStartStep("solving");
     els.solveFailureBox?.classList.remove("hidden");
     if (els.solveFailureMessage) els.solveFailureMessage.textContent = message;
   } else {
-    hideSolveProgress();
+    if (options.keepProgress) {
+      for (const node of [els.solveProgressMessage, els.solveOverlayProgressMessage]) {
+        if (node) node.textContent = `현재 최선안 반영 실패: ${message}`;
+      }
+    } else {
+      hideSolveProgress();
+    }
     appendChat("assistant", `자동배정 요청 실패: ${message}`);
   }
   log(message);
@@ -859,16 +903,63 @@ function sleep(ms) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
-function solveProgressStatsHtml(summary = {}) {
+function progressSummaryText(summary = {}) {
+  if (!summary || !Object.keys(summary).length) return "-";
+  return `미배정 ${summary.unassigned ?? "-"} / 오류 ${summary.errors ?? "-"}`;
+}
+
+function formatProgressTime(value) {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function progressChips(items = []) {
+  return (items || [])
+    .slice(0, 6)
+    .map((item) => `<span class="solve-profile-chip">${escapeHtml(item)}</span>`)
+    .join("");
+}
+
+function blockerChips(blockers = []) {
+  return (blockers || [])
+    .slice(0, 4)
+    .map((item) => `<span class="solve-profile-chip warn">${escapeHtml(item.label || item.type)} ${escapeHtml(item.count ?? "")}</span>`)
+    .join("");
+}
+
+function solveProgressStatsHtml(progress = {}) {
+  const summary = progress.bestSummary || {};
+  const last = progress.lastResultSummary || {};
   const stats = [
     ["미배정", summary.unassigned ?? "-"],
     ["식사부족", summary.lunchShortage ?? "-"],
     ["연강", summary.consecutive ?? "-"],
     ["안배부족", summary.imbalance ?? "-"],
   ];
-  return stats
+  const statCards = stats
     .map(([label, value]) => `<div class="solve-progress-stat"><strong>${escapeHtml(value)}</strong><span>${escapeHtml(label)}</span></div>`)
     .join("");
+  const changedText = progress.bestChanged ? "방금 개선됨" : `다른 후보 탐색 중${Number(progress.stagnationCount || 0) ? ` · 정체 ${progress.stagnationCount}회` : ""}`;
+  const profiles = progressChips(progress.activeProfiles || []);
+  const blockers = blockerChips(progress.structuralBlockers || []);
+  const aiSummary = progress.aiRepairAdvice?.summary ? `<div class="solve-progress-row"><span>AI 원인분석</span><strong>${escapeHtml(progress.aiRepairAdvice.summary)}</strong></div>` : "";
+  return `
+    ${statCards}
+    <div class="solve-progress-details">
+      <div class="solve-progress-row"><span>탐색 회차</span><strong>${escapeHtml(progress.chunkCount ?? "-")}</strong></div>
+      <div class="solve-progress-row"><span>시도 후보 수</span><strong>${escapeHtml(progress.attemptCount ?? "-")}</strong></div>
+      <div class="solve-progress-row"><span>마지막 후보</span><strong>${escapeHtml(progressSummaryText(last))}</strong></div>
+      <div class="solve-progress-row"><span>현재 최선안</span><strong>${escapeHtml(progressSummaryText(summary))}</strong></div>
+      <div class="solve-progress-row"><span>최선안 변경</span><strong>${escapeHtml(changedText)}</strong></div>
+      <div class="solve-progress-row"><span>마지막 변경</span><strong>${escapeHtml(formatProgressTime(progress.bestChangedAt))}</strong></div>
+      <div class="solve-progress-row"><span>탐색 모드</span><strong>${escapeHtml(progress.repairMode || "constraint")}</strong></div>
+      ${profiles ? `<div class="solve-progress-row wide"><span>활성 프로필</span><div>${profiles}</div></div>` : ""}
+      ${blockers ? `<div class="solve-progress-row wide"><span>미배정 원인</span><div>${blockers}</div></div>` : ""}
+      ${aiSummary}
+    </div>
+  `;
 }
 
 function renderSolveProgress(progress = {}, context = "workspace") {
@@ -876,7 +967,7 @@ function renderSolveProgress(progress = {}, context = "workspace") {
   const canShowAccept = Boolean(progress.canAccept) && elapsed >= 20000;
   state.solveAcceptVisible = canShowAccept;
   const message = progress.progressMessage || "탐색을 계속 진행 중입니다.";
-  const statsHtml = solveProgressStatsHtml(progress.bestSummary || {});
+  const statsHtml = solveProgressStatsHtml(progress || {});
   for (const node of [els.solveProgressMessage, els.solveOverlayProgressMessage]) {
     if (node) node.textContent = message;
   }
@@ -888,12 +979,50 @@ function renderSolveProgress(progress = {}, context = "workspace") {
   }
 }
 
-function requestAcceptBestSolve() {
-  if (!state.solveInProgress || !state.solveSessionId) return;
+function setAcceptButtonsBusy(isBusy) {
+  for (const button of [els.acceptBestSolveButton, els.acceptBestSolveOverlayButton]) {
+    if (!button) continue;
+    button.disabled = isBusy;
+    button.textContent = isBusy ? "반영 중" : "현재 최선안 사용";
+  }
+}
+
+async function acceptBestSolveNow(context = state.solveLaunchContext || "workspace") {
+  if (state.solveAcceptInProgress) return state.solveAcceptedResult;
+  if (!state.solveSessionId) {
+    showSolveFailure(new Error("진행 중인 자동배정 세션을 찾을 수 없습니다."), context);
+    return null;
+  }
   state.solveAcceptRequested = true;
+  state.solveAcceptInProgress = true;
+  setAcceptButtonsBusy(true);
   for (const node of [els.solveProgressMessage, els.solveOverlayProgressMessage]) {
     if (node) node.textContent = "현재 최선안을 반영하는 중입니다.";
   }
+  try {
+    const result = await api("/schedules/solve/accept", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: state.solveSessionId }),
+    });
+    state.solveAcceptedResult = result;
+    state.solveInProgress = false;
+    applyScheduleResult(result, `자동배정 완료: ${strategyName(result.bestStrategy)} 선택`);
+    if (result.progressMessage) log(result.progressMessage);
+    hideSolveProgress();
+    return result;
+  } catch (error) {
+    state.solveAcceptRequested = false;
+    showSolveFailure(error, context, { keepProgress: true });
+    return null;
+  } finally {
+    state.solveAcceptInProgress = false;
+    setAcceptButtonsBusy(false);
+  }
+}
+
+function requestAcceptBestSolve() {
+  acceptBestSolveNow().catch((error) => showSolveFailure(error, state.solveLaunchContext || "workspace"));
 }
 
 function perfectEnough(summary = {}) {
@@ -905,6 +1034,8 @@ async function solveSchedule(context = "workspace") {
   getActiveImport();
   state.solveInProgress = true;
   state.solveSessionId = "";
+  state.solveAcceptedResult = null;
+  state.solveAcceptInProgress = false;
   els.solveButton.disabled = true;
   els.solveButton.textContent = "배정 중";
   if (els.startSolveButton) els.startSolveButton.disabled = true;
@@ -913,7 +1044,7 @@ async function solveSchedule(context = "workspace") {
   updateSolveAvailability();
   try {
     const basePayload = {
-      ...requestBasePayload(),
+      ...(await requestBasePayloadForSolve()),
       aiConfig: getAiConfig(),
       apiValidated: state.apiValidated,
       solveOptions: getSolveOptions(),
@@ -927,7 +1058,7 @@ async function solveSchedule(context = "workspace") {
     renderSolveProgress(progress, context);
     while (state.solveInProgress && !state.solveAcceptRequested) {
       if (progress.canAccept && perfectEnough(progress.bestSummary)) {
-        state.solveAcceptRequested = true;
+        await acceptBestSolveNow(context);
         break;
       }
       await sleep(700);
@@ -937,14 +1068,11 @@ async function solveSchedule(context = "workspace") {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ...basePayload, sessionId: state.solveSessionId }),
       });
+      if (state.solveAcceptedResult) break;
       renderSolveProgress(progress, context);
     }
-    const result = await api("/schedules/solve/accept", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sessionId: state.solveSessionId }),
-    });
-    applyScheduleResult(result, `자동배정 완료: ${strategyName(result.bestStrategy)} 선택`);
+    const result = state.solveAcceptedResult || await acceptBestSolveNow(context);
+    if (!result) return false;
     if (result.progressMessage) log(result.progressMessage);
     if (result.aiAdvisor?.advice) {
       const advice = result.aiAdvisor.advice;
@@ -966,6 +1094,12 @@ async function solveSchedule(context = "workspace") {
     return false;
   } finally {
     state.solveInProgress = false;
+    state.solveSessionId = "";
+    state.solveAcceptVisible = false;
+    state.solveAcceptRequested = false;
+    state.solveAcceptInProgress = false;
+    state.solveAcceptedResult = null;
+    setAcceptButtonsBusy(false);
     els.solveButton.textContent = "▶ AI 자동배정";
     if (els.startSolveButton) els.startSolveButton.disabled = false;
     if (els.solvePreferenceConfirm) els.solvePreferenceConfirm.disabled = false;

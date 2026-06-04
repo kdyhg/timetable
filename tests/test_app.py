@@ -68,6 +68,7 @@ class TimetableAppTests(unittest.TestCase):
     def test_solve_preferences_and_manual_edit_are_visible(self):
         html = (app_module.ROOT / "web" / "index.html").read_text(encoding="utf-8")
         script = (app_module.ROOT / "web" / "app.js").read_text(encoding="utf-8")
+        styles = (app_module.ROOT / "web" / "styles.css").read_text(encoding="utf-8")
         preference_index = html.index("자동배정 선호도")
         manual_link_index = html.index('href="#manualEditPanel"')
         manual_panel_index = html.index('id="manualEditPanel"')
@@ -115,6 +116,10 @@ class TimetableAppTests(unittest.TestCase):
         self.assertIn("/schedules/solve/start", script)
         self.assertIn("/schedules/solve/continue", script)
         self.assertIn("/schedules/solve/accept", script)
+        self.assertIn("function acceptBestSolveNow", script)
+        self.assertIn("stagnationCount", script)
+        self.assertIn("structuralBlockers", script)
+        self.assertIn("solve-progress-details", styles)
         self.assertIn("function requestBasePayloadForSolve()", script)
         self.assertIn("function scheduleResultImportId", script)
         self.assertIn("await requestBasePayloadForSolve()", script)
@@ -149,6 +154,12 @@ class TimetableAppTests(unittest.TestCase):
             self.assertTrue(started["canAccept"])
             continued = app_module.continue_solve_session(validation["records"], started["sessionId"])
             self.assertTrue(continued["ok"])
+            self.assertIn("lastResultSummary", continued)
+            self.assertIn("bestChangedAt", continued)
+            self.assertIn("stagnationCount", continued)
+            self.assertIn("activeProfiles", continued)
+            self.assertIn("structuralBlockers", continued)
+            self.assertIn("aiRepairAdvice", continued)
             save_last_schedule.assert_not_called()
             accepted = app_module.accept_solve_session(started["sessionId"])
             self.assertIn("selected", accepted)
@@ -156,6 +167,13 @@ class TimetableAppTests(unittest.TestCase):
             self.assertEqual(accepted["importId"], "import-abc")
             self.assertEqual(accepted["solveSession"]["importId"], "import-abc")
             save_last_schedule.assert_called_once()
+
+    def test_progressive_solve_chunk_stage_escalates_repair_mode(self):
+        self.assertEqual(app_module.solve_chunk_stage(0)["repairMode"], "constraint")
+        self.assertEqual(app_module.solve_chunk_stage(2)["repairMode"], "relax")
+        self.assertEqual(app_module.solve_chunk_stage(5)["repairMode"], "deep")
+        self.assertEqual(app_module.solve_chunk_stage(1, elapsed_ms=21000)["repairMode"], "relax")
+        self.assertEqual(app_module.solve_chunk_stage(1, stagnation_count=4)["repairMode"], "deep")
 
     def test_records_can_fallback_to_last_schedule_import_id_for_resolve(self):
         records = {"config": {}, "teachers": {}, "classes": {}, "subjects": {}, "rooms": {}, "loads": []}
@@ -990,8 +1008,8 @@ class TimetableAppTests(unittest.TestCase):
         result = solve_schedule(validation["records"])
         self.assertGreater(result["repairSummary"]["repairCandidateCount"], 0)
         self.assertLessEqual(len(result["candidates"]), 4)
-        self.assertTrue(all(candidate["algorithm"] == "metaheuristic-genetic" for candidate in result["candidates"]))
-        self.assertTrue(all(candidate["strategy"].startswith("ga-") for candidate in result["candidates"]))
+        self.assertTrue(all(candidate["algorithm"] in {"metaheuristic-genetic", "greedy-seed"} for candidate in result["candidates"]))
+        self.assertTrue(all(candidate["strategy"].startswith(("ga-", "ai-")) for candidate in result["candidates"]))
         selected = result["selected"]
         self.assertTrue(selected["aiGenerated"])
         self.assertEqual(selected["unassigned"], [])

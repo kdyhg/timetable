@@ -3056,14 +3056,29 @@ def generate_ai_repair_candidates(records: dict, strict_candidates: list[dict]) 
     return repair_candidates
 
 
-def relaxation_profiles(records: dict, include_relaxations: bool = True) -> list[tuple[str, dict, list[str]]]:
+def normalize_repair_mode(value: str | None) -> str:
+    mode = as_text(value).lower()
+    if mode in {"relax", "unassigned-relax", "stagnation-relax"}:
+        return "relax"
+    if mode in {"deep", "deep-repair", "swap-chain"}:
+        return "deep"
+    return "constraint"
+
+
+def relaxation_profiles(records: dict, include_relaxations: bool = True, repair_mode: str = "constraint") -> list[tuple[str, dict, list[str]]]:
     _, max_period = schedule_dimensions(records)
     settings = constraint_settings(records)
+    repair_mode = normalize_repair_mode(repair_mode)
     profiles = [("strict", {}, [])]
     if not include_relaxations or not settings.get("allowRelaxForUnassigned"):
         return profiles
     if settings.get("maxConsecutive") and settings["maxConsecutive"] < max_period:
-        for next_limit in range(settings["maxConsecutive"] + 1, min(max_period, settings["maxConsecutive"] + 2) + 1):
+        max_step = 1
+        if repair_mode == "relax":
+            max_step = 2
+        elif repair_mode == "deep":
+            max_step = max_period
+        for next_limit in range(settings["maxConsecutive"] + 1, min(max_period, settings["maxConsecutive"] + max_step) + 1):
             profiles.append((
                 f"relax-consecutive-{next_limit}",
                 {"최대연강허용": str(next_limit)},
@@ -3094,10 +3109,15 @@ def relaxation_profiles(records: dict, include_relaxations: bool = True) -> list
         combined_notes.extend(notes)
     if combined:
         profiles.append(("relax-combined", combined, combined_notes))
+    if repair_mode == "deep":
+        deep = {"균등분배강도": "off", "점심시간보호": "N", "교사요일최대적용": "N"}
+        if settings.get("maxConsecutive") and settings["maxConsecutive"] < max_period:
+            deep["최대연강허용"] = str(max_period)
+        profiles.append(("deep-unassigned-repair", deep, ["deep repair combined relaxation"]))
     return profiles
 
 
-def initial_genes(records: dict, rng: random.Random | None = None, seed_base: int | None = None, search_strength: str = "strong", iterations: int | None = None) -> list[dict]:
+def initial_genes(records: dict, rng: random.Random | None = None, seed_base: int | None = None, search_strength: str = "strong", iterations: int | None = None, repair_mode: str = "constraint") -> list[dict]:
     rng = rng or random.Random(seed_base or solve_run_seed(None))
     settings = constraint_settings(records)
     iterations = iterations or settings.get("metaIterations") or 60
@@ -3107,6 +3127,11 @@ def initial_genes(records: dict, rng: random.Random | None = None, seed_base: in
         strategies = ["constraint-first", "unassigned-first", "spread-days", "genetic-balanced", "special-room-first", "balanced"]
     elif method == "from-start":
         strategies = ["constraint-first", "spread-days", "spread-periods", "genetic-balanced", "balanced"]
+    repair_mode = normalize_repair_mode(repair_mode)
+    if repair_mode == "relax":
+        strategies = ["constraint-first", "unassigned-first", "special-room-first", "spread-days", "genetic-balanced", "balanced", "gap-light"]
+    elif repair_mode == "deep":
+        strategies = ["unassigned-first", "constraint-first", "special-room-first", "spread-days", "spread-periods", "genetic-balanced", "gap-light", "balanced"]
     genes = []
     seed_base = seed_base or rng.randint(1, 1_000_000)
     for index in range(max(12, iterations)):
@@ -3116,7 +3141,8 @@ def initial_genes(records: dict, rng: random.Random | None = None, seed_base: in
         genes.append({
             "seed": seed_base + index * 9973 + rng.randint(0, 7919),
             "strategy": strategy,
-            "randomness": min(1.6, 0.25 + (index % 7) * 0.11 + (0.18 if search_strength == "strong" else 0.0)),
+            "randomness": min(1.9 if repair_mode == "deep" else 1.6, 0.25 + (index % 7) * 0.11 + (0.18 if search_strength == "strong" else 0.0) + (0.22 if repair_mode == "deep" else 0.0)),
+            "repairMode": repair_mode,
         })
     return genes
 
@@ -3150,13 +3176,14 @@ def crossover_gene(parent_a: dict, parent_b: dict, rng: random.Random, generatio
     }
 
 
-def solve_metaheuristic(records: dict, include_relaxations: bool = True, seed: int | None = None, search_strength: str = "strong", return_stats: bool = False):
+def solve_metaheuristic(records: dict, include_relaxations: bool = True, seed: int | None = None, search_strength: str = "strong", return_stats: bool = False, repair_mode: str = "constraint", active_profiles: list[str] | None = None):
     settings = constraint_settings(records)
     iterations = search_iteration_budget(settings, normalize_search_strength(search_strength))
     seed = seed or solve_run_seed(None)
     rng = random.Random(seed)
-    profiles = relaxation_profiles(records, include_relaxations=include_relaxations)
-    genes = initial_genes(records, rng=rng, seed_base=seed, search_strength=normalize_search_strength(search_strength), iterations=iterations)
+    repair_mode = normalize_repair_mode(repair_mode)
+    profiles = relaxation_profiles(records, include_relaxations=include_relaxations, repair_mode=repair_mode)
+    genes = initial_genes(records, rng=rng, seed_base=seed, search_strength=normalize_search_strength(search_strength), iterations=iterations, repair_mode=repair_mode)
     population = []
     attempt_count = 0
     timed_out = False
@@ -3200,6 +3227,9 @@ def solve_metaheuristic(records: dict, include_relaxations: bool = True, seed: i
         "uniqueCandidateCount": len(unique),
         "profileCount": len(profiles),
         "searchStrength": normalize_search_strength(search_strength),
+        "repairMode": repair_mode,
+        "activeProfiles": active_profiles or [profile[0] for profile in profiles],
+        "lastSeed": seed,
         "timedOut": timed_out,
     }
     return (candidates, stats) if return_stats else candidates
@@ -3792,6 +3822,8 @@ def solve_schedule(records: dict, api_key: str = "", ai_config=None, solve_optio
     seed = solve_run_seed(solve_options)
     search_strength = normalize_search_strength(solve_options.get("searchStrength"))
     variation_mode = normalize_variation_mode(solve_options.get("variationMode"))
+    repair_mode = normalize_repair_mode(solve_options.get("repairMode"))
+    active_profiles = solve_options.get("activeProfiles") if isinstance(solve_options.get("activeProfiles"), list) else []
     records = apply_solve_options(records, solve_options)
     record_signature = records_signature(records)
     config = normalize_ai_config(ai_config, api_key=api_key)
@@ -3806,12 +3838,13 @@ def solve_schedule(records: dict, api_key: str = "", ai_config=None, solve_optio
         candidate.setdefault("aiGenerated", False)
     needs_relaxation = needs_repair_candidates(strict_candidates)
     repair_candidates = generate_ai_repair_candidates(records, strict_candidates)
-    genetic_candidates, genetic_stats = solve_metaheuristic(records, include_relaxations=needs_relaxation, seed=seed, search_strength=search_strength, return_stats=True)
-    annotate_candidate_signatures(genetic_candidates)
+    genetic_candidates, genetic_stats = solve_metaheuristic(records, include_relaxations=needs_relaxation, seed=seed, search_strength=search_strength, return_stats=True, repair_mode=repair_mode, active_profiles=active_profiles)
+    all_candidates = genetic_candidates + repair_candidates
+    annotate_candidate_signatures(all_candidates)
     previous_result = load_last_schedule() if variation_mode == "quality-first" else None
-    best, best_changed, selection_source = select_quality_first_candidate(records, genetic_candidates, variation_mode, previous_result)
+    best, best_changed, selection_source = select_quality_first_candidate(records, all_candidates, variation_mode, previous_result)
     best["signature"] = candidate_signature(best)
-    candidates = selected_candidate_list(best, genetic_candidates, limit=4)
+    candidates = selected_candidate_list(best, all_candidates, limit=4)
     ai_summary = summarize_candidate_for_ai(best)
     elapsed_ms = int((time.monotonic() - started_at) * 1000)
     ai_advisor = build_ai_solve_advisor(records, ai_summary, config) if advisor else {
@@ -3840,6 +3873,9 @@ def solve_schedule(records: dict, api_key: str = "", ai_config=None, solve_optio
         "progressMessage": "자동배정 탐색 chunk가 완료되었습니다.",
         "searchStats": {
             **genetic_stats,
+            "repairMode": repair_mode,
+            "activeProfiles": active_profiles or genetic_stats.get("activeProfiles", []),
+            "lastSeed": seed,
             "variationMode": variation_mode,
             "selectionSource": selection_source,
             "previousSignature": candidate_signature((previous_result or {}).get("selected", {})) if previous_result and previous_result.get("recordSignature") == record_signature else "",
@@ -3894,6 +3930,205 @@ def solve_best_summary(result: dict | None) -> dict:
     }
 
 
+BLOCKER_LABELS = {
+    "class_no_empty_slot": "class empty slot shortage",
+    "teacher_conflict": "teacher conflict or forbidden time",
+    "room_conflict": "special room shortage or conflict",
+    "hard_forbidden": "hard forbidden condition",
+    "sync_no_common_slot": "sync group has no common slot",
+    "max_consecutive": "max consecutive limit",
+    "lunch_protection": "lunch protection limit",
+    "teacher_day_max": "teacher day max limit",
+    "repair_required": "relocation or swap needed",
+    "unknown": "needs more diagnosis",
+}
+
+
+def schedule_busy_index(schedule: dict) -> tuple[defaultdict, defaultdict]:
+    teacher_busy = defaultdict(set)
+    room_busy = defaultdict(set)
+    for class_data in (schedule.get("classes") or {}).values():
+        for day, periods in (class_data.get("grid") or {}).items():
+            for period_text, cell in (periods or {}).items():
+                if not cell:
+                    continue
+                period = parse_int(period_text)
+                if period is None:
+                    continue
+                if cell.get("teacherCode"):
+                    teacher_busy[cell["teacherCode"]].add((day, period))
+                if cell.get("roomCode"):
+                    room_busy[cell["roomCode"]].add((day, period))
+    return teacher_busy, room_busy
+
+
+def unassigned_example(item: dict) -> str:
+    parts = [
+        as_text(item.get("teacherName") or item.get("teacherCode")),
+        as_text(item.get("subjectName") or item.get("subjectCode")),
+        as_text(item.get("className") or item.get("classCode")),
+    ]
+    return " / ".join(part for part in parts if part)
+
+
+def add_blocker(counter: Counter, examples: dict, blocker_type: str, item: dict) -> None:
+    counter[blocker_type] += 1
+    bucket = examples.setdefault(blocker_type, [])
+    if len(bucket) < 3:
+        bucket.append(unassigned_example(item))
+
+
+def structural_blocker_type_for_unassigned(records: dict, schedule: dict, item: dict, teacher_busy, room_busy, forbidden, settings: dict, max_period: int) -> str:
+    if item.get("syncOccurrenceId") or item.get("syncGroup"):
+        return "sync_no_common_slot"
+    load = load_for_unassigned(records, item)
+    if not load:
+        return "unknown"
+    block_size = parse_positive_int(item.get("hours")) or 1
+    entry = entry_for_load(load, records, block_size)
+    class_grid = (schedule.get("classes", {}).get(load["classCode"], {}).get("grid") or {})
+    counters = Counter()
+    feasible = 0
+    for day in schedule.get("days", []):
+        for period in schedule.get("periods", []):
+            periods = [period + offset for offset in range(block_size)]
+            if period + block_size - 1 > max_period:
+                continue
+            if any(not class_period_available(schedule, load["classCode"], day, item_period) for item_period in periods):
+                continue
+            if any(class_grid.get(day, {}).get(str(item_period)) for item_period in periods):
+                counters["class_no_empty_slot"] += 1
+                continue
+            if any((day, item_period) in teacher_busy[entry["teacherCode"]] for item_period in periods):
+                counters["teacher_conflict"] += 1
+                continue
+            if entry.get("roomCode") and any((day, item_period) in room_busy[entry["roomCode"]] for item_period in periods):
+                counters["room_conflict"] += 1
+                continue
+            if any(hard_forbidden(forbidden, entry, day, item_period) for item_period in periods):
+                counters["hard_forbidden"] += 1
+                continue
+            if violates_teacher_flow(teacher_busy, entry["teacherCode"], day, periods, settings):
+                prospective = teacher_periods_for_day(teacher_busy, entry["teacherCode"], day) | set(periods)
+                if settings.get("maxConsecutive") and max_consecutive_count(prospective) > settings["maxConsecutive"]:
+                    counters["max_consecutive"] += 1
+                else:
+                    counters["lunch_protection"] += 1
+                continue
+            if teacher_day_max_penalty(teacher_busy, entry["teacherCode"], day, block_size, settings) is None:
+                counters["teacher_day_max"] += 1
+                continue
+            feasible += 1
+    if feasible:
+        return "repair_required"
+    if counters:
+        return counters.most_common(1)[0][0]
+    return "class_no_empty_slot"
+
+
+def structural_blockers_for_candidate(records: dict, candidate: dict | None) -> list[dict]:
+    selected = candidate or {}
+    unassigned = selected.get("unassigned") or []
+    if not unassigned:
+        return []
+    schedule = selected.get("schedule") or {}
+    teacher_busy, room_busy = schedule_busy_index(schedule)
+    forbidden = build_forbidden_index(records)
+    settings = constraint_settings(records)
+    _, max_period = schedule_dimensions(records)
+    counter = Counter()
+    examples = {}
+    for item in unassigned:
+        blocker_type = structural_blocker_type_for_unassigned(records, schedule, item, teacher_busy, room_busy, forbidden, settings, max_period)
+        add_blocker(counter, examples, blocker_type, item)
+    return [
+        {
+            "type": blocker_type,
+            "label": BLOCKER_LABELS.get(blocker_type, blocker_type),
+            "count": count,
+            "examples": examples.get(blocker_type, []),
+        }
+        for blocker_type, count in counter.most_common()
+    ]
+
+
+def repair_options_from_blockers(records: dict, blockers: list[dict], repair_mode: str) -> dict:
+    repair_mode = normalize_repair_mode(repair_mode)
+    if repair_mode == "constraint":
+        return {}
+    blocker_types = {item.get("type") for item in blockers or []}
+    _, max_period = schedule_dimensions(records)
+    settings = constraint_settings(records)
+    options = {"allowRelaxForUnassigned": "Y", "assignmentMethod": "unassigned-only"}
+    if "max_consecutive" in blocker_types or repair_mode == "deep":
+        current = settings.get("maxConsecutive") or 0
+        if current:
+            options["maxConsecutive"] = min(max_period, current + (2 if repair_mode == "relax" else max_period))
+    if "lunch_protection" in blocker_types or repair_mode == "deep":
+        options["protectLunch"] = "N"
+    if "teacher_day_max" in blocker_types or repair_mode == "deep":
+        options["teacherDayMaxEnabled"] = "N"
+    if "class_no_empty_slot" in blocker_types or "sync_no_common_slot" in blocker_types or repair_mode == "deep":
+        options["balanceStrength"] = "off"
+    return options
+
+
+def local_ai_repair_advice(blockers: list[dict], repair_mode: str) -> dict:
+    if not blockers:
+        return {
+            "summary": "No structural blocker was found in the current best candidate.",
+            "profiles": [],
+            "suggestions": [],
+            "remote": {"ok": False, "status": "not-needed", "provider": "local"},
+        }
+    labels = [f"{item.get('label')} {item.get('count')}" for item in blockers[:4]]
+    suggestions = []
+    for item in blockers[:4]:
+        blocker_type = item.get("type")
+        if blocker_type == "sync_no_common_slot":
+            suggestions.append("Prioritize sync-group repositioning with combined relaxation.")
+        elif blocker_type == "max_consecutive":
+            suggestions.append("Prioritize max-consecutive relaxation candidates.")
+        elif blocker_type == "lunch_protection":
+            suggestions.append("Validate lunch-protection relaxation candidates.")
+        elif blocker_type == "teacher_day_max":
+            suggestions.append("Validate teacher-day-max relaxation candidates.")
+        else:
+            suggestions.append(f"Increase relocation/swap repair for {item.get('label')}.")
+    return {
+        "summary": "Structural blockers: " + " / ".join(labels),
+        "profiles": [repair_mode],
+        "suggestions": suggestions,
+        "remote": {"ok": False, "status": "local", "provider": "local"},
+    }
+
+
+def build_ai_repair_advice(records: dict, session: dict, ai_config=None) -> dict:
+    blockers = session.get("structuralBlockers") or []
+    repair_mode = session.get("repairMode") or "constraint"
+    advice = local_ai_repair_advice(blockers, repair_mode)
+    config = normalize_ai_config(ai_config)
+    if not as_text(config.get("apiKey")) or not config.get("validated"):
+        return advice
+    context = {
+        "candidateSummary": session.get("bestSummary") or {},
+        "structuralBlockers": blockers,
+        "repairMode": repair_mode,
+        "settings": constraint_settings(records),
+    }
+    remote = call_ai_advisor(config, "repair_strategy", context)
+    advice["remote"] = {key: value for key, value in remote.items() if key != "advice"}
+    if remote.get("ok") and remote.get("advice"):
+        remote_advice = remote["advice"]
+        advice["summary"] = remote_advice.get("summary") or advice["summary"]
+        advice["suggestions"] = [
+            item.get("explanation") or " / ".join(item.get("steps", []))
+            for item in remote_advice.get("suggestions", [])
+            if isinstance(item, dict)
+        ] or advice["suggestions"]
+    return advice
+
+
 def solve_session_key(session_id: str) -> str:
     return f"solve_session:{session_id}"
 
@@ -3927,21 +4162,50 @@ def load_solve_session(session_id: str) -> dict | None:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def solve_session_chunk_options(solve_options: dict | None, chunk_index: int) -> dict:
+def solve_chunk_stage(chunk_index: int, elapsed_ms: int = 0, stagnation_count: int = 0) -> dict:
+    if chunk_index >= 5 or stagnation_count >= 4:
+        return {
+            "repairMode": "deep",
+            "activeProfiles": ["constraint-first", "unassigned-first", "relax-combined", "swap-chain", "sync-reposition"],
+        }
+    if chunk_index >= 2 or elapsed_ms >= 20000 or stagnation_count >= 2:
+        return {
+            "repairMode": "relax",
+            "activeProfiles": ["constraint-first", "unassigned-first", "relax-consecutive", "relax-lunch", "relax-day-max"],
+        }
+    return {
+        "repairMode": "constraint",
+        "activeProfiles": ["constraint-first", "genetic-balanced"],
+    }
+
+
+def solve_session_chunk_options(solve_options: dict | None, chunk_index: int, session: dict | None = None) -> dict:
     options = deepcopy(solve_options or {})
     strength = normalize_search_strength(options.get("searchStrength"))
+    session = session or {}
+    elapsed_ms = int((time.time() - float(session.get("startedAtEpoch", time.time()))) * 1000)
+    stage = solve_chunk_stage(chunk_index, elapsed_ms, parse_positive_int(session.get("stagnationCount")) or 0)
+    repair_mode = normalize_repair_mode(stage["repairMode"])
     chunk_iterations = {"fast": 24, "balanced": 36, "strong": 48}[strength]
+    if repair_mode == "relax":
+        chunk_iterations = {"fast": 30, "balanced": 44, "strong": 60}[strength]
+    elif repair_mode == "deep":
+        chunk_iterations = {"fast": 36, "balanced": 54, "strong": 72}[strength]
     requested = parse_positive_int(options.get("iterations")) or chunk_iterations
     options["iterations"] = max(18, min(requested, chunk_iterations))
     options["searchStrength"] = strength
     options["variationMode"] = "random"
     options["seed"] = solve_run_seed(None) + chunk_index * 1009
+    options["repairMode"] = repair_mode
+    options["activeProfiles"] = stage["activeProfiles"]
+    options.update(repair_options_from_blockers(session.get("recordsSnapshot") or {}, session.get("structuralBlockers") or [], repair_mode))
     return options
 
 
-def run_solve_session_chunk(records: dict, session: dict) -> tuple[dict, bool]:
+def run_solve_session_chunk(records: dict, session: dict, ai_config=None) -> tuple[dict, bool]:
     chunk_index = parse_positive_int(session.get("chunkCount")) or 0
-    chunk_options = solve_session_chunk_options(session.get("solveOptions") or {}, chunk_index)
+    session["recordsSnapshot"] = records
+    chunk_options = solve_session_chunk_options(session.get("solveOptions") or {}, chunk_index, session)
     result = solve_schedule(records, ai_config={}, solve_options=chunk_options, persist=False, advisor=False, import_id=as_text(session.get("importId")))
     previous_best = session.get("bestResult")
     previous_rank = solve_result_rank(previous_best)
@@ -3952,28 +4216,52 @@ def run_solve_session_chunk(records: dict, session: dict) -> tuple[dict, bool]:
     if not previous_best or new_rank > previous_rank or (new_rank == previous_rank and new_signature != previous_signature):
         session["bestResult"] = result
         best_changed = True
+        session["bestChangedAt"] = now_iso()
+        session["stagnationCount"] = 0
+    else:
+        session["stagnationCount"] = (parse_positive_int(session.get("stagnationCount")) or 0) + 1
     session["chunkCount"] = chunk_index + 1
     session["attemptCount"] = (parse_positive_int(session.get("attemptCount")) or 0) + (parse_positive_int(result.get("attemptCount")) or 0)
     session["lastResultSummary"] = solve_best_summary(result)
     session["bestSummary"] = solve_best_summary(session.get("bestResult"))
+    session["activeProfiles"] = result.get("searchStats", {}).get("activeProfiles", [])
+    session["repairMode"] = result.get("searchStats", {}).get("repairMode", chunk_options.get("repairMode", "constraint"))
+    session["lastSeed"] = result.get("searchStats", {}).get("lastSeed", result.get("seed"))
+    session["structuralBlockers"] = structural_blockers_for_candidate(records, (session.get("bestResult") or {}).get("selected"))
+    if session.get("structuralBlockers") and ((parse_positive_int(session.get("stagnationCount")) or 0) >= 2 or session.get("chunkCount", 0) >= 3):
+        last_ai_chunk = parse_positive_int(session.get("lastAiRepairChunk")) or 0
+        if not session.get("aiRepairAdvice") or session.get("chunkCount", 0) - last_ai_chunk >= 3 or best_changed:
+            session["aiRepairAdvice"] = build_ai_repair_advice(records, session, ai_config)
+            session["lastAiRepairChunk"] = session.get("chunkCount", 0)
     session["lastUpdatedAt"] = now_iso()
     session["elapsedMs"] = int((time.time() - float(session.get("startedAtEpoch", time.time()))) * 1000)
+    session.pop("recordsSnapshot", None)
     return result, best_changed
 
 
 def solve_session_response(session: dict, best_changed: bool = False) -> dict:
+    chunk_count = session.get("chunkCount", 0)
+    attempt_count = session.get("attemptCount", 0)
+    status = "best improved" if best_changed else "searching alternatives"
     return {
         "ok": True,
         "sessionId": session.get("id"),
         "startedAt": session.get("startedAt"),
         "elapsedMs": session.get("elapsedMs", 0),
-        "chunkCount": session.get("chunkCount", 0),
-        "attemptCount": session.get("attemptCount", 0),
+        "chunkCount": chunk_count,
+        "attemptCount": attempt_count,
         "bestChanged": best_changed,
+        "bestChangedAt": session.get("bestChangedAt", ""),
         "bestSummary": session.get("bestSummary") or solve_best_summary(session.get("bestResult")),
         "lastResultSummary": session.get("lastResultSummary") or {},
+        "stagnationCount": session.get("stagnationCount", 0),
+        "activeProfiles": session.get("activeProfiles", []),
+        "repairMode": session.get("repairMode", "constraint"),
+        "lastSeed": session.get("lastSeed", ""),
+        "structuralBlockers": session.get("structuralBlockers", []),
+        "aiRepairAdvice": session.get("aiRepairAdvice") or {},
         "canAccept": bool(session.get("bestResult")),
-        "progressMessage": "탐색을 계속 진행 중입니다. 20초 이후 현재 최선안을 사용할 수 있습니다.",
+        "progressMessage": f"{status}: chunk {chunk_count}, candidates {attempt_count}.",
     }
 
 
@@ -3998,11 +4286,11 @@ def start_solve_session(records: dict, solve_options: dict | None = None, import
     return solve_session_response(session, best_changed=best_changed)
 
 
-def continue_solve_session(records: dict, session_id: str) -> dict:
+def continue_solve_session(records: dict, session_id: str, ai_config=None) -> dict:
     session = load_solve_session(session_id)
     if not session:
-        return {"ok": False, "error": "진행 중인 자동배정 탐색 세션을 찾을 수 없습니다."}
-    _, best_changed = run_solve_session_chunk(records, session)
+        return {"ok": False, "error": "진행 중인 자동배정 세션을 찾을 수 없습니다."}
+    _, best_changed = run_solve_session_chunk(records, session, ai_config=ai_config)
     save_solve_session(session)
     append_operation_log("solve_continue", {
         "sessionId": session_id,
@@ -4015,8 +4303,10 @@ def continue_solve_session(records: dict, session_id: str) -> dict:
 
 def accept_solve_session(session_id: str) -> dict:
     session = load_solve_session(session_id)
-    if not session or not session.get("bestResult"):
-        return {"ok": False, "error": "현재 최선안을 찾을 수 없습니다. 자동배정을 먼저 시작하세요."}
+    if not session:
+        return {"ok": False, "error": "진행 중인 자동배정 세션을 찾을 수 없습니다."}
+    if not session.get("bestResult"):
+        return {"ok": False, "error": "세션은 있지만 아직 반영할 최선안이 없습니다. 자동배정을 조금 더 진행하세요."}
     result = deepcopy(session["bestResult"])
     result["solveSession"] = {
         "sessionId": session_id,
@@ -5319,7 +5609,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 if records is None:
                     self.send_json({"error": missing_records_message(body)}, status=400)
                     return
-                result = continue_solve_session(records, as_text(body.get("sessionId")))
+                result = continue_solve_session(records, as_text(body.get("sessionId")), ai_config=ai_config_from_body(body, require_validated=True))
                 self.send_json(result, status=200 if result.get("ok") else 404)
                 return
             if path == "/schedules/solve/accept":
