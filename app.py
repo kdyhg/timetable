@@ -1180,7 +1180,7 @@ def parse_sync_groups(wb, records, issues):
 
 
 def sync_lane_key_for_load(load: dict) -> str:
-    return f"{as_text(load.get('syncGroup'))}::{as_text(load.get('subjectCode'))}"
+    return f"{as_text(load.get('syncGroup'))}::{as_text(load.get('classCode'))}"
 
 
 def build_sync_bundles(records: dict, issues: list[dict] | None = None) -> list[dict]:
@@ -1200,17 +1200,17 @@ def build_sync_bundles(records: dict, issues: list[dict] | None = None) -> list[
     for group_code, loads in sorted(grouped.items(), key=lambda item: item[0]):
         lanes = defaultdict(list)
         for load in loads:
-            lanes[as_text(load.get("subjectCode"))].append(load)
+            lanes[as_text(load.get("classCode"))].append(load)
 
         lane_hours = {
-            subject_code: sum(parse_positive_int(load.get("weeklyHours")) or 0 for load in lane_loads)
-            for subject_code, lane_loads in lanes.items()
+            class_code: sum(parse_positive_int(load.get("weeklyHours")) or 0 for load in lane_loads)
+            for class_code, lane_loads in lanes.items()
         }
         nonzero_totals = {hours for hours in lane_hours.values() if hours > 0}
         if len(nonzero_totals) > 1 and issues is not None:
             detail = ", ".join(
-                f"{display_name(records, '과목', subject_code)} {hours}시간"
-                for subject_code, hours in sorted(lane_hours.items(), key=lambda item: display_name(records, "과목", item[0]))
+                f"{display_name(records, '학급', class_code)} {hours}시간"
+                for class_code, hours in sorted(lane_hours.items(), key=lambda item: display_name(records, "학급", item[0]))
             )
             for load in loads:
                 add_issue(
@@ -1219,32 +1219,32 @@ def build_sync_bundles(records: dict, issues: list[dict] | None = None) -> list[
                     sheet_name,
                     load.get("row", 2),
                     sync_column,
-                    f"동시그룹 '{group_code}'의 과목별 합산 시수가 같아야 합니다.",
-                    f"현재 {detail}입니다. 같은 동시그룹의 과목 lane 시수를 동일하게 맞춰주세요.",
+                    f"동시그룹 '{group_code}'의 학급별 동시그룹 시수가 같아야 합니다.",
+                    f"현재 {detail}입니다. 같은 동시그룹에 참여하는 각 학급의 시수를 동일하게 맞춰주세요.",
                 )
             continue
 
         total_hours = next(iter(nonzero_totals), 0)
         lane_units = {}
-        for subject_code, lane_loads in lanes.items():
+        for class_code, lane_loads in lanes.items():
             units = []
-            for load in sorted(lane_loads, key=lambda item: (item.get("className", ""), item.get("teacherName", ""), item.get("row", 0))):
+            for load in sorted(lane_loads, key=lambda item: (item.get("subjectName", ""), item.get("teacherName", ""), item.get("row", 0))):
                 for _ in range(parse_positive_int(load.get("weeklyHours")) or 0):
                     units.append(load)
-            lane_units[subject_code] = units
+            lane_units[class_code] = units
 
         occurrences = []
         for index in range(total_hours):
             occurrence_id = f"{group_code}:{index + 1}"
             units = []
-            for subject_code, units_for_lane in sorted(lane_units.items(), key=lambda item: display_name(records, "과목", item[0])):
+            for class_code, units_for_lane in sorted(lane_units.items(), key=lambda item: display_name(records, "학급", item[0])):
                 if index >= len(units_for_lane):
                     continue
                 load = units_for_lane[index]
-                lane_key = f"{group_code}::{subject_code}"
+                lane_key = f"{group_code}::{class_code}"
                 units.append({
                     "laneKey": lane_key,
-                    "subjectCode": subject_code,
+                    "classCode": class_code,
                     "load": load,
                 })
             if units:

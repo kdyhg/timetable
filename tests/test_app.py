@@ -152,27 +152,34 @@ class TimetableAppTests(unittest.TestCase):
             self.assertIn("solveSession", accepted)
             save_last_schedule.assert_called_once()
 
-    def test_sync_group_lane_hours_validate_and_move_together(self):
+    def test_sync_group_class_lane_hours_validate_and_move_together(self):
         workbook = create_template_workbook()
         set_config_value(workbook, "점심시간보호", "N")
         set_config_value(workbook, "최대연강허용", "7")
-        append_named_row(workbook, "교사", {"교사명": "김국어"})
-        append_named_row(workbook, "교사", {"교사명": "박수학"})
-        append_named_row(workbook, "학급-계열", {"학급명": "1-1", "학년": "1", "계열": "공통", "담임교사명": "김국어", "가상학급여부": "N"})
-        append_named_row(workbook, "학급-계열", {"학급명": "1-2", "학년": "1", "계열": "공통", "담임교사명": "박수학", "가상학급여부": "N"})
-        append_named_row(workbook, "과목", {"과목명": "국어", "단축명": "국", "NEIS과목명": "국어"})
-        append_named_row(workbook, "과목", {"과목명": "수학", "단축명": "수", "NEIS과목명": "수학"})
-        append_named_row(workbook, "교사별 시수표", {"교사명": "김국어", "과목명": "국어", "동시그룹": "G1"})
-        append_named_row(workbook, "교사별 시수표", {"교사명": "박수학", "과목명": "수학", "동시그룹": "G1"})
+        append_named_row(workbook, "교사", {"교사명": "김세계"})
+        append_named_row(workbook, "교사", {"교사명": "박세계"})
+        append_named_row(workbook, "교사", {"교사명": "이물리"})
+        append_named_row(workbook, "학급-계열", {"학급명": "2-1", "학년": "2", "계열": "공통", "담임교사명": "김세계", "가상학급여부": "N"})
+        append_named_row(workbook, "학급-계열", {"학급명": "2-2", "학년": "2", "계열": "공통", "담임교사명": "박세계", "가상학급여부": "N"})
+        append_named_row(workbook, "학급-계열", {"학급명": "2-3", "학년": "2", "계열": "공통", "담임교사명": "이물리", "가상학급여부": "N"})
+        append_named_row(workbook, "과목", {"과목명": "세계사", "단축명": "세", "NEIS과목명": "세계사"})
+        append_named_row(workbook, "과목", {"과목명": "물리", "단축명": "물", "NEIS과목명": "물리"})
+        append_named_row(workbook, "교사별 시수표", {"교사명": "김세계", "과목명": "세계사", "동시그룹": "G1"})
+        append_named_row(workbook, "교사별 시수표", {"교사명": "박세계", "과목명": "세계사", "동시그룹": "G1"})
+        append_named_row(workbook, "교사별 시수표", {"교사명": "이물리", "과목명": "물리", "동시그룹": "G1"})
         load_sheet = workbook["교사별 시수표"]
         class_start = len(SPECS_BY_NAME["교사별 시수표"]) + 1
-        load_sheet.cell(row=1, column=class_start).value = "1-1"
-        load_sheet.cell(row=1, column=class_start + 1).value = "1-2"
-        load_sheet.cell(row=load_sheet.max_row - 1, column=class_start).value = 2
-        load_sheet.cell(row=load_sheet.max_row, column=class_start + 1).value = 2
+        load_sheet.cell(row=1, column=class_start).value = "2-1"
+        load_sheet.cell(row=1, column=class_start + 1).value = "2-2"
+        load_sheet.cell(row=1, column=class_start + 2).value = "2-3"
+        load_sheet.cell(row=load_sheet.max_row - 2, column=class_start).value = 3
+        load_sheet.cell(row=load_sheet.max_row - 1, column=class_start + 1).value = 3
+        load_sheet.cell(row=load_sheet.max_row, column=class_start + 2).value = 3
         validation = validate_workbook(workbook)
         self.assertTrue(validation["ok"], validation["issues"])
         self.assertEqual(len(validation["records"].get("syncBundles", [])), 1)
+        self.assertEqual(validation["records"]["syncBundles"][0]["laneHours"], {"C001": 3, "C002": 3, "C003": 3})
+        self.assertEqual(len(validation["records"]["syncBundles"][0]["occurrences"]), 3)
         selected = solve_schedule(validation["records"], solve_options={"iterations": 12, "searchStrength": "fast"})["selected"]
         by_occurrence = defaultdict(set)
         for class_data in selected["schedule"]["classes"].values():
@@ -212,25 +219,32 @@ class TimetableAppTests(unittest.TestCase):
                         moved_slots.add((day, period))
         self.assertEqual(moved_slots, {(move_option["day"], move_option["period"])})
 
-    def test_sync_group_lane_hour_mismatch_is_upload_error(self):
+    def test_sync_group_class_lane_hour_mismatch_is_upload_error(self):
         workbook = create_template_workbook()
         append_named_row(workbook, "교사", {"교사명": "김국어"})
         append_named_row(workbook, "교사", {"교사명": "박수학"})
+        append_named_row(workbook, "교사", {"교사명": "이물리"})
         append_named_row(workbook, "학급-계열", {"학급명": "1-1", "학년": "1", "계열": "공통", "담임교사명": "김국어", "가상학급여부": "N"})
         append_named_row(workbook, "학급-계열", {"학급명": "1-2", "학년": "1", "계열": "공통", "담임교사명": "박수학", "가상학급여부": "N"})
+        append_named_row(workbook, "학급-계열", {"학급명": "1-3", "학년": "1", "계열": "공통", "담임교사명": "이물리", "가상학급여부": "N"})
         append_named_row(workbook, "과목", {"과목명": "국어", "단축명": "국", "NEIS과목명": "국어"})
         append_named_row(workbook, "과목", {"과목명": "수학", "단축명": "수", "NEIS과목명": "수학"})
+        append_named_row(workbook, "과목", {"과목명": "물리", "단축명": "물", "NEIS과목명": "물리"})
         append_named_row(workbook, "교사별 시수표", {"교사명": "김국어", "과목명": "국어", "동시그룹": "G1"})
         append_named_row(workbook, "교사별 시수표", {"교사명": "박수학", "과목명": "수학", "동시그룹": "G1"})
+        append_named_row(workbook, "교사별 시수표", {"교사명": "이물리", "과목명": "물리", "동시그룹": "G1"})
         load_sheet = workbook["교사별 시수표"]
         class_start = len(SPECS_BY_NAME["교사별 시수표"]) + 1
         load_sheet.cell(row=1, column=class_start).value = "1-1"
         load_sheet.cell(row=1, column=class_start + 1).value = "1-2"
-        load_sheet.cell(row=load_sheet.max_row - 1, column=class_start).value = 2
-        load_sheet.cell(row=load_sheet.max_row, column=class_start + 1).value = 1
+        load_sheet.cell(row=1, column=class_start + 2).value = "1-3"
+        load_sheet.cell(row=load_sheet.max_row - 2, column=class_start).value = 3
+        load_sheet.cell(row=load_sheet.max_row - 1, column=class_start + 1).value = 2
+        load_sheet.cell(row=load_sheet.max_row, column=class_start + 2).value = 3
         validation = validate_workbook(workbook)
         self.assertFalse(validation["ok"])
         self.assertIn("동시그룹", json.dumps(validation["issues"], ensure_ascii=False))
+        self.assertIn("학급별", json.dumps(validation["issues"], ensure_ascii=False))
 
     def test_vercel_python_entrypoints_are_declared(self):
         api_index = (app_module.ROOT / "api" / "index.py").read_text(encoding="utf-8")
