@@ -964,6 +964,51 @@ body.setup-complete .start-panel {
   color: var(--red);
 }
 
+.status-line.warning {
+  color: #8a5a00;
+}
+
+.upload-issue-preview {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid #f1c6c6;
+  border-radius: 8px;
+  background: #fff7f7;
+  font-size: 12px;
+}
+
+.upload-issue-preview strong {
+  color: var(--red);
+}
+
+.upload-issue-row {
+  display: grid;
+  gap: 2px;
+  padding-top: 7px;
+  border-top: 1px solid #f3d7d7;
+}
+
+.upload-issue-row:first-of-type {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.upload-issue-row span {
+  font-weight: 800;
+  color: var(--red);
+}
+
+.upload-issue-row p {
+  margin: 0;
+  color: var(--text);
+}
+
+.upload-issue-row small {
+  color: var(--muted);
+}
+
 .schedule-board {
   overflow-x: auto;
 }

@@ -17,9 +17,16 @@ const state = {
   sessionAiConfig: null,
   solveLaunchContext: "workspace",
   solveInProgress: false,
+  solveSessionId: "",
+  solveStartedAt: 0,
+  solveAcceptVisible: false,
+  solveAcceptRequested: false,
   pendingMovePreview: null,
   pendingScheduleProposal: null,
   pendingPreviewKind: "",
+  chatPendingRemoteId: 0,
+  chatLocalResponse: null,
+  chatLocalDisplayed: false,
 };
 
 const STORAGE_KEYS = {
@@ -33,6 +40,9 @@ const els = {
   uploadInput: document.querySelector("#uploadInput"),
   selectedFileName: document.querySelector("#selectedFileName"),
   uploadButton: document.querySelector("#uploadButton"),
+  uploadStatus: document.querySelector("#uploadStatus"),
+  uploadReportLink: document.querySelector("#uploadReportLink"),
+  uploadIssuePreview: document.querySelector("#uploadIssuePreview"),
   solveMethod: document.querySelector("#solveMethod"),
   searchStrength: document.querySelector("#searchStrength"),
   variationMode: document.querySelector("#variationMode"),
@@ -63,6 +73,12 @@ const els = {
   solveFailureMessage: document.querySelector("#solveFailureMessage"),
   retrySolveButton: document.querySelector("#retrySolveButton"),
   editSolvePreferenceButton: document.querySelector("#editSolvePreferenceButton"),
+  solveProgressMessage: document.querySelector("#solveProgressMessage"),
+  solveProgressStats: document.querySelector("#solveProgressStats"),
+  acceptBestSolveButton: document.querySelector("#acceptBestSolveButton"),
+  solveOverlayProgressMessage: document.querySelector("#solveOverlayProgressMessage"),
+  solveOverlayProgressStats: document.querySelector("#solveOverlayProgressStats"),
+  acceptBestSolveOverlayButton: document.querySelector("#acceptBestSolveOverlayButton"),
   solveStatus: document.querySelector("#solveStatus"),
   excelExport: document.querySelector("#excelExport"),
   neisExport: document.querySelector("#neisExport"),
@@ -100,6 +116,9 @@ const els = {
   chatLog: document.querySelector("#chatLog"),
   chatMessage: document.querySelector("#chatMessage"),
   chatButton: document.querySelector("#chatButton"),
+  chatPendingBox: document.querySelector("#chatPendingBox"),
+  chatPendingMessage: document.querySelector("#chatPendingMessage"),
+  chatUseLocalButton: document.querySelector("#chatUseLocalButton"),
   chatConstraintList: document.querySelector("#chatConstraintList"),
   startStepBadge: document.querySelector("#startStepBadge"),
   initialConstraintText: document.querySelector("#initialConstraintText"),
@@ -126,6 +145,7 @@ const metricLabels = {
   loadCount: "시수 행",
   constraintCount: "조건",
   syncGroupCount: "동시/합반",
+  syncBundleCount: "동시묶음",
   continuousCount: "연속",
   coTeacherCount: "복수교사",
 };
@@ -178,10 +198,58 @@ function storageSet(key, value) {
   }
 }
 
+function normalizeImport(item) {
+  if (!item) return null;
+  const id = item.id || "";
+  return {
+    ...item,
+    issues: Array.isArray(item.issues) ? item.issues : [],
+    stats: item.stats || {},
+    reportUrl: item.reportUrl || (id ? `/imports/${id}/report.xlsx` : ""),
+  };
+}
+
+function setUploadStatus(message, tone = "", reportUrl = "", issues = []) {
+  if (els.uploadStatus) {
+    els.uploadStatus.textContent = message;
+    els.uploadStatus.classList.remove("ok", "error", "warning");
+    if (tone) els.uploadStatus.classList.add(tone);
+  }
+  if (els.uploadReportLink) {
+    els.uploadReportLink.href = reportUrl || "#";
+    els.uploadReportLink.classList.toggle("hidden", !reportUrl);
+  }
+  if (!els.uploadIssuePreview) return;
+  const visibleIssues = Array.isArray(issues) ? issues.slice(0, 6) : [];
+  els.uploadIssuePreview.classList.toggle("hidden", !visibleIssues.length);
+  els.uploadIssuePreview.innerHTML = visibleIssues.length
+    ? `
+      <strong>먼저 고칠 항목</strong>
+      ${visibleIssues
+        .map(
+          (issue) => `
+            <div class="upload-issue-row">
+              <span>${escapeHtml(issue.sheet)} ${escapeHtml(issue.cell)}</span>
+              <p>${escapeHtml(issue.message)}</p>
+              <small>${escapeHtml(issue.fix)}</small>
+            </div>
+          `
+        )
+        .join("")}
+    `
+    : "";
+}
+
 function setSelectedFile(file) {
   state.selectedFile = file || null;
   els.selectedFileName.textContent = state.selectedFile ? state.selectedFile.name : "선택된 파일 없음";
   els.uploadButton.disabled = !state.selectedFile;
+  setUploadStatus(
+    state.selectedFile ? "파일이 선택되었습니다. 업로드 및 검증을 눌러 구조 검사를 시작하세요." : "작성한 엑셀을 선택한 뒤 검증하면 결과가 여기에 표시됩니다.",
+    "",
+    "",
+    []
+  );
 }
 
 function syncModelValueFromControls() {
@@ -277,7 +345,6 @@ function getSolveOptions() {
     allowRelaxForUnassigned: els.allowRelaxForUnassigned.checked ? "Y" : "N",
     protectLunch: els.protectLunch.checked ? "Y" : "N",
     teacherDayMaxEnabled: els.teacherDayMaxEnabled.checked ? "Y" : "N",
-    timeBudgetSeconds: 55,
     teacherDayMax: {
       월: els.teacherMaxMon.value.trim(),
       화: els.teacherMaxTue.value.trim(),
@@ -427,7 +494,7 @@ async function api(path, options = {}) {
     const rawMessage = data?.error || data?.message || data || `요청 실패: ${response.status}`;
     let message = String(rawMessage);
     if (message.includes("FUNCTION_INVOCATION_TIMEOUT")) {
-      message = "자동배정이 Vercel 실행 시간 제한을 넘겼습니다. 탐색 강도를 낮추거나 다시 시도하세요.";
+      message = "서버 응답이 중단되었습니다. 진행형 탐색을 다시 시작하거나 최근 오류 로그를 확인하세요.";
     }
     throw new Error(message);
   }
@@ -467,7 +534,7 @@ async function checkHealth() {
 }
 
 function renderMetrics(stats = {}) {
-  const keys = ["teacherCount", "classCount", "subjectCount", "roomCount", "fixedPeriodCount", "loadCount", "constraintCount"];
+  const keys = ["teacherCount", "classCount", "subjectCount", "roomCount", "fixedPeriodCount", "loadCount", "constraintCount", "syncBundleCount"];
   els.metrics.innerHTML = keys
     .map((key) => {
       const label = metricLabels[key] || key;
@@ -501,6 +568,7 @@ function renderIssues(issues = []) {
 
 function renderCurrentImport(item) {
   const previousImportId = state.currentImport?.id || null;
+  item = normalizeImport(item);
   state.currentImport = item;
   state.scheduleResult = null;
   state.selectedCandidate = null;
@@ -527,15 +595,16 @@ function renderCurrentImport(item) {
     clearQuickMove("수업 칸 선택", false);
     return;
   }
-  const errorCount = item.issues.filter((issue) => issue.severity === "error").length;
-  const warningCount = item.issues.filter((issue) => issue.severity === "warning").length;
+  const issues = item.issues || [];
+  const errorCount = issues.filter((issue) => issue.severity === "error").length;
+  const warningCount = issues.filter((issue) => issue.severity === "warning").length;
   els.currentTitle.textContent = item.fileName;
   els.currentSubtitle.textContent = `${item.createdAt} · 오류 ${errorCount}건 · 경고 ${warningCount}건`;
   updateSolveAvailability();
   els.reportLink.href = item.reportUrl || `/imports/${item.id}/report.xlsx`;
   els.reportLink.classList.remove("disabled");
   renderMetrics(item.stats);
-  renderIssues(item.issues);
+  renderIssues(issues);
   renderDiagnostics(null);
   renderTeacherIssues(null);
   clearQuickMove("수업 칸 선택", false);
@@ -550,7 +619,8 @@ function renderImports() {
   els.importList.innerHTML = state.imports
     .map((item) => {
       const active = state.currentImport && state.currentImport.id === item.id ? "active" : "";
-      const errors = item.issues.filter((issue) => issue.severity === "error").length;
+      const issues = Array.isArray(item.issues) ? item.issues : [];
+      const errors = issues.filter((issue) => issue.severity === "error").length;
       const status = item.ok ? "검증 가능" : `오류 ${errors}`;
       return `
         <button class="history-item ${active}" type="button" data-import-id="${escapeHtml(item.id)}">
@@ -564,7 +634,7 @@ function renderImports() {
 
 async function loadImports() {
   const data = await api("/api/imports");
-  state.imports = data.imports.map((item) => ({ ...item, reportUrl: `/imports/${item.id}/report.xlsx` }));
+  state.imports = data.imports.map((item) => normalizeImport(item));
   renderImports();
   if (!state.currentImport && state.imports.length) {
     const storedId = storageGet(STORAGE_KEYS.importId);
@@ -576,17 +646,32 @@ async function uploadWorkbook() {
   if (!state.selectedFile) return;
   els.uploadButton.disabled = true;
   els.uploadButton.textContent = "검증 중";
+  setUploadStatus("엑셀 구조와 입력값을 검증하는 중입니다...", "", "", []);
   const form = new FormData();
   form.append("file", state.selectedFile);
   try {
     const result = await api("/imports/timetable-input", { method: "POST", body: form });
-    const item = { ...result, reportUrl: result.reportUrl };
+    const item = normalizeImport(result);
+    const errors = item.issues.filter((issue) => issue.severity === "error");
+    const warnings = item.issues.filter((issue) => issue.severity === "warning");
     state.imports = [item, ...state.imports.filter((existing) => existing.id !== item.id)];
     renderCurrentImport(item);
-    if (result.ok) setStartStep("constraints");
-    log(`엑셀 검증 완료: ${result.ok ? "통과" : "오류 있음"}`);
+    if (item.ok) {
+      setUploadStatus(`검증을 통과했습니다. 오류 0건, 경고 ${warnings.length}건입니다.`, "ok", "", []);
+      setStartStep("constraints");
+    } else {
+      setUploadStatus(
+        `검증 오류 ${errors.length}건, 경고 ${warnings.length}건입니다. 아래 항목을 고친 뒤 다시 업로드하세요.`,
+        "error",
+        item.reportUrl,
+        item.issues
+      );
+      setStartStep("excel");
+    }
+    log(`엑셀 검증 완료: ${item.ok ? "통과" : `오류 ${errors.length}건`}`);
   } catch (error) {
     log(error.message);
+    setUploadStatus(`업로드 요청 실패: ${error.message}`, "error", "", []);
     alert(error.message);
   } finally {
     els.uploadButton.textContent = "↥ 업로드 및 검증";
@@ -645,9 +730,39 @@ function renderDiagnostics(candidate = state.selectedCandidate) {
     .join("");
 }
 
+renderDiagnostics = function renderDiagnosticsWithUnassigned(candidate = state.selectedCandidate) {
+  const diagnostics = candidate?.diagnostics || [];
+  const unassigned = candidate?.unassigned || [];
+  if (!els.diagnosticPanel) return;
+  if (!diagnostics.length && !unassigned.length) {
+    els.diagnosticPanel.innerHTML = `<div class="diagnostic-row success"><strong>진단</strong><span>선택된 후보의 검증 진단이 없습니다.</span></div>`;
+    return;
+  }
+  const unassignedHtml = unassigned
+    .map((item) => `
+      <div class="diagnostic-row error unassigned-card">
+        <strong>미배정</strong>
+        <span>${escapeHtml(item.teacherName || item.teacherCode || "-")} / ${escapeHtml(item.subjectName || item.subjectCode || "-")} / ${escapeHtml(item.className || item.classCode || "-")} ${escapeHtml(item.hours || 1)}시간</span>
+        <small>${escapeHtml(item.reason || "")}</small>
+      </div>
+    `)
+    .join("");
+  const diagnosticHtml = diagnostics
+    .slice(0, 8)
+    .map((item) => `
+      <div class="diagnostic-row ${escapeHtml(item.severity || "warning")}">
+        <strong>${escapeHtml(item.type === "repair" ? "미배정 자동 보정 기록" : item.title || item.type || "진단")}</strong>
+        <span>${escapeHtml(item.reason || "")}</span>
+        <small>${escapeHtml(item.suggestion || "")}</small>
+      </div>
+    `)
+    .join("");
+  els.diagnosticPanel.innerHTML = `${unassignedHtml}${diagnosticHtml}`;
+};
+
 function renderTeacherIssues(candidate = state.selectedCandidate) {
   if (!els.teacherIssuePanel) return;
-  const issues = candidate?.teacherIssues || [];
+  const issues = [...(candidate?.teacherIssues || [])].sort((a, b) => String(a.teacherName || a.teacherCode || "").localeCompare(String(b.teacherName || b.teacherCode || ""), "ko"));
   if (!candidate) {
     els.teacherIssuePanel.innerHTML = `<div class="empty-state compact">자동배정 후 배정불량교사가 표시됩니다.</div>`;
     return;
@@ -710,6 +825,10 @@ function closeSolvePreferences() {
 function showSolveProgress(context) {
   els.solveFailureBox?.classList.add("hidden");
   if (els.solveFailureMessage) els.solveFailureMessage.textContent = "";
+  state.solveStartedAt = Date.now();
+  state.solveAcceptVisible = false;
+  state.solveAcceptRequested = false;
+  renderSolveProgress({ progressMessage: "탐색을 시작하고 있습니다.", bestSummary: null, canAccept: false }, context);
   if (context === "setup") {
     setStartStep("solving");
   } else {
@@ -719,6 +838,8 @@ function showSolveProgress(context) {
 
 function hideSolveProgress() {
   els.solveOverlay?.classList.add("hidden");
+  els.acceptBestSolveButton?.classList.add("hidden");
+  els.acceptBestSolveOverlayButton?.classList.add("hidden");
 }
 
 function showSolveFailure(error, context) {
@@ -734,10 +855,56 @@ function showSolveFailure(error, context) {
   log(message);
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function solveProgressStatsHtml(summary = {}) {
+  const stats = [
+    ["미배정", summary.unassigned ?? "-"],
+    ["식사부족", summary.lunchShortage ?? "-"],
+    ["연강", summary.consecutive ?? "-"],
+    ["안배부족", summary.imbalance ?? "-"],
+  ];
+  return stats
+    .map(([label, value]) => `<div class="solve-progress-stat"><strong>${escapeHtml(value)}</strong><span>${escapeHtml(label)}</span></div>`)
+    .join("");
+}
+
+function renderSolveProgress(progress = {}, context = "workspace") {
+  const elapsed = Date.now() - (state.solveStartedAt || Date.now());
+  const canShowAccept = Boolean(progress.canAccept) && elapsed >= 20000;
+  state.solveAcceptVisible = canShowAccept;
+  const message = progress.progressMessage || "탐색을 계속 진행 중입니다.";
+  const statsHtml = solveProgressStatsHtml(progress.bestSummary || {});
+  for (const node of [els.solveProgressMessage, els.solveOverlayProgressMessage]) {
+    if (node) node.textContent = message;
+  }
+  for (const node of [els.solveProgressStats, els.solveOverlayProgressStats]) {
+    if (node) node.innerHTML = statsHtml;
+  }
+  for (const button of [els.acceptBestSolveButton, els.acceptBestSolveOverlayButton]) {
+    if (button) button.classList.toggle("hidden", !canShowAccept);
+  }
+}
+
+function requestAcceptBestSolve() {
+  if (!state.solveInProgress || !state.solveSessionId) return;
+  state.solveAcceptRequested = true;
+  for (const node of [els.solveProgressMessage, els.solveOverlayProgressMessage]) {
+    if (node) node.textContent = "현재 최선안을 반영하는 중입니다.";
+  }
+}
+
+function perfectEnough(summary = {}) {
+  return Number(summary.unassigned || 0) === 0 && Number(summary.errors || 0) === 0;
+}
+
 async function solveSchedule(context = "workspace") {
   if (state.solveInProgress) return false;
   getActiveImport();
   state.solveInProgress = true;
+  state.solveSessionId = "";
   els.solveButton.disabled = true;
   els.solveButton.textContent = "배정 중";
   if (els.startSolveButton) els.startSolveButton.disabled = true;
@@ -745,20 +912,40 @@ async function solveSchedule(context = "workspace") {
   showSolveProgress(context);
   updateSolveAvailability();
   try {
-    const result = await api("/schedules/solve", {
+    const basePayload = {
+      ...requestBasePayload(),
+      aiConfig: getAiConfig(),
+      apiValidated: state.apiValidated,
+      solveOptions: getSolveOptions(),
+    };
+    let progress = await api("/schedules/solve/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        ...requestBasePayload(),
-        aiConfig: getAiConfig(),
-        apiValidated: state.apiValidated,
-        solveOptions: getSolveOptions(),
-      }),
+      body: JSON.stringify(basePayload),
+    });
+    state.solveSessionId = progress.sessionId || "";
+    renderSolveProgress(progress, context);
+    while (state.solveInProgress && !state.solveAcceptRequested) {
+      if (progress.canAccept && perfectEnough(progress.bestSummary)) {
+        state.solveAcceptRequested = true;
+        break;
+      }
+      await sleep(700);
+      if (state.solveAcceptRequested) break;
+      progress = await api("/schedules/solve/continue", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...basePayload, sessionId: state.solveSessionId }),
+      });
+      renderSolveProgress(progress, context);
+    }
+    const result = await api("/schedules/solve/accept", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: state.solveSessionId }),
     });
     applyScheduleResult(result, `자동배정 완료: ${strategyName(result.bestStrategy)} 선택`);
-    if (result.progressMessage) {
-      log(`${result.progressMessage}${result.timedOut ? " (시간 제한 내 최선 후보)" : ""}`);
-    }
+    if (result.progressMessage) log(result.progressMessage);
     if (result.aiAdvisor?.advice) {
       const advice = result.aiAdvisor.advice;
       const remote = result.aiAdvisor.remote || {};
@@ -839,7 +1026,9 @@ function buildTeacherViews(schedule) {
       }
     }
   }
-  return teachers;
+  return Object.fromEntries(
+    Object.entries(teachers).sort((a, b) => String(a[1].name || a[0]).localeCompare(String(b[1].name || b[0]), "ko"))
+  );
 }
 
 function renderCellContent(cell, mode) {
@@ -957,6 +1146,48 @@ function drawSelectedSchedule() {
   els.scheduleBoard.innerHTML = `<table class="schedule-table">${header}${rows}</table>`;
 }
 
+drawSelectedSchedule = function drawSelectedSchedulePeriodRows() {
+  const schedule = state.selectedCandidate?.schedule;
+  if (!schedule) return;
+  const mode = els.viewMode.value;
+  const entities = mode === "teacher" ? buildTeacherViews(schedule) : schedule.classes;
+  const entityCode = els.classSelect.value || Object.keys(entities)[0];
+  const entityData = entities[entityCode];
+  if (!entityData) {
+    els.scheduleBoard.innerHTML = `<div class="empty-state">표시할 시간표가 없습니다.</div>`;
+    return;
+  }
+  const days = schedule.days || [];
+  const periods = schedule.periods || [];
+  const header = `<tr><th>교시</th>${days.map((day) => `<th>${escapeHtml(day)}</th>`).join("")}</tr>`;
+  const rows = periods
+    .map((period) => {
+      const cells = days
+        .map((day) => {
+          const dayLimit = Number(entityData.dayLimits?.[day] ?? periods.length);
+          if (mode === "class" && period > dayLimit) {
+            return `<td class="unavailable"><div class="schedule-cell unavailable"><small>수업 없음</small></div></td>`;
+          }
+          const raw = entityData.grid?.[day]?.[String(period)];
+          const cell = Array.isArray(raw) ? raw[0] : raw;
+          const sourceClassCode = mode === "teacher" ? (cell?.classCode || state.quickMoveSource?.classCode || "") : entityCode;
+          const option = findQuickMoveOption(day, period);
+          const cellClasses = [];
+          if (sourceClassCode && isQuickMoveSource(sourceClassCode, day, period)) cellClasses.push("quick-source");
+          if (option) cellClasses.push("quick-option", `quick-${option.grade || "ok"}`);
+          const attrs = sourceClassCode || option
+            ? `data-day="${escapeHtml(day)}" data-period="${period}" data-class-code="${escapeHtml(sourceClassCode || "")}" data-teacher-code="${escapeHtml(mode === "teacher" ? entityCode : cell?.teacherCode || "")}" data-has-cell="${cell ? "1" : "0"}" data-source="${escapeHtml(cell?.source || "")}"`
+            : "";
+          const note = option ? `<div class="move-option-note">${escapeHtml(option.grade === "good" ? "좋음" : option.grade === "warn" ? "주의" : option.grade === "bad" ? "불가" : "가능")}</div>` : "";
+          return `<td class="${cellClasses.join(" ")}" ${attrs}>${renderCellContent(cell, mode)}${note}</td>`;
+        })
+        .join("");
+      return `<tr><th>${escapeHtml(period)}교시</th>${cells}</tr>`;
+    })
+    .join("");
+  els.scheduleBoard.innerHTML = `<table class="schedule-table">${header}${rows}</table>`;
+};
+
 function fillSelect(select, values, formatter = (value) => value) {
   select.innerHTML = "";
   for (const value of values) {
@@ -970,7 +1201,7 @@ function fillSelect(select, values, formatter = (value) => value) {
 function populateMoveControls(schedule) {
   fillSelect(
     els.moveClass,
-    Object.keys(schedule.classes || {}),
+    Object.keys(schedule.classes || {}).sort((a, b) => String(schedule.classes[a].name || a).localeCompare(String(schedule.classes[b].name || b), "ko")),
     (classCode) => schedule.classes[classCode].name || classCode
   );
   fillSelect(els.moveFromDay, schedule.days || []);
@@ -1178,7 +1409,9 @@ function buildProposalPreview(scheduleResult) {
   }
   return {
     message: `AI 변경안입니다. 영향 교사 ${affectedTeachers.length}명, 승인 후 적용됩니다.`,
-    affectedTeachers: affectedTeachers.slice(0, 8),
+    affectedTeachers: affectedTeachers
+      .sort((a, b) => String(a.teacherName || a.teacherCode || "").localeCompare(String(b.teacherName || b.teacherCode || ""), "ko"))
+      .slice(0, 8),
   };
 }
 
@@ -1208,7 +1441,8 @@ function renderAffectedTeachers(teachers = []) {
   if (!teachers.length) {
     return `<div class="empty-state compact">비교할 교사 변경 내역이 없습니다. 승인하면 후보 시간표가 반영됩니다.</div>`;
   }
-  return `<div class="preview-teacher-grid">${teachers
+  return `<div class="preview-teacher-grid">${[...teachers]
+    .sort((a, b) => String(a.teacherName || a.teacherCode || "").localeCompare(String(b.teacherName || b.teacherCode || ""), "ko"))
     .map((teacher) => {
       const beforeMap = new Map((teacher.beforeCells || []).map((cell) => [cellKey(cell), cell.label]));
       const afterMap = new Map((teacher.afterCells || []).map((cell) => [cellKey(cell), cell.label]));
@@ -1522,6 +1756,146 @@ async function sendChat() {
   }
 }
 
+function chatRequestPayload(message) {
+  return {
+    ...requestBasePayload(),
+    message,
+    aiConfig: getAiConfig(),
+    apiValidated: state.apiValidated,
+    schedule: state.selectedCandidate?.schedule || null,
+    unassigned: state.selectedCandidate?.unassigned || [],
+    effectiveConfig: state.selectedCandidate?.effectiveConfig || null,
+    solveOptions: getSolveOptions(),
+  };
+}
+
+function showChatPending(message = "AI가 답변을 준비하고 있습니다.", showLocalButton = false) {
+  els.chatPendingBox?.classList.remove("hidden");
+  if (els.chatPendingMessage) els.chatPendingMessage.textContent = message;
+  els.chatUseLocalButton?.classList.toggle("hidden", !showLocalButton);
+}
+
+function hideChatPending() {
+  els.chatPendingBox?.classList.add("hidden");
+  els.chatUseLocalButton?.classList.add("hidden");
+}
+
+function formatChatResponse(response, sourceLabel = "") {
+  const suggestionText = (response.suggestions || [])
+    .map((item) => {
+      const body = item.explanation || (item.steps ? item.steps.join(" →") : JSON.stringify(item.draft));
+      return `${item.title}: ${body}`;
+    })
+    .join("\n");
+  const lines = [];
+  if (sourceLabel) lines.push(`[${sourceLabel}]`);
+  if (response.privacy) lines.push(response.privacy);
+  if (response.remote?.ok) {
+    lines.push(`[원격 AI 응답] ${response.remote.provider || "AI"} ${response.remote.model || ""}`.trim());
+  } else if (response.remoteFailure) {
+    const remote = response.remoteFailure;
+    lines.push(`[원격 AI 실패] ${remote.provider || "AI"} ${remote.status || ""}: ${remote.message || "응답을 받지 못했습니다."}`);
+  }
+  if (response.advice?.summary) lines.push(response.advice.summary);
+  if (suggestionText) lines.push(suggestionText);
+  if (response.remoteFailure && response.localAdvice?.summary && response.localAdvice.summary !== response.advice?.summary) {
+    lines.push(`[보조 진단] ${response.localAdvice.summary}`);
+    const localText = (response.localAdvice.suggestions || [])
+      .map((item) => `${item.title}: ${item.explanation || (item.steps || []).join(" →")}`)
+      .join("\n");
+    if (localText) lines.push(localText);
+  }
+  return lines.filter(Boolean).join("\n");
+}
+
+function handleChatResponse(response, sourceLabel = "") {
+  appendChat("assistant", formatChatResponse(response, sourceLabel), response.maskedPayload);
+  if (response.constraintDrafts?.length) {
+    state.pendingConstraintDrafts = response.constraintDrafts;
+    renderChatConstraints();
+    setActiveTab("diagnostics");
+  }
+  if (response.scheduleProposal?.scheduleResult) {
+    const proposal = response.scheduleProposal;
+    const preview = buildProposalPreview(proposal.scheduleResult);
+    if (proposal.message) preview.message = proposal.message;
+    openChangePreview({ title: "AI 변경안 미리보기", preview, kind: "proposal", proposal });
+    appendChat("assistant", "AI 변경안을 만들었습니다. 변경 미리보기에서 승인하면 시간표에 반영합니다.");
+  }
+}
+
+function useLocalChatNow() {
+  if (!state.chatLocalResponse) {
+    showChatPending("로컬 보조 답변을 준비하는 중입니다. 잠시만 기다려주세요.", false);
+    return;
+  }
+  if (!state.chatLocalDisplayed) {
+    state.chatLocalDisplayed = true;
+    handleChatResponse(state.chatLocalResponse, "보조 진단 먼저 보기");
+  }
+  showChatPending("원격 AI가 더 깊게 검토 중입니다. 늦게 도착하면 이어서 표시합니다.", false);
+  els.chatButton.disabled = false;
+}
+
+async function sendChatProgressive() {
+  const message = els.chatMessage.value.trim();
+  if (!message) return;
+  appendChat("user", message);
+  els.chatMessage.value = "";
+  els.chatButton.disabled = true;
+  const requestId = ++state.chatPendingRemoteId;
+  state.chatLocalResponse = null;
+  state.chatLocalDisplayed = false;
+  showChatPending("AI가 답변을 준비하고 있습니다.", false);
+  const payload = chatRequestPayload(message);
+  let remoteDone = false;
+  window.setTimeout(() => {
+    if (state.chatPendingRemoteId === requestId && !remoteDone) {
+      showChatPending("원격 AI가 계속 생각 중입니다. 지금 로컬 보조 답변을 먼저 볼 수 있습니다.", true);
+    }
+  }, 20000);
+  const localPromise = api("/ai/chat/local", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  })
+    .then((response) => {
+      if (state.chatPendingRemoteId !== requestId) return null;
+      state.chatLocalResponse = response;
+      return response;
+    })
+    .catch((error) => {
+      log(error.message);
+      return null;
+    });
+  try {
+    const response = await api("/ai/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    remoteDone = true;
+    if (state.chatPendingRemoteId !== requestId) return;
+    hideChatPending();
+    handleChatResponse(response, state.chatLocalDisplayed ? "원격 AI 응답 도착" : "");
+    log("AI 제안 생성 완료");
+  } catch (error) {
+    remoteDone = true;
+    if (state.chatPendingRemoteId !== requestId) return;
+    const local = await localPromise;
+    hideChatPending();
+    if (local && !state.chatLocalDisplayed) {
+      handleChatResponse(local, "원격 실패 후 보조 진단");
+    }
+    appendChat("assistant", `원격 AI 요청 실패: ${error.message}`);
+    log(error.message);
+  } finally {
+    if (state.chatPendingRemoteId === requestId) {
+      els.chatButton.disabled = false;
+    }
+  }
+}
+
 async function validateApiKey() {
   els.apiCheckButton.disabled = true;
   els.apiStatus.textContent = `${providerLabel()} API 키 검증 중`;
@@ -1629,6 +2003,8 @@ function wireEvents() {
   els.solvePreferenceConfirm?.addEventListener("click", confirmSolvePreferences);
   els.retrySolveButton?.addEventListener("click", () => solveSchedule(state.solveLaunchContext || "setup"));
   els.editSolvePreferenceButton?.addEventListener("click", () => openSolvePreferences(state.solveLaunchContext || "setup"));
+  els.acceptBestSolveButton?.addEventListener("click", requestAcceptBestSolve);
+  els.acceptBestSolveOverlayButton?.addEventListener("click", requestAcceptBestSolve);
   els.changePreviewClose?.addEventListener("click", closeChangePreview);
   els.changePreviewCancel?.addEventListener("click", closeChangePreview);
   els.changePreviewConfirm?.addEventListener("click", confirmChangePreview);
@@ -1700,10 +2076,11 @@ function wireEvents() {
     input.addEventListener("input", () => resetApiValidation(`${providerLabel()} API 키를 다시 검증하세요.`));
   }
   els.recentLogsButton?.addEventListener("click", loadRecentLogs);
-  els.chatButton.addEventListener("click", sendChat);
+  els.chatUseLocalButton?.addEventListener("click", useLocalChatNow);
+  els.chatButton.addEventListener("click", sendChatProgressive);
   els.chatMessage.addEventListener("keydown", (event) => {
     if (event.ctrlKey && event.key === "Enter") {
-      sendChat();
+      sendChatProgressive();
     }
   });
 }
