@@ -27,6 +27,11 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
 
+try:
+    from ortools.sat.python import cp_model
+except Exception:  # pragma: no cover - exercised when optional dependency is absent
+    cp_model = None
+
 
 ROOT = Path(__file__).parent.resolve()
 WEB_DIR = ROOT / "web"
@@ -1888,6 +1893,12 @@ def missing_records_message(body: dict | None = None) -> str:
     return "importId 또는 records가 필요합니다."
 
 
+def cp_sat_required_by_body(body: dict | None = None) -> bool:
+    body = body or {}
+    options = body.get("solveOptions") if isinstance(body.get("solveOptions"), dict) else {}
+    return truthy_config(options.get("requireCpSat", "N"))
+
+
 def records_with_config(records: dict, updates: dict | None) -> dict:
     if not updates:
         return records
@@ -3235,6 +3246,369 @@ def solve_metaheuristic(records: dict, include_relaxations: bool = True, seed: i
     return (candidates, stats) if return_stats else candidates
 
 
+def cp_sat_available() -> bool:
+    return cp_model is not None
+
+
+def cp_sat_missing_message() -> str:
+    return "CP-SAT 엔진을 불러오지 못했습니다. requirements.txt 설치 후 다시 실행하세요."
+
+
+def load_grade(records: dict, class_code: str) -> str:
+    return as_text((records.get("classes") or {}).get(class_code, {}).get("학년"))
+
+
+def multigrade_teachers(records: dict) -> set[str]:
+    by_teacher = defaultdict(set)
+    for load in records.get("loads", []):
+        teacher = as_text(load.get("teacherCode"))
+        grade = load_grade(records, as_text(load.get("classCode")))
+        if teacher and grade:
+            by_teacher[teacher].add(grade)
+    return {teacher for teacher, grades in by_teacher.items() if len(grades) >= 2}
+
+
+def cp_unit_cells(unit: dict, day: str, start_period: int) -> list[dict]:
+    cells = []
+    block_size = parse_positive_int(unit.get("blockSize")) or 1
+    for entry in unit.get("entries", []):
+        for offset in range(block_size):
+            cells.append({
+                "classCode": entry.get("classCode", ""),
+                "teacherCode": entry.get("teacherCode", ""),
+                "roomCode": entry.get("roomCode", ""),
+                "day": day,
+                "period": start_period + offset,
+                "entry": entry,
+                "blockIndex": offset + 1,
+            })
+    return cells
+
+
+def cp_unit_slot_feasible(schedule: dict, unit: dict, day: str, start_period: int, teacher_busy, room_busy, forbidden, settings: dict, max_period: int) -> bool:
+    seen_classes = set()
+    seen_teachers = set()
+    seen_rooms = set()
+    for cell in cp_unit_cells(unit, day, start_period):
+        class_code = cell["classCode"]
+        teacher_code = cell["teacherCode"]
+        room_code = cell["roomCode"]
+        period = cell["period"]
+        entry = cell["entry"]
+        if period > max_period:
+            return False
+        if not class_period_available(schedule, class_code, day, period):
+            return False
+        if schedule["classes"][class_code]["grid"][day][str(period)]:
+            return False
+        class_key = (class_code, period)
+        teacher_key = (teacher_code, period)
+        room_key = (room_code, period)
+        if class_key in seen_classes:
+            return False
+        if teacher_code and teacher_key in seen_teachers:
+            return False
+        if room_code and room_key in seen_rooms:
+            return False
+        seen_classes.add(class_key)
+        if teacher_code:
+            seen_teachers.add(teacher_key)
+        if room_code:
+            seen_rooms.add(room_key)
+        if teacher_code and (day, period) in teacher_busy[teacher_code]:
+            return False
+        if room_code and (day, period) in room_busy[room_code]:
+            return False
+        if hard_forbidden(forbidden, entry, day, period):
+            return False
+    by_teacher_periods = defaultdict(list)
+    for cell in cp_unit_cells(unit, day, start_period):
+        if cell["teacherCode"]:
+            by_teacher_periods[cell["teacherCode"]].append(cell["period"])
+    for teacher_code, periods in by_teacher_periods.items():
+        if violates_teacher_flow(teacher_busy, teacher_code, day, periods, settings):
+            return False
+        if teacher_day_max_penalty(teacher_busy, teacher_code, day, len(periods), settings) is None:
+            return False
+    return True
+
+
+def cp_unit_slot_penalty(records: dict, unit: dict, day: str, start_period: int, settings: dict, max_period: int) -> int:
+    penalty = 0.0
+    for cell in cp_unit_cells(unit, day, start_period):
+        penalty += soft_constraint_score(records, cell["entry"], day, cell["period"], max_period)
+        penalty += abs(cell["period"] - ((max_period + 1) / 2)) * 0.08
+    if unit.get("bottleneck"):
+        penalty -= 1.0
+    return max(0, int(round(penalty * 100)))
+
+
+def make_cp_unit(unit_id: str, kind: str, entries: list[dict], block_size: int, load: dict | None = None, occurrence: dict | None = None) -> dict:
+    return {
+        "unitId": unit_id,
+        "kind": kind,
+        "entries": entries,
+        "blockSize": block_size,
+        "load": load or {},
+        "occurrence": occurrence or {},
+        "bottleneck": False,
+        "availableSlots": 0,
+    }
+
+
+def standardize_cp_units(records: dict) -> list[dict]:
+    units = []
+    for bundle in records.get("syncBundles", []):
+        for occurrence in bundle.get("occurrences", []):
+            units.append(make_cp_unit(
+                f"sync:{occurrence.get('syncOccurrenceId')}",
+                "sync",
+                sync_occurrence_entries(occurrence, records),
+                1,
+                occurrence=occurrence,
+            ))
+    for load_index, load in enumerate(records.get("loads", []), start=1):
+        if as_text(load.get("syncGroup")):
+            continue
+        for block_index, block_size in enumerate(parse_block_pattern(load.get("continuousPattern"), load["weeklyHours"]), start=1):
+            units.append(make_cp_unit(
+                f"load:{load.get('row', load_index)}:{block_index}",
+                "continuous" if block_size > 1 else "normal",
+                [entry_for_load(load, records, block_size)],
+                block_size,
+                load=load,
+            ))
+    return units
+
+
+def prepare_cp_units(records: dict, schedule: dict, teacher_busy, room_busy, forbidden, settings: dict, max_period: int) -> tuple[list[dict], int, int]:
+    teachers = multigrade_teachers(records)
+    units = standardize_cp_units(records)
+    bottleneck_count = 0
+    for unit in units:
+        slots = []
+        for day in schedule.get("days", []):
+            for period in schedule.get("periods", []):
+                if cp_unit_slot_feasible(schedule, unit, day, period, teacher_busy, room_busy, forbidden, settings, max_period):
+                    slots.append({
+                        "day": day,
+                        "period": period,
+                        "penalty": cp_unit_slot_penalty(records, unit, day, period, settings, max_period),
+                    })
+        unit["slots"] = slots
+        unit["availableSlots"] = len(slots)
+        unit["bottleneck"] = (
+            unit.get("kind") == "sync"
+            or unit.get("blockSize", 1) > 1
+            or any(entry.get("roomCode") for entry in unit.get("entries", []))
+            or any(entry.get("teacherCode") in teachers for entry in unit.get("entries", []))
+            or len(slots) <= max(3, len(schedule.get("days", [])))
+        )
+        if unit["bottleneck"]:
+            bottleneck_count += 1
+    grade_values = {
+        load_grade(records, entry.get("classCode", ""))
+        for unit in units
+        for entry in unit.get("entries", [])
+        if load_grade(records, entry.get("classCode", ""))
+    }
+    return units, bottleneck_count, len(grade_values)
+
+
+def cp_place_unit(schedule: dict, unit: dict, day: str, period: int, teacher_busy, room_busy) -> None:
+    for cell_info in cp_unit_cells(unit, day, period):
+        entry = deepcopy(cell_info["entry"])
+        entry["blockIndex"] = cell_info["blockIndex"]
+        schedule["classes"][cell_info["classCode"]]["grid"][day][str(cell_info["period"])] = entry
+        if cell_info["teacherCode"]:
+            teacher_busy[cell_info["teacherCode"]].add((day, cell_info["period"]))
+        if cell_info["roomCode"]:
+            room_busy[cell_info["roomCode"]].add((day, cell_info["period"]))
+
+
+def cp_unassigned_items(records: dict, unit: dict) -> list[dict]:
+    items = []
+    for entry in unit.get("entries", []):
+        items.append({
+            "teacherCode": entry.get("teacherCode", ""),
+            "teacherName": entry.get("teacherName") or display_name(records, "교사", entry.get("teacherCode", "")),
+            "subjectCode": entry.get("subjectCode", ""),
+            "subjectName": entry.get("subjectName") or display_name(records, "과목", entry.get("subjectCode", "")),
+            "classCode": entry.get("classCode", ""),
+            "className": entry.get("className") or display_name(records, "학급", entry.get("classCode", "")),
+            "roomCode": entry.get("roomCode", ""),
+            "hours": parse_positive_int(unit.get("blockSize")) or 1,
+            "syncGroup": entry.get("syncGroup", ""),
+            "syncOccurrenceId": entry.get("syncOccurrenceId", ""),
+            "syncLaneKey": entry.get("syncLaneKey", ""),
+            "reason": "CP-SAT 하드 제약 모델에서 배정 가능한 슬롯을 선택하지 못했습니다.",
+        })
+    return items
+
+
+def cp_status_label(status: int) -> str:
+    if cp_model is None:
+        return "not-run"
+    if status == cp_model.OPTIMAL:
+        return "optimal"
+    if status == cp_model.FEASIBLE:
+        return "feasible"
+    if status == cp_model.INFEASIBLE:
+        return "infeasible"
+    return "not-run"
+
+
+def solve_cp_sat_candidate(records: dict, solve_options: dict | None = None, seed: int | None = None) -> tuple[dict | None, dict]:
+    if cp_model is None:
+        return None, {
+            "phase": "preprocess",
+            "cpStatus": "not-run",
+            "bottleneckCount": 0,
+            "gradeSubproblemCount": 0,
+            "unassignedPenalty": 100000,
+            "hardSafeMutationCount": 0,
+            "message": cp_sat_missing_message(),
+        }
+    options = solve_options or {}
+    schedule = empty_schedule(records)
+    teacher_busy = defaultdict(set)
+    room_busy = defaultdict(set)
+    apply_fixed_periods(records, schedule, teacher_busy)
+    days, max_period = schedule_dimensions(records)
+    settings = constraint_settings(records)
+    forbidden = build_forbidden_index(records)
+    units, bottleneck_count, grade_count = prepare_cp_units(records, schedule, teacher_busy, room_busy, forbidden, settings, max_period)
+    model = cp_model.CpModel()
+    slot_vars = {}
+    unassigned_vars = {}
+    class_busy = defaultdict(list)
+    teacher_model_busy = defaultdict(list)
+    room_model_busy = defaultdict(list)
+    unassigned_penalty = 100000
+    objective_terms = []
+    for unit_index, unit in enumerate(units):
+        unit_vars = []
+        for slot_index, slot in enumerate(unit.get("slots", [])):
+            var = model.NewBoolVar(f"u{unit_index}_s{slot_index}")
+            slot_vars[(unit_index, slot_index)] = var
+            unit_vars.append(var)
+            objective_terms.append(var * int(slot.get("penalty", 0)))
+            for cell in cp_unit_cells(unit, slot["day"], slot["period"]):
+                class_busy[(cell["classCode"], cell["day"], cell["period"])].append(var)
+                if cell["teacherCode"]:
+                    teacher_model_busy[(cell["teacherCode"], cell["day"], cell["period"])].append(var)
+                if cell["roomCode"]:
+                    room_model_busy[(cell["roomCode"], cell["day"], cell["period"])].append(var)
+        unassigned = model.NewBoolVar(f"u{unit_index}_unassigned")
+        unassigned_vars[unit_index] = unassigned
+        model.Add(sum(unit_vars) + unassigned == 1)
+        objective_terms.append(unassigned * (unassigned_penalty + (5000 if unit.get("bottleneck") else 0)))
+    for variables in list(class_busy.values()) + list(teacher_model_busy.values()) + list(room_model_busy.values()):
+        if len(variables) > 1:
+            model.AddAtMostOne(variables)
+    model.Minimize(sum(objective_terms))
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = float(options.get("cpTimeLimitSeconds") or 8)
+    solver.parameters.num_search_workers = int(options.get("cpWorkers") or 4)
+    if seed:
+        solver.parameters.random_seed = int(seed % 2_000_000_000)
+    status = solver.Solve(model)
+    cp_status = cp_status_label(status)
+    assigned = {}
+    unassigned = []
+    if cp_status in {"optimal", "feasible"}:
+        for unit_index, unit in enumerate(units):
+            chosen = None
+            for slot_index, slot in enumerate(unit.get("slots", [])):
+                if solver.BooleanValue(slot_vars[(unit_index, slot_index)]):
+                    chosen = slot
+                    break
+            if chosen:
+                assigned[unit["unitId"]] = chosen
+                cp_place_unit(schedule, unit, chosen["day"], chosen["period"], teacher_busy, room_busy)
+            else:
+                unassigned.extend(cp_unassigned_items(records, unit))
+    else:
+        for unit in units:
+            unassigned.extend(cp_unassigned_items(records, unit))
+    validation = validate_schedule(records, schedule, unassigned)
+    diagnostics = diagnose_schedule(records, schedule, validation, unassigned)
+    candidate = {
+        "strategy": f"cp-sat-{cp_status}-{seed or ''}",
+        "schedule": schedule,
+        "unassigned": unassigned,
+        "validation": validation,
+        "diagnostics": diagnostics,
+        "algorithm": "cp-sat",
+        "gene": {"seed": seed or 0, "strategy": "cp-sat", "randomness": 0.0},
+        "quality": teacher_distribution_metrics(schedule),
+        "teacherIssues": teacher_issue_summary(records, schedule, validation),
+        "repairNotes": [],
+        "score": 0,
+        "cpAssignments": assigned,
+    }
+    candidate["score"] = timetable_quality_score(candidate)
+    stats = {
+        "phase": "bottleneck-cp" if bottleneck_count else "grade-cp",
+        "cpStatus": cp_status,
+        "bottleneckCount": bottleneck_count,
+        "gradeSubproblemCount": grade_count,
+        "unassignedPenalty": unassigned_penalty,
+        "hardSafeMutationCount": 0,
+        "cpUnitCount": len(units),
+        "cpAssignedCount": len(assigned),
+    }
+    return candidate, stats
+
+
+def hard_safe_local_search(records: dict, candidate: dict, seed: int | None = None, max_steps: int = 160) -> tuple[dict, int]:
+    if not candidate or candidate_error_count(candidate):
+        return candidate, 0
+    rng = random.Random(seed or solve_run_seed(None))
+    best = deepcopy(candidate)
+    best_score = timetable_quality_score(best)
+    mutation_count = 0
+    for _ in range(max_steps):
+        schedule = best.get("schedule") or {}
+        movable = []
+        for class_code, class_data in (schedule.get("classes") or {}).items():
+            for day in schedule.get("days", []):
+                for period in schedule.get("periods", []):
+                    cell = class_data.get("grid", {}).get(day, {}).get(str(period))
+                    if cell and cell.get("source") != "fixed":
+                        movable.append((class_code, day, period))
+        if not movable:
+            break
+        class_code, src_day, src_period = rng.choice(movable)
+        dst_day = rng.choice(schedule.get("days") or [src_day])
+        dst_period = rng.choice(schedule.get("periods") or [src_period])
+        if dst_day == src_day and dst_period == src_period:
+            continue
+        dst_cell = schedule.get("classes", {}).get(class_code, {}).get("grid", {}).get(dst_day, {}).get(str(dst_period))
+        mode = "swap" if dst_cell else "move"
+        moved = move_schedule(records, schedule, {
+            "mode": mode,
+            "from": {"classCode": class_code, "day": src_day, "period": src_period},
+            "to": {"day": dst_day, "period": dst_period},
+        })
+        if not moved.get("ok"):
+            continue
+        trial = deepcopy(best)
+        trial["schedule"] = moved["schedule"]
+        trial["validation"] = moved["validation"]
+        trial["diagnostics"] = moved["diagnostics"]
+        trial["teacherIssues"] = moved["teacherIssues"]
+        trial["quality"] = teacher_distribution_metrics(moved["schedule"])
+        trial["score"] = timetable_quality_score(trial)
+        if candidate_error_count(trial) == 0 and len(trial.get("unassigned", [])) <= len(best.get("unassigned", [])) and trial["score"] >= best_score:
+            best = trial
+            best_score = trial["score"]
+            mutation_count += 1
+    best["algorithm"] = "cp-sat-metaheuristic"
+    best["strategy"] = f"{best.get('strategy', 'cp-sat')}-hard-safe-local"
+    return best, mutation_count
+
+
 def candidate_rank(candidate: dict):
     relaxation_count = len(candidate.get("relaxations", []))
     return (
@@ -3827,6 +4201,21 @@ def solve_schedule(records: dict, api_key: str = "", ai_config=None, solve_optio
     records = apply_solve_options(records, solve_options)
     record_signature = records_signature(records)
     config = normalize_ai_config(ai_config, api_key=api_key)
+    cp_candidate = None
+    cp_stats = {
+        "phase": "preprocess",
+        "cpStatus": "not-run",
+        "bottleneckCount": 0,
+        "gradeSubproblemCount": 0,
+        "unassignedPenalty": 100000,
+        "hardSafeMutationCount": 0,
+    }
+    if cp_sat_available():
+        cp_candidate, cp_stats = solve_cp_sat_candidate(records, solve_options=solve_options, seed=seed)
+        if cp_candidate:
+            cp_candidate, mutation_count = hard_safe_local_search(records, cp_candidate, seed=seed, max_steps=60 if search_strength == "fast" else 160)
+            cp_stats["phase"] = "ga-quality"
+            cp_stats["hardSafeMutationCount"] = mutation_count
     strict_candidates = [
         solve_greedy(records, "balanced", gene={"seed": 11, "randomness": 0.0, "strategy": "balanced"}),
         solve_greedy(records, "gap-light", gene={"seed": 17, "randomness": 0.0, "strategy": "gap-light"}),
@@ -3839,7 +4228,8 @@ def solve_schedule(records: dict, api_key: str = "", ai_config=None, solve_optio
     needs_relaxation = needs_repair_candidates(strict_candidates)
     repair_candidates = generate_ai_repair_candidates(records, strict_candidates)
     genetic_candidates, genetic_stats = solve_metaheuristic(records, include_relaxations=needs_relaxation, seed=seed, search_strength=search_strength, return_stats=True, repair_mode=repair_mode, active_profiles=active_profiles)
-    all_candidates = genetic_candidates + repair_candidates
+    cp_candidates = [cp_candidate] if cp_candidate else []
+    all_candidates = cp_candidates + genetic_candidates + repair_candidates
     annotate_candidate_signatures(all_candidates)
     previous_result = load_last_schedule() if variation_mode == "quality-first" else None
     best, best_changed, selection_source = select_quality_first_candidate(records, all_candidates, variation_mode, previous_result)
@@ -3865,7 +4255,7 @@ def solve_schedule(records: dict, api_key: str = "", ai_config=None, solve_optio
         "selected": best,
         "aiSummary": ai_summary,
         "aiAdvisor": ai_advisor,
-        "attemptCount": genetic_stats.get("attemptCount", 0),
+        "attemptCount": genetic_stats.get("attemptCount", 0) + (1 if cp_candidate else 0),
         "bestChanged": best_changed,
         "bestSignature": best["signature"],
         "timedOut": False,
@@ -3873,6 +4263,7 @@ def solve_schedule(records: dict, api_key: str = "", ai_config=None, solve_optio
         "progressMessage": "자동배정 탐색 chunk가 완료되었습니다.",
         "searchStats": {
             **genetic_stats,
+            **cp_stats,
             "repairMode": repair_mode,
             "activeProfiles": active_profiles or genetic_stats.get("activeProfiles", []),
             "lastSeed": seed,
@@ -3881,13 +4272,14 @@ def solve_schedule(records: dict, api_key: str = "", ai_config=None, solve_optio
             "previousSignature": candidate_signature((previous_result or {}).get("selected", {})) if previous_result and previous_result.get("recordSignature") == record_signature else "",
         },
         "repairSummary": {
+            "cpCandidateCount": len(cp_candidates),
             "strictCandidateCount": len(strict_candidates),
             "repairCandidateCount": len(repair_candidates),
             "geneticCandidateCount": len(genetic_candidates),
             "selectedRelaxations": best.get("relaxations", []),
         },
         "solver": {
-            "algorithm": "metaheuristic-genetic",
+            "algorithm": "cp-sat-metaheuristic" if cp_candidates else "metaheuristic-genetic",
             "objective": "미배정과 hard 검증 오류를 최우선으로 줄이고, 교사별 요일/오전오후 균등성을 최적화합니다.",
             "options": {key: value for key, value in solve_options.items() if key != "apiKey"},
         },
@@ -4224,9 +4616,16 @@ def run_solve_session_chunk(records: dict, session: dict, ai_config=None) -> tup
     session["attemptCount"] = (parse_positive_int(session.get("attemptCount")) or 0) + (parse_positive_int(result.get("attemptCount")) or 0)
     session["lastResultSummary"] = solve_best_summary(result)
     session["bestSummary"] = solve_best_summary(session.get("bestResult"))
-    session["activeProfiles"] = result.get("searchStats", {}).get("activeProfiles", [])
-    session["repairMode"] = result.get("searchStats", {}).get("repairMode", chunk_options.get("repairMode", "constraint"))
-    session["lastSeed"] = result.get("searchStats", {}).get("lastSeed", result.get("seed"))
+    search_stats = result.get("searchStats", {})
+    session["activeProfiles"] = search_stats.get("activeProfiles", [])
+    session["repairMode"] = search_stats.get("repairMode", chunk_options.get("repairMode", "constraint"))
+    session["phase"] = search_stats.get("phase", "ga-quality")
+    session["cpStatus"] = search_stats.get("cpStatus", "not-run")
+    session["bottleneckCount"] = search_stats.get("bottleneckCount", 0)
+    session["gradeSubproblemCount"] = search_stats.get("gradeSubproblemCount", 0)
+    session["unassignedPenalty"] = search_stats.get("unassignedPenalty", 0)
+    session["hardSafeMutationCount"] = search_stats.get("hardSafeMutationCount", 0)
+    session["lastSeed"] = search_stats.get("lastSeed", result.get("seed"))
     session["structuralBlockers"] = structural_blockers_for_candidate(records, (session.get("bestResult") or {}).get("selected"))
     if session.get("structuralBlockers") and ((parse_positive_int(session.get("stagnationCount")) or 0) >= 2 or session.get("chunkCount", 0) >= 3):
         last_ai_chunk = parse_positive_int(session.get("lastAiRepairChunk")) or 0
@@ -4257,7 +4656,21 @@ def solve_session_response(session: dict, best_changed: bool = False) -> dict:
         "stagnationCount": session.get("stagnationCount", 0),
         "activeProfiles": session.get("activeProfiles", []),
         "repairMode": session.get("repairMode", "constraint"),
+        "phase": session.get("phase", "ga-quality"),
+        "cpStatus": session.get("cpStatus", "not-run"),
+        "bottleneckCount": session.get("bottleneckCount", 0),
+        "gradeSubproblemCount": session.get("gradeSubproblemCount", 0),
+        "unassignedPenalty": session.get("unassignedPenalty", 0),
+        "hardSafeMutationCount": session.get("hardSafeMutationCount", 0),
         "lastSeed": session.get("lastSeed", ""),
+        "searchStats": {
+            "phase": session.get("phase", "ga-quality"),
+            "cpStatus": session.get("cpStatus", "not-run"),
+            "bottleneckCount": session.get("bottleneckCount", 0),
+            "gradeSubproblemCount": session.get("gradeSubproblemCount", 0),
+            "unassignedPenalty": session.get("unassignedPenalty", 0),
+            "hardSafeMutationCount": session.get("hardSafeMutationCount", 0),
+        },
         "structuralBlockers": session.get("structuralBlockers", []),
         "aiRepairAdvice": session.get("aiRepairAdvice") or {},
         "canAccept": bool(session.get("bestResult")),
@@ -5589,6 +6002,9 @@ class AppHandler(BaseHTTPRequestHandler):
                 return
             if path == "/schedules/solve":
                 body = read_json_body(self)
+                if cp_sat_required_by_body(body) and not cp_sat_available():
+                    self.send_json({"error": cp_sat_missing_message()}, status=503)
+                    return
                 records = get_records_from_body(body)
                 if records is None:
                     self.send_json({"error": missing_records_message(body)}, status=400)
@@ -5597,6 +6013,9 @@ class AppHandler(BaseHTTPRequestHandler):
                 return
             if path == "/schedules/solve/start":
                 body = read_json_body(self)
+                if cp_sat_required_by_body(body) and not cp_sat_available():
+                    self.send_json({"error": cp_sat_missing_message()}, status=503)
+                    return
                 records = get_records_from_body(body)
                 if records is None:
                     self.send_json({"error": missing_records_message(body)}, status=400)
@@ -5605,6 +6024,9 @@ class AppHandler(BaseHTTPRequestHandler):
                 return
             if path == "/schedules/solve/continue":
                 body = read_json_body(self)
+                if cp_sat_required_by_body(body) and not cp_sat_available():
+                    self.send_json({"error": cp_sat_missing_message()}, status=503)
+                    return
                 records = get_records_from_body(body)
                 if records is None:
                     self.send_json({"error": missing_records_message(body)}, status=400)

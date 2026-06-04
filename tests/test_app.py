@@ -116,6 +116,7 @@ class TimetableAppTests(unittest.TestCase):
         self.assertIn("/schedules/solve/start", script)
         self.assertIn("/schedules/solve/continue", script)
         self.assertIn("/schedules/solve/accept", script)
+        self.assertIn("requireCpSat", script)
         self.assertIn("function acceptBestSolveNow", script)
         self.assertIn("stagnationCount", script)
         self.assertIn("structuralBlockers", script)
@@ -133,6 +134,18 @@ class TimetableAppTests(unittest.TestCase):
         self.assertNotIn("skipped_timeout_guard", script)
         self.assertIn("document.addEventListener(\"keydown\", handleQuickEditKeydown)", script)
         self.assertNotIn("유전탐색", script)
+
+    def test_cp_sat_dependency_and_missing_status_are_declared(self):
+        requirements = (app_module.ROOT / "requirements.txt").read_text(encoding="utf-8")
+        self.assertIn("ortools", requirements)
+        candidate, stats = app_module.solve_cp_sat_candidate({"classes": {}, "loads": [], "config": {}})
+        if app_module.cp_sat_available():
+            self.assertIsNotNone(candidate)
+            self.assertIn(stats["cpStatus"], {"optimal", "feasible", "infeasible", "not-run"})
+        else:
+            self.assertIsNone(candidate)
+            self.assertEqual(stats["cpStatus"], "not-run")
+            self.assertIn("CP-SAT", stats["message"])
 
     def test_progressive_solve_session_accept_persists_best_only_on_accept(self):
         workbook = create_template_workbook()
@@ -378,7 +391,8 @@ class TimetableAppTests(unittest.TestCase):
 
         result = solve_schedule(validation["records"])
         selected = result["selected"]
-        self.assertEqual(result["solver"]["algorithm"], "metaheuristic-genetic")
+        expected_algorithm = "cp-sat-metaheuristic" if app_module.cp_sat_available() else "metaheuristic-genetic"
+        self.assertEqual(result["solver"]["algorithm"], expected_algorithm)
         self.assertGreater(result["repairSummary"]["geneticCandidateCount"], 0)
         self.assertEqual(selected["unassigned"], [])
         assigned = 0
@@ -564,6 +578,8 @@ class TimetableAppTests(unittest.TestCase):
         self.assertIn("bestSignature", first)
         self.assertIn("searchStats", first)
         self.assertEqual(first["searchStats"]["variationMode"], "quality-first")
+        self.assertIn("cpStatus", first["searchStats"])
+        self.assertIn("phase", first["searchStats"])
         self.assertEqual(first["recordSignature"], second["recordSignature"])
         self.assertEqual(second["recordSignature"], app_module.records_signature(app_module.apply_solve_options(records, {"iterations": 10, "searchStrength": "fast"})))
 
@@ -1008,8 +1024,8 @@ class TimetableAppTests(unittest.TestCase):
         result = solve_schedule(validation["records"])
         self.assertGreater(result["repairSummary"]["repairCandidateCount"], 0)
         self.assertLessEqual(len(result["candidates"]), 4)
-        self.assertTrue(all(candidate["algorithm"] in {"metaheuristic-genetic", "greedy-seed"} for candidate in result["candidates"]))
-        self.assertTrue(all(candidate["strategy"].startswith(("ga-", "ai-")) for candidate in result["candidates"]))
+        self.assertTrue(all(candidate["algorithm"] in {"cp-sat-metaheuristic", "metaheuristic-genetic", "greedy-seed"} for candidate in result["candidates"]))
+        self.assertTrue(all(candidate["strategy"].startswith(("cp-sat", "ga-", "ai-")) for candidate in result["candidates"]))
         selected = result["selected"]
         self.assertTrue(selected["aiGenerated"])
         self.assertEqual(selected["unassigned"], [])

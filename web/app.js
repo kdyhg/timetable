@@ -353,6 +353,7 @@ function getSolveOptions() {
     assignmentMethod: els.solveMethod.value,
     searchStrength: els.searchStrength?.value || "strong",
     variationMode: els.variationMode?.value || "quality-first",
+    requireCpSat: "Y",
     preferenceOrder: els.preferenceOrder.value,
     iterations: numericOption(els.solveIterations, 60),
     maxConsecutive: numericOption(els.maxConsecutive, 3),
@@ -954,6 +955,10 @@ function solveProgressStatsHtml(progress = {}) {
       <div class="solve-progress-row"><span>현재 최선안</span><strong>${escapeHtml(progressSummaryText(summary))}</strong></div>
       <div class="solve-progress-row"><span>최선안 변경</span><strong>${escapeHtml(changedText)}</strong></div>
       <div class="solve-progress-row"><span>마지막 변경</span><strong>${escapeHtml(formatProgressTime(progress.bestChangedAt))}</strong></div>
+      <div class="solve-progress-row"><span>CP 단계</span><strong>${escapeHtml(progress.phase || progress.searchStats?.phase || "-")}</strong></div>
+      <div class="solve-progress-row"><span>CP 상태</span><strong>${escapeHtml(progress.cpStatus || progress.searchStats?.cpStatus || "-")}</strong></div>
+      <div class="solve-progress-row"><span>병목 수업</span><strong>${escapeHtml(progress.bottleneckCount ?? progress.searchStats?.bottleneckCount ?? "-")}</strong></div>
+      <div class="solve-progress-row"><span>안전 변이</span><strong>${escapeHtml(progress.hardSafeMutationCount ?? progress.searchStats?.hardSafeMutationCount ?? "-")}</strong></div>
       <div class="solve-progress-row"><span>탐색 모드</span><strong>${escapeHtml(progress.repairMode || "constraint")}</strong></div>
       ${profiles ? `<div class="solve-progress-row wide"><span>활성 프로필</span><div>${profiles}</div></div>` : ""}
       ${blockers ? `<div class="solve-progress-row wide"><span>미배정 원인</span><div>${blockers}</div></div>` : ""}
