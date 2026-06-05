@@ -29,6 +29,8 @@ const state = {
   chatPendingRemoteId: 0,
   chatLocalResponse: null,
   chatLocalDisplayed: false,
+  insights: null,
+  scenarios: [],
 };
 
 const STORAGE_KEYS = {
@@ -95,6 +97,19 @@ const els = {
   scheduleBoard: document.querySelector("#scheduleBoard"),
   diagnosticPanel: document.querySelector("#diagnosticPanel"),
   teacherIssuePanel: document.querySelector("#teacherIssuePanel"),
+  refreshInsightsButton: document.querySelector("#refreshInsightsButton"),
+  analysisSummary: document.querySelector("#analysisSummary"),
+  unassignedDashboard: document.querySelector("#unassignedDashboard"),
+  riskDashboard: document.querySelector("#riskDashboard"),
+  relaxationSimulator: document.querySelector("#relaxationSimulator"),
+  candidateComparison: document.querySelector("#candidateComparison"),
+  syncGroupVisualization: document.querySelector("#syncGroupVisualization"),
+  manualRecommendations: document.querySelector("#manualRecommendations"),
+  neisPrecheck: document.querySelector("#neisPrecheck"),
+  scenarioName: document.querySelector("#scenarioName"),
+  saveScenarioButton: document.querySelector("#saveScenarioButton"),
+  scenarioList: document.querySelector("#scenarioList"),
+  solveQueuePanel: document.querySelector("#solveQueuePanel"),
   quickEditStatus: document.querySelector("#quickEditStatus"),
   quickMoveList: document.querySelector("#quickMoveList"),
   moveMode: document.querySelector("#moveMode"),
@@ -825,6 +840,281 @@ function renderTeacherIssues(candidate = state.selectedCandidate) {
     .join("");
 }
 
+function countTable(rows = [], labelKey = "label") {
+  if (!rows.length) return `<div class="empty-state compact">표시할 항목이 없습니다.</div>`;
+  return `
+    <table class="analysis-table">
+      <thead><tr><th>항목</th><th>건수</th></tr></thead>
+      <tbody>
+        ${rows.map((item) => `<tr><td>${escapeHtml(item[labelKey] || "-")}</td><td>${escapeHtml(item.count ?? 0)}</td></tr>`).join("")}
+      </tbody>
+    </table>
+  `;
+}
+
+function renderAnalysisSummary(summary = {}) {
+  if (!els.analysisSummary) return;
+  const stats = [
+    ["미배정", summary.unassigned ?? "-"],
+    ["검증오류", summary.errors ?? "-"],
+    ["경고", summary.warnings ?? "-"],
+    ["점수", summary.score ?? "-"],
+  ];
+  els.analysisSummary.innerHTML = stats
+    .map(([label, value]) => `<div class="analysis-stat"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`)
+    .join("");
+}
+
+function renderUnassignedDashboard(data = {}) {
+  if (!els.unassignedDashboard) return;
+  const blockers = data.blockers || [];
+  const items = data.items || [];
+  els.unassignedDashboard.innerHTML = `
+    <div class="analysis-list">
+      <div class="analysis-row ${Number(data.total || 0) ? "error" : ""}">
+        <strong>현재 미배정 ${escapeHtml(data.total ?? 0)}건</strong>
+        <small>${blockers.map((item) => `${item.label} ${item.count}건`).join(" · ") || "미배정이 없습니다."}</small>
+      </div>
+      ${countTable(data.bySyncGroup || [])}
+      ${items.slice(0, 8).map((item) => `
+        <div class="analysis-row error">
+          <strong>${escapeHtml(item.teacherName || item.teacherCode || "-")} / ${escapeHtml(item.subjectName || item.subjectCode || "-")}</strong>
+          <small>${escapeHtml(item.className || item.classCode || "-")} · ${escapeHtml(item.reason || "")}</small>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderRiskDashboard(risk = {}) {
+  if (!els.riskDashboard) return;
+  const levelLabel = risk.level === "high" ? "높음" : risk.level === "medium" ? "주의" : "낮음";
+  const rows = risk.tightClasses || [];
+  els.riskDashboard.innerHTML = `
+    <div class="analysis-list">
+      <div class="analysis-row ${risk.level === "high" ? "error" : risk.level === "medium" ? "warning" : ""}">
+        <strong>위험도 ${escapeHtml(levelLabel)}</strong>
+        <small>${escapeHtml(risk.summary || "")}</small>
+      </div>
+      <table class="analysis-table">
+        <thead><tr><th>학급</th><th>교과</th><th>고정</th><th>여유</th></tr></thead>
+        <tbody>
+          ${rows.slice(0, 12).map((row) => `<tr><td>${escapeHtml(row.className)}</td><td>${escapeHtml(row.loadHours)}</td><td>${escapeHtml(row.fixedHours)}</td><td>${escapeHtml(row.slack)}</td></tr>`).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderRelaxationSimulator(rows = []) {
+  if (!els.relaxationSimulator) return;
+  if (!rows.length) {
+    els.relaxationSimulator.innerHTML = `<div class="empty-state compact">자동배정 후 완화 시뮬레이션이 표시됩니다.</div>`;
+    return;
+  }
+  els.relaxationSimulator.innerHTML = `
+    <table class="analysis-table">
+      <thead><tr><th>조건</th><th>미배정</th><th>변화</th><th>오류</th></tr></thead>
+      <tbody>
+        ${rows.map((row) => `
+          <tr>
+            <td>${escapeHtml(row.label)}</td>
+            <td>${escapeHtml(row.unassigned ?? "-")}</td>
+            <td>${escapeHtml(row.delta > 0 ? `+${row.delta}` : row.delta ?? "-")}</td>
+            <td>${escapeHtml(row.errors ?? row.error ?? "-")}</td>
+          </tr>
+        `).join("")}
+      </tbody>
+    </table>
+  `;
+}
+
+function renderCandidateComparison(rows = []) {
+  if (!els.candidateComparison) return;
+  if (!rows.length) {
+    els.candidateComparison.innerHTML = `<div class="empty-state compact">후보 시간표가 없습니다.</div>`;
+    return;
+  }
+  els.candidateComparison.innerHTML = `
+    <table class="analysis-table">
+      <thead><tr><th>후보</th><th>미배정</th><th>오류</th><th>연강</th><th>식사</th><th>안배</th></tr></thead>
+      <tbody>
+        ${rows.map((row) => `
+          <tr>
+            <td>${row.selected ? "✓ " : ""}${escapeHtml(strategyName(row.strategy || `후보 ${row.index}`))}</td>
+            <td>${escapeHtml(row.unassigned)}</td>
+            <td>${escapeHtml(row.errors)}</td>
+            <td>${escapeHtml(row.consecutive)}</td>
+            <td>${escapeHtml(row.lunchShortage)}</td>
+            <td>${escapeHtml(row.imbalance)}</td>
+          </tr>
+        `).join("")}
+      </tbody>
+    </table>
+  `;
+}
+
+function renderSyncGroups(rows = []) {
+  if (!els.syncGroupVisualization) return;
+  if (!rows.length) {
+    els.syncGroupVisualization.innerHTML = `<div class="empty-state compact">동시그룹이 없습니다.</div>`;
+    return;
+  }
+  els.syncGroupVisualization.innerHTML = `
+    <table class="analysis-table">
+      <thead><tr><th>그룹</th><th>회차</th><th>배정</th><th>미배정</th><th>방식</th></tr></thead>
+      <tbody>
+        ${rows.map((row) => `
+          <tr>
+            <td>${escapeHtml(row.syncGroup)}</td>
+            <td>${escapeHtml(row.occurrenceCount)}회 · ${escapeHtml(row.laneCount)}학급</td>
+            <td>${escapeHtml(row.placedCount)}</td>
+            <td>${escapeHtml(row.unassigned)}</td>
+            <td>${escapeHtml(row.arrangementMethod || "-")}</td>
+          </tr>
+        `).join("")}
+      </tbody>
+    </table>
+  `;
+}
+
+function renderManualRecommendations(rows = []) {
+  if (!els.manualRecommendations) return;
+  if (!rows.length) {
+    els.manualRecommendations.innerHTML = `<div class="empty-state compact">미배정이 없거나 추천할 항목이 없습니다.</div>`;
+    return;
+  }
+  els.manualRecommendations.innerHTML = `
+    <div class="analysis-list">
+      ${rows.map((row) => `
+        <div class="analysis-row ${row.type === "blocked" || row.type === "sync" ? "warning" : ""}">
+          <strong>${escapeHtml(row.title)}</strong>
+          <small>${escapeHtml(row.message)}</small>
+          ${(row.options || []).length ? `<small>${row.options.map((item) => item.label).join(" · ")}</small>` : ""}
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderNeisPrecheck(neis = {}) {
+  if (!els.neisPrecheck) return;
+  const issues = neis.issues || [];
+  els.neisPrecheck.innerHTML = `
+    <div class="analysis-list">
+      <div class="analysis-row ${neis.ok ? "" : "warning"}">
+        <strong>${escapeHtml(neis.summary || "NEIS 사전검증")}</strong>
+        <small>${neis.ok ? "내보내기 전 큰 차단 요소가 없습니다." : "아래 항목을 확인하세요."}</small>
+      </div>
+      ${issues.slice(0, 12).map((item) => `<div class="analysis-row ${item.severity === "error" ? "error" : "warning"}"><small>${escapeHtml(item.message)}</small></div>`).join("")}
+    </div>
+  `;
+}
+
+function renderScenarios(rows = []) {
+  if (!els.scenarioList) return;
+  if (!rows.length) {
+    els.scenarioList.innerHTML = `<div class="empty-state compact">저장된 시나리오가 없습니다.</div>`;
+    return;
+  }
+  els.scenarioList.innerHTML = `
+    <div class="analysis-list">
+      ${rows.map((row) => `
+        <button class="analysis-row" type="button" data-load-scenario="${escapeHtml(row.id)}">
+          <strong>${escapeHtml(row.name || row.id)}</strong>
+          <small>미배정 ${escapeHtml(row.unassigned)} · 오류 ${escapeHtml(row.errors)} · ${escapeHtml(row.createdAt || "")}</small>
+        </button>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderSolveQueue(queue = {}) {
+  if (!els.solveQueuePanel) return;
+  els.solveQueuePanel.innerHTML = `
+    <div class="analysis-list">
+      <div class="analysis-row ${state.solveInProgress ? "warning" : ""}">
+        <strong>${state.solveInProgress ? "탐색 진행 중" : "대기 중"}</strong>
+        <small>${escapeHtml(queue.message || "진행형 탐색 큐가 준비되어 있습니다.")}</small>
+        <small>세션 ${escapeHtml(queue.lastSession || state.solveSessionId || "-")} · chunk ${escapeHtml(queue.chunkCount || 0)} · 후보 ${escapeHtml(queue.attemptCount || 0)}</small>
+      </div>
+    </div>
+  `;
+}
+
+function renderInsights(data = state.insights) {
+  if (!data) {
+    renderAnalysisSummary({});
+    for (const node of [els.unassignedDashboard, els.riskDashboard, els.relaxationSimulator, els.candidateComparison, els.syncGroupVisualization, els.manualRecommendations, els.neisPrecheck, els.scenarioList, els.solveQueuePanel]) {
+      if (node) node.innerHTML = `<div class="empty-state compact">자동배정 후 분석이 표시됩니다.</div>`;
+    }
+    return;
+  }
+  state.insights = data;
+  state.scenarios = data.scenarios || state.scenarios || [];
+  renderAnalysisSummary(data.summary || {});
+  renderUnassignedDashboard(data.unassigned || {});
+  renderRiskDashboard(data.risk || {});
+  renderRelaxationSimulator(data.relaxationSimulations || []);
+  renderCandidateComparison(data.candidateComparison || []);
+  renderSyncGroups(data.syncGroups || []);
+  renderManualRecommendations(data.manualRecommendations || []);
+  renderNeisPrecheck(data.neis || {});
+  renderScenarios(state.scenarios);
+  renderSolveQueue(data.queue || {});
+}
+
+async function loadInsights(includeSimulation = true) {
+  if (!state.scheduleResult && !state.selectedCandidate) {
+    renderInsights(null);
+    return null;
+  }
+  const data = await api("/schedules/insights", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      ...requestBasePayload(),
+      scheduleResult: state.scheduleResult,
+      candidate: state.selectedCandidate,
+      includeSimulation,
+    }),
+  });
+  renderInsights(data);
+  return data;
+}
+
+async function saveCurrentScenario() {
+  if (!state.scheduleResult?.selected) {
+    log("저장할 시간표가 없습니다.");
+    return;
+  }
+  const name = els.scenarioName?.value.trim() || `시나리오 ${new Date().toLocaleString("ko-KR")}`;
+  const result = await api("/scenarios/save", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      ...requestBasePayload(),
+      name,
+      scheduleResult: state.scheduleResult,
+    }),
+  });
+  state.scenarios = result.scenarios || [];
+  renderScenarios(state.scenarios);
+  log(`시나리오 저장: ${result.scenario?.name || name}`);
+}
+
+async function loadScenario(scenarioId) {
+  const result = await api("/scenarios/load", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ scenarioId, apply: true }),
+  });
+  if (result.scheduleResult) {
+    applyScheduleResult(result.scheduleResult, `시나리오 불러오기: ${result.scenario?.name || scenarioId}`);
+    setActiveTab("timetable");
+  }
+}
+
 function applyScheduleResult(result, message = "시간표 반영 완료", options = {}) {
   const activateTab = options.activateTab !== false;
   rememberImportId(scheduleResultImportId(result));
@@ -839,6 +1129,7 @@ function applyScheduleResult(result, message = "시간표 반영 완료", option
   if (activateTab) setActiveTab("timetable");
   completeSetup();
   log(message);
+  loadInsights(true).catch((error) => log(error.message));
 }
 
 function openSolvePreferences(context = "workspace") {
@@ -1468,6 +1759,7 @@ async function submitManualMove(move) {
     renderDiagnostics(state.selectedCandidate);
     renderTeacherIssues(state.selectedCandidate);
     log(result.message);
+    loadInsights(false).catch((error) => log(error.message));
   } catch (error) {
     log(error.message);
     alert(error.message);
@@ -2170,6 +2462,7 @@ function wireEvents() {
     renderSchedule(candidate.schedule);
     renderDiagnostics(candidate);
     renderTeacherIssues(candidate);
+    loadInsights(false).catch((error) => log(error.message));
   });
   els.viewMode.addEventListener("change", () => {
     clearQuickMove("수업 칸 선택", false);
@@ -2219,6 +2512,13 @@ function wireEvents() {
     input.addEventListener("input", () => resetApiValidation(`${providerLabel()} API 키를 다시 검증하세요.`));
   }
   els.recentLogsButton?.addEventListener("click", loadRecentLogs);
+  els.refreshInsightsButton?.addEventListener("click", () => loadInsights(true).catch((error) => log(error.message)));
+  els.saveScenarioButton?.addEventListener("click", () => saveCurrentScenario().catch((error) => log(error.message)));
+  els.scenarioList?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-load-scenario]");
+    if (!button) return;
+    loadScenario(button.dataset.loadScenario).catch((error) => log(error.message));
+  });
   els.chatUseLocalButton?.addEventListener("click", useLocalChatNow);
   els.chatButton.addEventListener("click", sendChatProgressive);
   els.chatMessage.addEventListener("keydown", (event) => {
@@ -2236,6 +2536,7 @@ async function boot() {
   renderTeacherIssues(null);
   renderQuickMoveList();
   renderChatConstraints();
+  renderInsights(null);
   setActiveTab("overview");
   setStartStep("api");
   updateProviderFields(false);

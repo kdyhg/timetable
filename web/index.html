@@ -159,6 +159,7 @@
           <button class="tab-button active" type="button" data-tab-target="overview">검증·후보</button>
           <button class="tab-button" type="button" data-tab-target="timetable">시간표</button>
           <button class="tab-button" type="button" data-tab-target="manual">수동수정</button>
+          <button class="tab-button" type="button" data-tab-target="analysis">분석</button>
           <button class="tab-button" type="button" data-tab-target="diagnostics">진단</button>
         </nav>
 
@@ -234,6 +235,64 @@
               <div class="teacher-issue-panel">
                 <div class="section-label">배정불량교사</div>
                 <div id="teacherIssuePanel"></div>
+              </div>
+            </section>
+
+            <section class="panel tab-panel" data-tab-panel="analysis">
+              <div class="panel-heading">
+                <h2>결과 분석</h2>
+                <div class="log-actions">
+                  <button id="refreshInsightsButton" class="mini-button ghost" type="button">분석 새로고침</button>
+                  <button id="saveScenarioButton" class="mini-button" type="button">시나리오 저장</button>
+                </div>
+              </div>
+              <div class="scenario-save-row">
+                <input id="scenarioName" class="input" type="text" placeholder="시나리오 이름" />
+              </div>
+              <div id="analysisSummary" class="analysis-grid"></div>
+              <div class="analysis-grid two">
+                <div class="analysis-card">
+                  <div class="section-label">미배정 원인 대시보드</div>
+                  <div id="unassignedDashboard"></div>
+                </div>
+                <div class="analysis-card">
+                  <div class="section-label">배정 전 위험도 검사</div>
+                  <div id="riskDashboard"></div>
+                </div>
+              </div>
+              <div class="analysis-grid two">
+                <div class="analysis-card">
+                  <div class="section-label">조건 완화 시뮬레이터</div>
+                  <div id="relaxationSimulator"></div>
+                </div>
+                <div class="analysis-card">
+                  <div class="section-label">후보 시간표 비교표</div>
+                  <div id="candidateComparison"></div>
+                </div>
+              </div>
+              <div class="analysis-card">
+                <div class="section-label">동시그룹 시각화</div>
+                <div id="syncGroupVisualization"></div>
+              </div>
+              <div class="analysis-grid two">
+                <div class="analysis-card">
+                  <div class="section-label">수동수정 추천</div>
+                  <div id="manualRecommendations"></div>
+                </div>
+                <div class="analysis-card">
+                  <div class="section-label">NEIS 내보내기 사전검증</div>
+                  <div id="neisPrecheck"></div>
+                </div>
+              </div>
+              <div class="analysis-grid two">
+                <div class="analysis-card">
+                  <div class="section-label">시나리오 관리</div>
+                  <div id="scenarioList"></div>
+                </div>
+                <div class="analysis-card">
+                  <div class="section-label">긴 자동배정 작업 큐</div>
+                  <div id="solveQueuePanel"></div>
+                </div>
               </div>
             </section>
           </div>

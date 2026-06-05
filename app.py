@@ -43,6 +43,7 @@ if not RUNTIME_DATA_DIR and VERCEL_RUNTIME:
 DATA_DIR = Path(RUNTIME_DATA_DIR).resolve() if RUNTIME_DATA_DIR else ROOT / "data"
 IMPORT_DIR = DATA_DIR / "imports"
 SOLVE_SESSION_DIR = DATA_DIR / "solve_sessions"
+SCENARIO_DIR = DATA_DIR / "scenarios"
 LAST_SCHEDULE_FILE = DATA_DIR / "last_schedule.json"
 OPERATION_LOG_FILE = DATA_DIR / "operation_log.jsonl"
 
@@ -229,6 +230,7 @@ EXAMPLE_ROWS = {
 def ensure_dirs() -> None:
     IMPORT_DIR.mkdir(parents=True, exist_ok=True)
     SOLVE_SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    SCENARIO_DIR.mkdir(parents=True, exist_ok=True)
 
 
 SENSITIVE_LOG_KEYS = {"apiKey", "api_key", "authorization", "Authorization", "x-goog-api-key", "token", "secret"}
@@ -6201,6 +6203,397 @@ def load_last_schedule() -> dict | None:
     return None
 
 
+def scenario_index_key() -> str:
+    return "scenario_index"
+
+
+def load_scenario_index() -> list[dict]:
+    if postgres_url():
+        index = load_state_postgres(scenario_index_key()) or {}
+        return index.get("scenarios", [])
+    redis_url, redis_token = redis_config()
+    if redis_url and redis_token:
+        index = load_state_redis(scenario_index_key()) or {}
+        return index.get("scenarios", [])
+    ensure_dirs()
+    scenarios = []
+    for path in SCENARIO_DIR.glob("*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            scenarios.append(public_scenario_metadata(payload))
+        except (OSError, json.JSONDecodeError):
+            continue
+    return sorted(scenarios, key=lambda item: item.get("createdAt", ""), reverse=True)
+
+
+def save_scenario_index(items: list[dict]) -> None:
+    payload = {"scenarios": sorted(items, key=lambda item: item.get("createdAt", ""), reverse=True)[:50]}
+    if postgres_url():
+        save_state_postgres(scenario_index_key(), payload)
+        return
+    redis_url, redis_token = redis_config()
+    if redis_url and redis_token:
+        save_state_redis(scenario_index_key(), payload)
+
+
+def scenario_storage_key(scenario_id: str) -> str:
+    return f"scenario:{scenario_id}"
+
+
+def public_scenario_metadata(payload: dict) -> dict:
+    result = payload.get("scheduleResult") or {}
+    selected = result.get("selected", {})
+    validation = selected.get("validation", {})
+    errors = len([item for item in validation.get("violations", []) if item.get("severity") == "error"])
+    return {
+        "id": payload.get("id"),
+        "name": payload.get("name"),
+        "createdAt": payload.get("createdAt"),
+        "importId": payload.get("importId", ""),
+        "strategy": selected.get("strategy") or result.get("bestStrategy", ""),
+        "unassigned": len(selected.get("unassigned", [])),
+        "errors": errors,
+        "score": selected.get("score", 0),
+    }
+
+
+def save_scenario(payload: dict) -> dict:
+    scenario_id = as_text(payload.get("id")) or uuid.uuid4().hex[:12]
+    payload["id"] = scenario_id
+    payload.setdefault("createdAt", now_iso())
+    if postgres_url():
+        save_state_postgres(scenario_storage_key(scenario_id), payload)
+    else:
+        redis_url, redis_token = redis_config()
+        if redis_url and redis_token:
+            save_state_redis(scenario_storage_key(scenario_id), payload)
+        else:
+            ensure_dirs()
+            (SCENARIO_DIR / f"{scenario_id}.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    metadata = public_scenario_metadata(payload)
+    index = [item for item in load_scenario_index() if item.get("id") != scenario_id]
+    index.insert(0, metadata)
+    save_scenario_index(index)
+    append_operation_log("scenario_save", {"scenarioId": scenario_id, "name": payload.get("name"), "importId": payload.get("importId")})
+    return metadata
+
+
+def load_scenario(scenario_id: str) -> dict | None:
+    scenario_id = as_text(scenario_id)
+    if not scenario_id:
+        return None
+    if postgres_url():
+        return load_state_postgres(scenario_storage_key(scenario_id))
+    redis_url, redis_token = redis_config()
+    if redis_url and redis_token:
+        return load_state_redis(scenario_storage_key(scenario_id))
+    path = SCENARIO_DIR / f"{scenario_id}.json"
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def result_from_body_or_last(body: dict) -> dict:
+    result = body.get("scheduleResult") if isinstance(body.get("scheduleResult"), dict) else None
+    if result:
+        return result
+    last = load_last_schedule()
+    return last or {}
+
+
+def candidate_from_body_or_result(body: dict, result: dict) -> dict:
+    candidate = body.get("candidate") if isinstance(body.get("candidate"), dict) else None
+    if candidate:
+        return candidate
+    selected = result.get("selected") if isinstance(result.get("selected"), dict) else None
+    if selected:
+        return selected
+    return result if isinstance(result, dict) else {}
+
+
+def insight_violation_count(candidate: dict, severity: str = "error") -> int:
+    return len([item for item in candidate.get("validation", {}).get("violations", []) if item.get("severity") == severity])
+
+
+def compact_counter(counter: Counter, limit: int = 8) -> list[dict]:
+    return [{"label": label or "-", "count": count} for label, count in counter.most_common(limit)]
+
+
+def unassigned_breakdown(records: dict, candidate: dict) -> dict:
+    unassigned = candidate.get("unassigned") or []
+    blockers = structural_blockers_for_candidate(records, candidate)
+    return {
+        "total": len(unassigned),
+        "blockers": blockers,
+        "bySubject": compact_counter(Counter(item.get("subjectName") or display_name(records, "과목", item.get("subjectCode", "")) for item in unassigned)),
+        "byTeacher": compact_counter(Counter(item.get("teacherName") or display_name(records, "교사", item.get("teacherCode", "")) for item in unassigned)),
+        "byClass": compact_counter(Counter(item.get("className") or display_name(records, "학급", item.get("classCode", "")) for item in unassigned)),
+        "bySyncGroup": compact_counter(Counter(item.get("syncGroup") or "일반수업" for item in unassigned)),
+        "items": unassigned[:40],
+    }
+
+
+def preassignment_risk(records: dict) -> dict:
+    days, max_period = schedule_dimensions(records)
+    class_rows = []
+    high = []
+    warning = []
+    for class_code, class_data in sorted(records.get("classes", {}).items(), key=lambda item: display_name(records, "학급", item[0])):
+        limits = class_data.get("_dayLimits") or {}
+        capacity = sum(parse_int(limits.get(day), max_period) or max_period for day in days)
+        fixed = sum(1 for item in records.get("fixedPeriods", []) if item.get("classCode") == class_code)
+        load_hours = sum(parse_positive_int(item.get("weeklyHours")) or 0 for item in records.get("loads", []) if item.get("classCode") == class_code)
+        slack = capacity - fixed - load_hours
+        row = {
+            "classCode": class_code,
+            "className": display_name(records, "학급", class_code),
+            "capacity": capacity,
+            "loadHours": load_hours,
+            "fixedHours": fixed,
+            "slack": slack,
+        }
+        class_rows.append(row)
+        if slack < 0:
+            high.append(f"{row['className']} 수업 가능 칸보다 {abs(slack)}시간 초과")
+        elif slack == 0:
+            warning.append(f"{row['className']} 여유 0칸")
+    sync_conflicts = []
+    for bundle in records.get("syncBundles", []):
+        conflicts = []
+        for occurrence in bundle.get("occurrences", []):
+            conflicts.extend(sync_occurrence_teacher_conflicts(occurrence))
+        if conflicts:
+            sync_conflicts.append({"syncGroup": bundle.get("syncGroup"), "count": len(conflicts)})
+    if sync_conflicts:
+        high.append(f"동시그룹 내부 교사중복 {sum(item['count'] for item in sync_conflicts)}건")
+    tight_count = len([row for row in class_rows if row["slack"] == 0])
+    if tight_count >= max(1, len(class_rows) // 3):
+        warning.append(f"여유 0칸 학급 {tight_count}개")
+    level = "high" if high else ("medium" if warning else "low")
+    return {
+        "level": level,
+        "summary": " / ".join(high[:3] or warning[:3] or ["입력 구조상 즉시 보이는 고위험 요소는 적습니다."]),
+        "high": high[:10],
+        "warnings": warning[:10],
+        "tightClasses": [row for row in class_rows if row["slack"] <= 1][:20],
+        "syncConflicts": sync_conflicts,
+    }
+
+
+def relaxation_simulation(records: dict, candidate: dict | None = None) -> list[dict]:
+    settings = constraint_settings(records)
+    _, max_period = schedule_dimensions(records)
+    profiles = [
+        ("현재 조건 빠른 재탐색", {}),
+        ("점심보호 해제", {"점심시간보호": "N"}),
+        ("최대연강 +1", {"최대연강허용": str(min(max_period, (settings.get("maxConsecutive") or 0) + 1))} if settings.get("maxConsecutive") else {}),
+        ("안배 완화", {"균등분배강도": "off"}),
+        ("종합 완화", {"점심시간보호": "N", "균등분배강도": "off", "교사요일최대적용": "N", "최대연강허용": str(max_period)}),
+    ]
+    baseline_unassigned = len((candidate or {}).get("unassigned", []))
+    output = []
+    seen = set()
+    for label, updates in profiles:
+        key = tuple(sorted(updates.items()))
+        if key in seen:
+            continue
+        seen.add(key)
+        effective_records = records_with_config(records, updates) if updates else records
+        started = time.monotonic()
+        try:
+            quick = solve_greedy(effective_records, "constraint-first", gene={"seed": 991, "randomness": 0.4, "strategy": "constraint-first"})
+            errors = insight_violation_count(quick)
+            unassigned = len(quick.get("unassigned", []))
+            output.append({
+                "label": label,
+                "updates": updates,
+                "unassigned": unassigned,
+                "errors": errors,
+                "delta": unassigned - baseline_unassigned if candidate is not None else 0,
+                "elapsedMs": int((time.monotonic() - started) * 1000),
+            })
+        except Exception as exc:
+            output.append({"label": label, "updates": updates, "error": str(exc)})
+    return output
+
+
+def sync_group_visualization(records: dict, candidate: dict) -> list[dict]:
+    schedule = candidate.get("schedule") or {}
+    slot_by_occurrence = {}
+    for class_data in (schedule.get("classes") or {}).values():
+        for day in schedule.get("days", []):
+            for period in schedule.get("periods", []):
+                cell = class_data.get("grid", {}).get(day, {}).get(str(period))
+                if cell and cell.get("syncOccurrenceId"):
+                    slot_by_occurrence.setdefault(cell["syncOccurrenceId"], set()).add((day, period))
+    unassigned_by_group = Counter(item.get("syncGroup") or "" for item in candidate.get("unassigned", []) if item.get("syncGroup"))
+    rows = []
+    for bundle in records.get("syncBundles", []):
+        occurrences = []
+        conflict_count = 0
+        for occurrence in bundle.get("occurrences", []):
+            conflicts = sync_occurrence_teacher_conflicts(occurrence)
+            conflict_count += len(conflicts)
+            slots = sorted(slot_by_occurrence.get(occurrence.get("syncOccurrenceId"), []))
+            occurrences.append({
+                "id": occurrence.get("syncOccurrenceId"),
+                "laneCount": len(occurrence.get("units", [])),
+                "slot": " / ".join(f"{day}{period}" for day, period in slots) if slots else "미배정",
+                "teacherConflictCount": len(conflicts),
+            })
+        rows.append({
+            "syncGroup": bundle.get("syncGroup"),
+            "arrangementMethod": bundle.get("arrangementMethod", ""),
+            "laneCount": len(bundle.get("laneHours", {})),
+            "occurrenceCount": len(bundle.get("occurrences", [])),
+            "placedCount": len([item for item in occurrences if item["slot"] != "미배정"]),
+            "unassigned": unassigned_by_group.get(bundle.get("syncGroup"), 0),
+            "teacherConflictCount": conflict_count,
+            "occurrences": occurrences[:8],
+        })
+    return rows
+
+
+def candidate_comparison(result: dict, selected: dict) -> list[dict]:
+    rows = []
+    selected_signature = candidate_signature(selected) if selected else ""
+    for index, candidate in enumerate(result.get("candidates", []) or [], start=1):
+        validation = candidate.get("validation", {})
+        violations = validation.get("violations", [])
+        teacher_issues = candidate.get("teacherIssues", [])
+        rows.append({
+            "index": index,
+            "strategy": candidate.get("strategy", ""),
+            "selected": candidate_signature(candidate) == selected_signature,
+            "score": candidate.get("score", 0),
+            "unassigned": len(candidate.get("unassigned", [])),
+            "errors": len([item for item in violations if item.get("severity") == "error"]),
+            "lunchShortage": len([item for item in violations if item.get("type") == "lunch_protection"]),
+            "consecutive": len([item for item in violations if item.get("type") == "max_consecutive"]),
+            "imbalance": len([item for item in teacher_issues if any("안배" in as_text(tag) for tag in item.get("issues", []))]),
+            "relaxations": candidate.get("relaxations", []),
+        })
+    return rows
+
+
+def neis_precheck(records: dict, candidate: dict) -> dict:
+    issues = []
+    if candidate.get("unassigned"):
+        issues.append({"severity": "error", "message": f"미배정 {len(candidate.get('unassigned', []))}건이 있어 NEIS 출력 전 해결이 필요합니다."})
+    error_count = insight_violation_count(candidate)
+    if error_count:
+        issues.append({"severity": "error", "message": f"검증 오류 {error_count}건이 있어 NEIS 출력 전 검증을 통과해야 합니다."})
+    neis_subjects = {
+        item.get("과목코드"): item
+        for item in records.get("neis", [])
+        if item.get("과목코드")
+    }
+    neis_teachers = {
+        item.get("교사코드"): item
+        for item in records.get("neis", [])
+        if item.get("교사코드")
+    }
+    used_subjects = set()
+    used_teachers = set()
+    schedule = candidate.get("schedule") or {}
+    for class_data in (schedule.get("classes") or {}).values():
+        for day in schedule.get("days", []):
+            for period in schedule.get("periods", []):
+                cell = class_data.get("grid", {}).get(day, {}).get(str(period))
+                if not cell or cell.get("source") == "fixed":
+                    continue
+                if cell.get("subjectCode"):
+                    used_subjects.add(cell.get("subjectCode"))
+                if cell.get("teacherCode"):
+                    used_teachers.add(cell.get("teacherCode"))
+    for subject_code in sorted(used_subjects, key=lambda code: display_name(records, "과목", code)):
+        subject = records.get("subjects", {}).get(subject_code, {})
+        neis = neis_subjects.get(subject_code, {})
+        if not as_text(neis.get("NEIS과목명") or subject.get("NEIS과목명")):
+            issues.append({"severity": "warning", "message": f"{display_name(records, '과목', subject_code)} NEIS 과목명이 비어 있습니다."})
+        if not as_text(neis.get("NEIS과목코드")):
+            issues.append({"severity": "warning", "message": f"{display_name(records, '과목', subject_code)} NEIS 과목코드가 비어 있습니다."})
+    for teacher_code in sorted(used_teachers, key=lambda code: display_name(records, "교사", code)):
+        neis = neis_teachers.get(teacher_code, {})
+        if not as_text(neis.get("NEIS교사명")):
+            issues.append({"severity": "warning", "message": f"{display_name(records, '교사', teacher_code)} NEIS 교사명이 비어 있습니다."})
+    return {
+        "ok": not any(item.get("severity") == "error" for item in issues),
+        "issues": issues[:80],
+        "summary": "NEIS 출력 가능" if not issues else f"NEIS 사전확인 {len(issues)}건",
+    }
+
+
+def manual_recommendations(records: dict, candidate: dict) -> list[dict]:
+    schedule = candidate.get("schedule") or {}
+    unassigned = candidate.get("unassigned") or []
+    teacher_busy, room_busy = schedule_busy_index(schedule)
+    forbidden = build_forbidden_index(records)
+    settings = constraint_settings(records)
+    _, max_period = schedule_dimensions(records)
+    recommendations = []
+    for item in unassigned[:8]:
+        if item.get("syncGroup"):
+            recommendations.append({
+                "title": describe_unassigned_item(records, item),
+                "type": "sync",
+                "message": f"동시그룹 {item.get('syncGroup')} 묶음 재배치가 필요합니다. 분석 탭의 동시그룹 표에서 미배정 회차를 확인하세요.",
+                "options": [],
+            })
+            continue
+        load = load_for_unassigned(records, item)
+        if not load:
+            continue
+        block_size = parse_positive_int(item.get("hours")) or 1
+        entry = entry_for_load(load, records, block_size)
+        options = []
+        for day in schedule.get("days", []):
+            for period in schedule.get("periods", []):
+                if can_place_repair_entry(records, schedule, load, entry, day, period, block_size, teacher_busy, room_busy, forbidden, settings, max_period):
+                    options.append({"day": day, "period": period, "label": f"{day} {period}교시 직접 배치"})
+                    if len(options) >= 5:
+                        break
+            if len(options) >= 5:
+                break
+        recommendations.append({
+            "title": describe_unassigned_item(records, item),
+            "type": "direct" if options else "blocked",
+            "message": "직접 배치 후보를 찾았습니다." if options else "직접 배치 가능한 빈 칸이 없어 맞교환/연쇄이동이 필요합니다.",
+            "options": options,
+        })
+    return recommendations
+
+
+def schedule_insights(records: dict, result: dict, candidate: dict, include_simulation: bool = True) -> dict:
+    candidate = candidate or {}
+    return {
+        "ok": True,
+        "generatedAt": now_iso(),
+        "summary": {
+            "unassigned": len(candidate.get("unassigned", [])),
+            "errors": insight_violation_count(candidate),
+            "warnings": insight_violation_count(candidate, "warning"),
+            "score": candidate.get("score", 0),
+            "strategy": candidate.get("strategy") or result.get("bestStrategy", ""),
+        },
+        "risk": preassignment_risk(records),
+        "unassigned": unassigned_breakdown(records, candidate),
+        "relaxationSimulations": relaxation_simulation(records, candidate) if include_simulation and records.get("loads") else [],
+        "syncGroups": sync_group_visualization(records, candidate),
+        "candidateComparison": candidate_comparison(result, candidate),
+        "manualRecommendations": manual_recommendations(records, candidate),
+        "neis": neis_precheck(records, candidate),
+        "scenarios": load_scenario_index(),
+        "queue": {
+            "active": False,
+            "message": "자동배정은 짧은 탐색 chunk를 이어 붙이는 진행형 큐 방식으로 실행됩니다.",
+            "lastSession": (result.get("solveSession") or {}).get("sessionId", ""),
+            "chunkCount": (result.get("solveSession") or {}).get("chunkCount", 0),
+            "attemptCount": (result.get("solveSession") or {}).get("attemptCount", result.get("attemptCount", 0)),
+        },
+    }
+
+
 def routed_request_path(raw_path: str) -> str:
     parsed = urlparse(raw_path)
     query = parse_qs(parsed.query, keep_blank_values=True)
@@ -6254,6 +6647,9 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": "현재 시간표를 불러오지 못했습니다. 자동배정을 먼저 실행하세요."}, status=404)
                 return
             self.send_json({"ok": True, "scheduleResult": result})
+            return
+        if path == "/scenarios":
+            self.send_json({"scenarios": load_scenario_index()})
             return
         if path.startswith("/imports/") and path.endswith("/report.xlsx"):
             import_id = path.split("/")[2]
@@ -6345,6 +6741,26 @@ class AppHandler(BaseHTTPRequestHandler):
                     return
                 self.send_json(validate_schedule(records, schedule))
                 return
+            if path == "/schedules/insights":
+                body = read_json_body(self)
+                records = get_records_from_body(body)
+                if records is None:
+                    self.send_json({"error": missing_records_message(body)}, status=400)
+                    return
+                result = result_from_body_or_last(body)
+                candidate = candidate_from_body_or_result(body, result)
+                self.send_json(schedule_insights(records, result, candidate, include_simulation=body.get("includeSimulation", True)))
+                return
+            if path == "/exports/neis/validate":
+                body = read_json_body(self)
+                records = get_records_from_body(body)
+                if records is None:
+                    self.send_json({"error": missing_records_message(body)}, status=400)
+                    return
+                result = result_from_body_or_last(body)
+                candidate = candidate_from_body_or_result(body, result)
+                self.send_json(neis_precheck(records, candidate))
+                return
             if path == "/schedules/move-options":
                 body = read_json_body(self)
                 records = get_records_from_body(body)
@@ -6385,6 +6801,32 @@ class AppHandler(BaseHTTPRequestHandler):
                     self.send_json({"error": "importId 또는 records가 필요합니다."}, status=400)
                     return
                 self.send_json(apply_schedule_proposal(records, body.get("proposal") or body.get("scheduleProposal") or body))
+                return
+            if path == "/scenarios/save":
+                body = read_json_body(self)
+                result = result_from_body_or_last(body)
+                if not result or not result.get("selected"):
+                    self.send_json({"error": "저장할 시간표가 없습니다. 자동배정을 먼저 실행하세요."}, status=400)
+                    return
+                scenario_name = as_text(body.get("name")) or f"시나리오 {now_iso()}"
+                payload = {
+                    "name": scenario_name,
+                    "importId": import_id_from_body(body) or result.get("importId") or last_schedule_import_id(),
+                    "scheduleResult": result,
+                    "createdAt": now_iso(),
+                }
+                self.send_json({"ok": True, "scenario": save_scenario(payload), "scenarios": load_scenario_index()})
+                return
+            if path == "/scenarios/load":
+                body = read_json_body(self)
+                scenario = load_scenario(body.get("scenarioId"))
+                if not scenario:
+                    self.send_json({"error": "시나리오를 찾을 수 없습니다."}, status=404)
+                    return
+                result = scenario.get("scheduleResult")
+                if body.get("apply"):
+                    save_last_schedule(result)
+                self.send_json({"ok": True, "scenario": public_scenario_metadata(scenario), "scheduleResult": result})
                 return
             if path == "/ai/chat/local":
                 body = read_json_body(self)

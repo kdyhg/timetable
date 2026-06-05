@@ -116,6 +116,18 @@ class TimetableAppTests(unittest.TestCase):
         self.assertIn("/schedules/solve/start", script)
         self.assertIn("/schedules/solve/continue", script)
         self.assertIn("/schedules/solve/accept", script)
+        self.assertIn('data-tab-target="analysis"', html)
+        self.assertIn('id="refreshInsightsButton"', html)
+        self.assertIn('id="saveScenarioButton"', html)
+        self.assertIn('id="unassignedDashboard"', html)
+        self.assertIn('id="relaxationSimulator"', html)
+        self.assertIn('id="candidateComparison"', html)
+        self.assertIn('id="syncGroupVisualization"', html)
+        self.assertIn('id="neisPrecheck"', html)
+        self.assertIn("/schedules/insights", script)
+        self.assertIn("/scenarios/save", script)
+        self.assertIn("function renderInsights", script)
+        self.assertIn(".analysis-card", styles)
         self.assertIn("requireCpSat", script)
         self.assertIn("function acceptBestSolveNow", script)
         self.assertIn("stagnationCount", script)
@@ -134,6 +146,39 @@ class TimetableAppTests(unittest.TestCase):
         self.assertNotIn("skipped_timeout_guard", script)
         self.assertIn("document.addEventListener(\"keydown\", handleQuickEditKeydown)", script)
         self.assertNotIn("유전탐색", script)
+
+    def test_schedule_insights_returns_analysis_sections(self):
+        records = {
+            "config": {"요일": "월,화", "교시수": "2"},
+            "teachers": {"T1": {"교사명": "김교사"}},
+            "classes": {"C1": {"학급명": "1-1", "_dayLimits": {"월": 2, "화": 2}}},
+            "subjects": {"S1": {"과목명": "국어"}},
+            "rooms": {},
+            "loads": [{"teacherCode": "T1", "subjectCode": "S1", "classCode": "C1", "weeklyHours": 1}],
+            "fixedPeriods": [],
+            "constraints": [],
+            "neis": [],
+            "syncBundles": [],
+        }
+        candidate = {
+            "strategy": "test",
+            "score": 0,
+            "schedule": app_module.empty_schedule(records),
+            "unassigned": [{"teacherCode": "T1", "subjectCode": "S1", "classCode": "C1", "hours": 1}],
+            "validation": {"violations": []},
+            "teacherIssues": [],
+        }
+        result = {"selected": candidate, "candidates": [candidate]}
+        insights = app_module.schedule_insights(records, result, candidate, include_simulation=False)
+
+        self.assertTrue(insights["ok"])
+        self.assertEqual(insights["summary"]["unassigned"], 1)
+        self.assertIn("risk", insights)
+        self.assertIn("unassigned", insights)
+        self.assertIn("candidateComparison", insights)
+        self.assertIn("manualRecommendations", insights)
+        self.assertIn("neis", insights)
+        self.assertIn("queue", insights)
 
     def test_cp_sat_dependency_and_missing_status_are_declared(self):
         requirements = (app_module.ROOT / "requirements.txt").read_text(encoding="utf-8")
