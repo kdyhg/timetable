@@ -21,6 +21,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
+from zoneinfo import ZoneInfo
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.comments import Comment
@@ -299,8 +300,11 @@ def operation_logs_text(limit: int = 500) -> bytes:
     return ("\n".join(lines) + ("\n" if lines else "")).encode("utf-8")
 
 
+KST = ZoneInfo("Asia/Seoul")
+
+
 def now_iso() -> str:
-    return datetime.now().replace(microsecond=0).isoformat()
+    return datetime.now(KST).replace(microsecond=0).isoformat()
 
 
 def clean(value):
@@ -4583,17 +4587,32 @@ def solve_result_rank(result: dict | None):
     return candidate_rank((result or {}).get("selected", {}))
 
 
+def teacher_issue_tag_count(teacher_issues: list[dict], keywords: tuple[str, ...]) -> int:
+    count = 0
+    for issue in teacher_issues:
+        tags = [as_text(tag) for tag in issue.get("issues", [])]
+        if any(any(keyword in tag for keyword in keywords) for tag in tags):
+            count += 1
+    return count
+
+
 def solve_best_summary(result: dict | None) -> dict:
     selected = (result or {}).get("selected", {})
     validation = selected.get("validation", {})
     violations = validation.get("violations", [])
     teacher_issues = selected.get("teacherIssues", [])
+    lunch_validation_count = len([item for item in violations if item.get("type") == "lunch_protection"])
+    consecutive_validation_count = len([item for item in violations if item.get("type") == "max_consecutive"])
+    lunch_issue_count = teacher_issue_tag_count(teacher_issues, ("\uc2dd\uc0ac",))
+    consecutive_issue_count = teacher_issue_tag_count(teacher_issues, ("\uc5f0\uac15", "3"))
+    imbalance_issue_count = teacher_issue_tag_count(teacher_issues, ("\uc548\ubc30",))
     return {
         "unassigned": len(selected.get("unassigned", [])),
         "errors": len([item for item in violations if item.get("severity") == "error"]),
-        "lunchShortage": len([item for item in violations if item.get("type") == "lunch_protection"]),
-        "consecutive": len([item for item in violations if item.get("type") == "max_consecutive"]),
-        "imbalance": len([item for item in teacher_issues if any("안배" in as_text(tag) for tag in item.get("issues", []))]),
+        "lunchShortage": max(lunch_validation_count, lunch_issue_count),
+        "consecutive": max(consecutive_validation_count, consecutive_issue_count),
+        "imbalance": imbalance_issue_count,
+        "teacherIssueCount": len(teacher_issues),
         "score": selected.get("score", 0),
         "signature": candidate_signature(selected) if selected else "",
     }

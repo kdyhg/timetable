@@ -1204,9 +1204,11 @@ function progressSummaryText(summary = {}) {
 
 function formatProgressTime(value) {
   if (!value) return "-";
-  const date = new Date(value);
+  const text = String(value);
+  const normalized = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(text) ? `${text}Z` : text;
+  const date = new Date(normalized);
   if (Number.isNaN(date.getTime())) return String(value);
-  return date.toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  return date.toLocaleTimeString("ko-KR", { timeZone: "Asia/Seoul", hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
 function progressChips(items = []) {

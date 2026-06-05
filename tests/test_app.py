@@ -180,6 +180,29 @@ class TimetableAppTests(unittest.TestCase):
         self.assertIn("neis", insights)
         self.assertIn("queue", insights)
 
+    def test_progress_summary_counts_teacher_issue_tags(self):
+        result = {
+            "selected": {
+                "unassigned": [],
+                "validation": {"violations": []},
+                "teacherIssues": [
+                    {"teacherName": "A", "issues": ["\uc2dd\uc0ac"]},
+                    {"teacherName": "B", "issues": ["3\uc5f0\uac15", "\uc548\ubc30"]},
+                    {"teacherName": "C", "issues": ["\uc548\ubc30"]},
+                ],
+                "schedule": {},
+            }
+        }
+        summary = app_module.solve_best_summary(result)
+
+        self.assertEqual(summary["lunchShortage"], 1)
+        self.assertEqual(summary["consecutive"], 1)
+        self.assertEqual(summary["imbalance"], 2)
+        self.assertEqual(summary["teacherIssueCount"], 3)
+
+    def test_now_iso_uses_korean_timezone(self):
+        self.assertRegex(app_module.now_iso(), r"\+09:00$")
+
     def test_cp_sat_dependency_and_missing_status_are_declared(self):
         requirements = (app_module.ROOT / "requirements.txt").read_text(encoding="utf-8")
         self.assertIn("ortools", requirements)
