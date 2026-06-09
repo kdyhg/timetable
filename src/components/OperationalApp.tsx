@@ -79,17 +79,17 @@ const PROJECT_FILE_VERSION = 3;
 const issueFilterLabels: Array<{ key: TeacherIssueFilter; label: string; issue: string }> = [
   { key: "consecutive", label: "3연강", issue: "3연강" },
   { key: "lunch", label: "식사", issue: "식사" },
-  { key: "balance", label: "안배", issue: "안배" },
+  { key: "balance", label: "요일 균형", issue: "안배" },
 ];
 const openAiModels = ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.2", "gpt-5.2-chat-latest", "gpt-5-mini", "gpt-5-nano", "gpt-5.2-pro", "custom"];
 const geminiModels = ["gemini-3.5-flash", "gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-3.1-flash-lite", "custom"];
 const priorityOptions: Array<{ value: string; label: string; order: SoftPriority[] }> = [
-  { value: "consecutive-lunch-balance", label: "3연강 적음 > 식사시간 > 안배", order: ["consecutive", "lunch", "balance"] },
-  { value: "consecutive-balance-lunch", label: "3연강 적음 > 안배 > 식사시간", order: ["consecutive", "balance", "lunch"] },
-  { value: "balance-consecutive-lunch", label: "안배 > 3연강 적음 > 식사시간", order: ["balance", "consecutive", "lunch"] },
-  { value: "balance-lunch-consecutive", label: "안배 > 식사시간 > 3연강 적음", order: ["balance", "lunch", "consecutive"] },
-  { value: "lunch-consecutive-balance", label: "식사시간 > 3연강 적음 > 안배", order: ["lunch", "consecutive", "balance"] },
-  { value: "lunch-balance-consecutive", label: "식사시간 > 안배 > 3연강 적음", order: ["lunch", "balance", "consecutive"] },
+  { value: "consecutive-lunch-balance", label: "3연강 적음 > 식사시간 > 요일 균형", order: ["consecutive", "lunch", "balance"] },
+  { value: "consecutive-balance-lunch", label: "3연강 적음 > 요일 균형 > 식사시간", order: ["consecutive", "balance", "lunch"] },
+  { value: "balance-consecutive-lunch", label: "요일 균형 > 3연강 적음 > 식사시간", order: ["balance", "consecutive", "lunch"] },
+  { value: "balance-lunch-consecutive", label: "요일 균형 > 식사시간 > 3연강 적음", order: ["balance", "lunch", "consecutive"] },
+  { value: "lunch-consecutive-balance", label: "식사시간 > 3연강 적음 > 요일 균형", order: ["lunch", "consecutive", "balance"] },
+  { value: "lunch-balance-consecutive", label: "식사시간 > 요일 균형 > 3연강 적음", order: ["lunch", "balance", "consecutive"] },
 ];
 
 const SOURCE_COMPATIBILITY_MARKERS = [
@@ -255,6 +255,16 @@ function cellLabel(cell: unknown) {
   return subject && syncGroup ? `${subject}(${syncGroup})` : subject;
 }
 
+function displayIssueLabel(issue: string) {
+  if (issue === "안배") return "요일 편중";
+  if (issue === "미배정") return "미편성";
+  return issue;
+}
+
+function displayIssueList(issues: string[] | undefined) {
+  return (issues || []).map(displayIssueLabel).join(", ");
+}
+
 function classNameForMove(quality?: ManualMoveCandidate["quality"]) {
   if (quality === "good") return "move-good";
   if (quality === "warning") return "move-warning";
@@ -317,9 +327,9 @@ function proposalDeltaText(proposal: MoveProposal) {
   const parts = [
     proposal.delta.lunchIssues ? `식사 ${proposal.delta.lunchIssues > 0 ? "+" : ""}${proposal.delta.lunchIssues}` : "",
     proposal.delta.consecutiveIssues ? `3연강 ${proposal.delta.consecutiveIssues > 0 ? "+" : ""}${proposal.delta.consecutiveIssues}` : "",
-    proposal.delta.balanceIssues ? `안배 ${proposal.delta.balanceIssues > 0 ? "+" : ""}${proposal.delta.balanceIssues}` : "",
-    proposal.delta.hardErrors ? `hard ${proposal.delta.hardErrors > 0 ? "+" : ""}${proposal.delta.hardErrors}` : "",
-    proposal.delta.unassigned ? `미배정 ${proposal.delta.unassigned > 0 ? "+" : ""}${proposal.delta.unassigned}` : "",
+    proposal.delta.balanceIssues ? `요일 편중 ${proposal.delta.balanceIssues > 0 ? "+" : ""}${proposal.delta.balanceIssues}` : "",
+    proposal.delta.hardErrors ? `필수조건 오류 ${proposal.delta.hardErrors > 0 ? "+" : ""}${proposal.delta.hardErrors}` : "",
+    proposal.delta.unassigned ? `미편성 ${proposal.delta.unassigned > 0 ? "+" : ""}${proposal.delta.unassigned}` : "",
   ].filter(Boolean);
   return parts.length ? parts.join(", ") : "변화 없음";
 }
@@ -353,7 +363,7 @@ function parseAiRepairRecommendation(text: string, validIds: Set<string>): AiRep
     const parsed = JSON.parse(raw) as { ranked?: Array<{ proposalId?: string; reason?: string; priority?: number }> };
     const ranked = (parsed.ranked || [])
       .filter((item) => item.proposalId && validIds.has(item.proposalId))
-      .map((item, index) => ({ proposalId: item.proposalId!, reason: item.reason || "AI가 soft 문제 감소 가능성이 높다고 판단했습니다.", priority: item.priority || index + 1 }));
+      .map((item, index) => ({ proposalId: item.proposalId!, reason: item.reason || "AI가 품질 문제 감소 가능성이 높다고 판단했습니다.", priority: item.priority || index + 1 }));
     if (!ranked.length) return null;
     return { provider: "ai", ranked, message: "AI가 로컬 후보 중 추천 순서를 정했습니다." };
   } catch {
@@ -553,7 +563,7 @@ export default function OperationalApp({ initialSession, authConfigured, initial
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
   const [chatMessages, setChatMessages] = useState<Array<{ role: "user" | "assistant"; text: string }>>([
-    { role: "assistant", text: "AI 연결 후 미배정 원인, 조건 완화, 수동 이동안을 대화로 검토할 수 있습니다." },
+    { role: "assistant", text: "AI 연결 후 미편성 원인, 조건 조정, 수동 이동안을 대화로 검토할 수 있습니다." },
   ]);
   const workerRef = useRef<Worker | null>(null);
   const repairWorkerRef = useRef<Worker | null>(null);
@@ -773,7 +783,7 @@ export default function OperationalApp({ initialSession, authConfigured, initial
         workerRef.current = null;
         setWorkerRunning(false);
         setPendingSolve(null);
-        setStatus("목표에 도달했습니다. 미배정 0건이며 식사부족과 3연강이 각각 20건 미만입니다.");
+        setStatus("목표에 도달했습니다. 미편성 0건이며 식사부족과 3연강이 각각 20건 미만입니다.");
         navigateWithTransition("/workspace/classes");
         return;
       }
@@ -796,7 +806,7 @@ export default function OperationalApp({ initialSession, authConfigured, initial
         workerRef.current = null;
         setWorkerRunning(false);
         setPendingSolve(null);
-        setStatus("목표에 도달했습니다. 미배정 0건이며 식사부족과 3연강이 각각 20건 미만입니다.");
+        setStatus("목표에 도달했습니다. 미편성 0건이며 식사부족과 3연강이 각각 20건 미만입니다.");
         navigateWithTransition("/workspace/classes");
       }
       return;
@@ -1100,7 +1110,7 @@ export default function OperationalApp({ initialSession, authConfigured, initial
   function isRepairExecutionIntent(message: string) {
     const normalized = message.replace(/\s+/g, "");
     const action = /(해줘|해달|수정|반영|적용|줄여|없애|개선|보정|옮겨|바꿔)/.test(normalized);
-    const target = /(식사|점심|연강|안배|시간표|수업|배정|방안|방법|추천|보정)/.test(normalized);
+    const target = /(식사|점심|연강|안배|요일 균형|요일 편중|시간표|수업|배정|편성|방안|방법|추천|보정)/.test(normalized);
     return action && target;
   }
 
@@ -1194,7 +1204,7 @@ export default function OperationalApp({ initialSession, authConfigured, initial
       return;
     }
     const totalHours = records.loads.reduce((sum, load) => sum + (Number(load.hours) || 0), 0);
-    setStatus(`수업 입력현황: 교사 ${Object.keys(records.teachers).length}명, 학급 ${Object.keys(records.classes).length}개, 과목 ${Object.keys(records.subjects).length}개, 총 ${totalHours}시수`);
+    setStatus(`입력자료 요약: 교사 ${Object.keys(records.teachers).length}명, 학급 ${Object.keys(records.classes).length}개, 과목 ${Object.keys(records.subjects).length}개, 총 ${totalHours}시수`);
   }
 
   function showSyncStatus() {
@@ -1212,7 +1222,7 @@ export default function OperationalApp({ initialSession, authConfigured, initial
       return;
     }
     const assigned = diagnostics?.syncGroups || [];
-    setStatus(`동시수업 배당체크: ${syncGroups.size}개 그룹, 현재 미배정 ${assigned.reduce((sum, item) => sum + item.unassigned, 0)}시간`);
+    setStatus(`동시수업 배정 점검: ${syncGroups.size}개 그룹, 현재 미편성 ${assigned.reduce((sum, item) => sum + item.unassigned, 0)}시간`);
     navigateWithTransition("/workspace/analysis");
   }
 
@@ -1227,7 +1237,7 @@ export default function OperationalApp({ initialSession, authConfigured, initial
     setDiagnostics(null);
     setProgress(null);
     setScenarioDirty(true);
-    setStatus("수업 배당을 수정했습니다. 재배정을 실행하세요.");
+    setStatus("수업 시수를 조정했습니다. 다시 탐색해 주세요.");
   }
 
   function stopSolve() {
@@ -1485,7 +1495,7 @@ export default function OperationalApp({ initialSession, authConfigured, initial
     if (updated.signature === candidate.signature) {
       setMovePreviewResult(null);
       setPendingMove(null);
-      setStatus("수동수정이 적용되지 않았습니다. 동시/연속수업 묶음 또는 hard 제약을 확인하세요.");
+      setStatus("수동수정이 적용되지 않았습니다. 동시/연속수업 묶음 또는 필수조건을 확인하세요.");
       return;
     }
     setCandidate(updated);
@@ -1576,20 +1586,20 @@ export default function OperationalApp({ initialSession, authConfigured, initial
       return [] as MoveProposal[];
     }
     setRepairLoading(true);
-    setRepairStatus(source === "auto" ? "탐색이 정체되어 AI 보정 후보를 1회 검토합니다." : "식사/3연강/안배 보정 후보를 계산합니다.");
+    setRepairStatus(source === "auto" ? "탐색이 정체되어 AI 보정 후보를 1회 검토합니다." : "식사/3연강/요일 편중 보정 후보를 계산합니다.");
     try {
       await waitForPaint();
       const local = await computeRepairOptionsInWorker(baseCandidate);
       if (!local.length) {
         setRepairProposals([]);
-        setRepairRecommendation({ provider: "local", ranked: [], message: "hard-safe 보정 후보를 찾지 못했습니다." });
-        setRepairStatus("현재 조건을 지키면서 바로 적용 가능한 soft 보정 후보가 없습니다.");
+        setRepairRecommendation({ provider: "local", ranked: [], message: "필수조건을 지키는 보정 후보를 찾지 못했습니다." });
+        setRepairStatus("현재 필수조건을 지키면서 바로 적용 가능한 품질 보정 후보가 없습니다.");
         return [] as MoveProposal[];
       }
       const localRecommendation: AiRepairRecommendation = {
         provider: "local",
         ranked: local.slice(0, 6).map((proposal, index) => ({ proposalId: proposal.proposalId, reason: proposal.reasons[0] || "로컬 점수 기준 상위 후보입니다.", priority: index + 1 })),
-        message: "로컬 solver가 hard-safe 후보를 추천했습니다.",
+        message: "내장 검증 엔진이 필수조건을 지키는 후보를 추천했습니다.",
       };
       if (!aiConfig.validated || !aiConfig.apiKey) {
         setRepairProposals(local);
@@ -1608,7 +1618,7 @@ export default function OperationalApp({ initialSession, authConfigured, initial
         setRepairRecommendation(recommendation);
         setRepairStatus(recommendation.provider === "ai" ? "AI가 로컬 후보 중 추천 순서를 정했습니다." : recommendation.message);
         if (source === "auto") {
-          setChatMessages((current) => [...current, { role: "assistant", text: `AI soft 보정 후보를 준비했습니다.\n${sorted.slice(0, 3).map((proposal) => `${proposal.proposalId}: ${proposal.title} (${proposalDeltaText(proposal)})`).join("\n")}` }]);
+          setChatMessages((current) => [...current, { role: "assistant", text: `AI 품질 보정 후보를 준비했습니다.\n${sorted.slice(0, 3).map((proposal) => `${proposal.proposalId}: ${proposal.title} (${proposalDeltaText(proposal)})`).join("\n")}` }]);
         }
         return sorted;
       } catch (error) {
@@ -1638,10 +1648,10 @@ export default function OperationalApp({ initialSession, authConfigured, initial
     setChatLoading(true);
     try {
       const context = [
-        `현재 시간표 요약: 미배정 ${candidate?.summary.unassigned ?? 0}, hard 오류 ${candidate?.summary.hardErrors ?? 0}, 3연강 ${candidate?.summary.consecutiveIssues ?? 0}, 식사부족 ${candidate?.summary.lunchIssues ?? 0}, 안배부족 ${candidate?.summary.balanceIssues ?? 0}`,
+        `현재 시간표 요약: 미편성 ${candidate?.summary.unassigned ?? 0}, 필수조건 오류 ${candidate?.summary.hardErrors ?? 0}, 3연강 ${candidate?.summary.consecutiveIssues ?? 0}, 식사부족 ${candidate?.summary.lunchIssues ?? 0}, 요일 편중 ${candidate?.summary.balanceIssues ?? 0}`,
         `우선순위: ${priorityOptions.find((item) => item.value === priorityValue(solveOptions.softPriorityOrder))?.label}`,
-        ...(diagnostics?.unassigned || []).slice(0, 20).map((item) => `미배정: ${item.teacherName}/${item.subjectName}/${item.className}/${item.hours}시간/${item.reason}`),
-        ...(diagnostics?.teacherIssues || []).slice(0, 20).map((item) => `배정불량교사: ${item.teacherName}/${item.issues.join(",")}/${item.detail}`),
+        ...(diagnostics?.unassigned || []).slice(0, 20).map((item) => `미편성: ${item.teacherName}/${item.subjectName}/${item.className}/${item.hours}시간/${item.reason}`),
+        ...(diagnostics?.teacherIssues || []).slice(0, 20).map((item) => `일정 개선 대상 교사: ${item.teacherName}/${displayIssueList(item.issues)}/${item.detail}`),
       ].join("\n");
       if (candidate && isRepairExecutionIntent(message)) {
         setChatMessages((current) => [...current, { role: "assistant", text: "검증 가능한 수정 후보를 계산합니다. 후보가 나오면 전/후 미리보기로 보여드릴게요." }]);
@@ -1697,7 +1707,7 @@ export default function OperationalApp({ initialSession, authConfigured, initial
       { id: "project", href: "/setup/project", label: "새로 만들기/불러오기" },
       { id: "excel", href: "/setup/excel", label: "엑셀 업로드" },
       { id: "constraints", href: "/setup/constraints", label: "말로 설명할 조건" },
-      { id: "preferences", href: "/setup/preferences", label: "자동배정 선호도" },
+      { id: "preferences", href: "/setup/preferences", label: "자동 편성 설정" },
       { id: "solving", href: "/setup/solving", label: "배정 진행" },
     ];
     return (
@@ -1820,22 +1830,22 @@ export default function OperationalApp({ initialSession, authConfigured, initial
     const optionDays = (records?.config.days?.length ? records.config.days : ["월", "화", "수", "목", "금"]) as DayKey[];
     return (
       <section className="setup-card">
-        <h1>{mode === "reassign" ? "추가 배정 조건 수정" : "자동배정 선호도"}</h1>
+        <h1>{mode === "reassign" ? "추가 탐색 조건 수정" : "자동 편성 설정"}</h1>
         <div className="auto-assign-form">
           <section className="option-box">
-            <h2>배정방법</h2>
+            <h2>탐색 방식</h2>
             <div className="radio-stack">
-              <label><input type="radio" name={`reassign-${mode}`} checked={solveOptions.reassignMode === "full"} onChange={() => updateSolveFlag("reassignMode", "full")} /> 수동 배정된 시간을 제외한 모든 시간 처음부터 배정</label>
-              <label><input type="radio" name={`reassign-${mode}`} checked={solveOptions.reassignMode === "keep-fixed"} onChange={() => updateSolveFlag("reassignMode", "keep-fixed")} /> 수동배정, 고정된 시간을 제외한 모든 시간 처음부터 배정</label>
-              <label><input type="radio" name={`reassign-${mode}`} checked={solveOptions.reassignMode === "unassigned-first"} onChange={() => updateSolveFlag("reassignMode", "unassigned-first")} /> 미배정 시간만 배정(기존 배정된 시간 변경하지 않음)</label>
-              <label><input type="radio" name={`reassign-${mode}`} checked={solveOptions.reassignMode === "unassigned-only"} onChange={() => updateSolveFlag("reassignMode", "unassigned-only")} /> 미배정 시간만 배정(기존 배정된 시간 변경될 수 있음)</label>
+              <label><input type="radio" name={`reassign-${mode}`} checked={solveOptions.reassignMode === "full"} onChange={() => updateSolveFlag("reassignMode", "full")} /> 수동 편성 시간을 제외하고 전체 다시 탐색</label>
+              <label><input type="radio" name={`reassign-${mode}`} checked={solveOptions.reassignMode === "keep-fixed"} onChange={() => updateSolveFlag("reassignMode", "keep-fixed")} /> 수동 편성과 고정 시간을 유지하고 다시 탐색</label>
+              <label><input type="radio" name={`reassign-${mode}`} checked={solveOptions.reassignMode === "unassigned-first"} onChange={() => updateSolveFlag("reassignMode", "unassigned-first")} /> 미편성 수업만 채우기(현재 편성 유지)</label>
+              <label><input type="radio" name={`reassign-${mode}`} checked={solveOptions.reassignMode === "unassigned-only"} onChange={() => updateSolveFlag("reassignMode", "unassigned-only")} /> 미편성 수업 우선 재탐색(현재 편성 변경 가능)</label>
             </div>
           </section>
 
           <section className="option-box">
             <div className="option-header">
-              <h2>교사의 요일별 최대 배정시간수</h2>
-              <label className="check-row"><input type="checkbox" checked={solveOptions.teacherDayMaxStrict} onChange={(event) => updateSolveFlag("teacherDayMaxStrict", event.target.checked)} /> 엄수</label>
+              <h2>교사별 하루 최대 수업 수</h2>
+              <label className="check-row"><input type="checkbox" checked={solveOptions.teacherDayMaxStrict} onChange={(event) => updateSolveFlag("teacherDayMaxStrict", event.target.checked)} /> 필수 적용</label>
             </div>
             <div className="day-max-grid">
               {optionDays.map((day) => (
@@ -1847,36 +1857,36 @@ export default function OperationalApp({ initialSession, authConfigured, initial
           </section>
 
           <section className="option-box">
-            <h2>엄수조건</h2>
+            <h2>필수 적용 조건</h2>
             <div className="strict-grid">
-              <label className="check-row"><input type="checkbox" checked={solveOptions.strictMaxConsecutive} onChange={(event) => updateSolveFlag("strictMaxConsecutive", event.target.checked)} /> 연속 <input type="number" min={2} max={7} value={solveOptions.maxConsecutive} onChange={(event) => updateSolveFlag("maxConsecutive", Number(event.target.value) || 3)} /> 시간 이상 배정금지 엄수</label>
-              <label className="check-row"><input type="checkbox" checked={solveOptions.strictBalance} onChange={(event) => updateSolveFlag("strictBalance", event.target.checked)} /> 평균시수 + 1시간 이상 배정금지 엄수</label>
-              <label className="check-row"><input type="checkbox" checked={solveOptions.lunchProtection !== "N" && solveOptions.lunchProtectionLevel !== "off"} onChange={(event) => updateLunchProtectionLevel(event.target.checked ? "high" : "off")} /> 식사시간 고려 엄수</label>
-              <label className="check-row"><input type="checkbox" checked={solveOptions.avoidTwoHourLunchCross} onChange={(event) => updateSolveFlag("avoidTwoHourLunchCross", event.target.checked)} /> 2시간 연속수업 식사시간 걸침금지 엄수</label>
-              <label className="check-row"><input type="checkbox" checked={solveOptions.sameSubjectSameDay} onChange={(event) => updateSolveFlag("sameSubjectSameDay", event.target.checked)} /> 유사과목 같은 날 배정금지 엄수</label>
-              <label className="check-row"><input type="checkbox" checked={solveOptions.subjectCategorySeparation} onChange={(event) => updateSolveFlag("subjectCategorySeparation", event.target.checked)} /> 수업과목군 구분 엄수</label>
-              <label className="check-row"><input type="checkbox" checked={solveOptions.roundRobin} onChange={(event) => updateSolveFlag("roundRobin", event.target.checked)} /> 순배 엄수</label>
-              <label className="check-row"><input type="checkbox" checked={solveOptions.avoidConsecutiveDaysForMultiHourSubject} onChange={(event) => updateSolveFlag("avoidConsecutiveDaysForMultiHourSubject", event.target.checked)} /> 2시수 과목 연일배정금지 엄수</label>
-              <label className="check-row"><input type="checkbox" checked={allowRelaxation} onChange={(event) => updateSolveFlag("allowRelaxForUnassigned", event.target.checked ? "Y" : "N")} /> 미배정이 없도록 필요하면 엄수조건을 무시할 수 있음</label>
+              <label className="check-row"><input type="checkbox" checked={solveOptions.strictMaxConsecutive} onChange={(event) => updateSolveFlag("strictMaxConsecutive", event.target.checked)} /> 연속 <input type="number" min={2} max={7} value={solveOptions.maxConsecutive} onChange={(event) => updateSolveFlag("maxConsecutive", Number(event.target.value) || 3)} /> 시간 이상 수업 금지</label>
+              <label className="check-row"><input type="checkbox" checked={solveOptions.strictBalance} onChange={(event) => updateSolveFlag("strictBalance", event.target.checked)} /> 평균시수 + 1시간 이상 편중 금지</label>
+              <label className="check-row"><input type="checkbox" checked={solveOptions.lunchProtection !== "N" && solveOptions.lunchProtectionLevel !== "off"} onChange={(event) => updateLunchProtectionLevel(event.target.checked ? "high" : "off")} /> 식사시간 보호</label>
+              <label className="check-row"><input type="checkbox" checked={solveOptions.avoidTwoHourLunchCross} onChange={(event) => updateSolveFlag("avoidTwoHourLunchCross", event.target.checked)} /> 2시간 연속수업의 식사시간 걸침 금지</label>
+              <label className="check-row"><input type="checkbox" checked={solveOptions.sameSubjectSameDay} onChange={(event) => updateSolveFlag("sameSubjectSameDay", event.target.checked)} /> 유사과목 같은 날 중복 금지</label>
+              <label className="check-row"><input type="checkbox" checked={solveOptions.subjectCategorySeparation} onChange={(event) => updateSolveFlag("subjectCategorySeparation", event.target.checked)} /> 과목군 분리</label>
+              <label className="check-row"><input type="checkbox" checked={solveOptions.roundRobin} onChange={(event) => updateSolveFlag("roundRobin", event.target.checked)} /> 순환형 편성</label>
+              <label className="check-row"><input type="checkbox" checked={solveOptions.avoidConsecutiveDaysForMultiHourSubject} onChange={(event) => updateSolveFlag("avoidConsecutiveDaysForMultiHourSubject", event.target.checked)} /> 2시수 과목의 연속 요일 편성 금지</label>
+              <label className="check-row"><input type="checkbox" checked={allowRelaxation} onChange={(event) => updateSolveFlag("allowRelaxForUnassigned", event.target.checked ? "Y" : "N")} /> 미편성 최소화를 위해 선택 조건 조정 허용</label>
             </div>
           </section>
 
           <section className="option-box">
-            <h2>배정수준</h2>
+            <h2>탐색 정밀도</h2>
             <input type="range" min={1} max={3} value={solveOptions.placementLevel} onChange={(event) => updateSolveFlag("placementLevel", Number(event.target.value) || 2)} />
             <div className="range-labels"><span>하</span><span>중</span><span>상</span></div>
           </section>
 
           <section className="option-box split-options">
-            <label className="field">선호시간표
+            <label className="field">품질 우선순위
               <select value={priorityValue(solveOptions.softPriorityOrder)} onChange={(event) => updatePriority(event.target.value)}>
                 {priorityOptions.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
               </select>
             </label>
-            <label className="field">배정횟수
+            <label className="field">최소 탐색 횟수
               <input type="number" min={1} max={200} value={solveOptions.minAssignmentIterations} onChange={(event) => updateSolveFlag("minAssignmentIterations", Number(event.target.value) || 20)} />
             </label>
-            <label className="field">균등분배강도
+            <label className="field">요일 균형 강도
               <select value={solveOptions.balanceStrength} onChange={(event) => updateSolveFlag("balanceStrength", event.target.value as "off" | "soft" | "hard")}>
                 <option value="soft">보통</option>
                 <option value="hard">강하게</option>
@@ -1908,16 +1918,16 @@ export default function OperationalApp({ initialSession, authConfigured, initial
             </label>
           </section>
         </div>
-        <p className="notice">조건 완화 미리보기는 실제 후보가 아니라 선택 후 재배정할 때만 반영됩니다. 체크한 조건만 엄수/회피 대상으로 반영되며, 조건 완화는 사용자가 직접 체크한 경우에만 후보 탐색에 사용합니다.</p>
+        <p className="notice">조건 조정 미리보기는 실제 후보가 아니며, 선택 후 다시 탐색할 때 반영됩니다. 체크한 조건만 필수 적용 또는 회피 대상으로 사용합니다.</p>
         <div className="actions">
           <button className="secondary" onClick={() => navigateWithTransition(mode === "reassign" ? "/workspace/classes" : "/setup/constraints")}>이전</button>
-          <button className="primary" onClick={() => startSolve(mode)}>{mode === "reassign" ? "조건 반영 후 재배정" : "AI 자동배정 시작"}</button>
-          {mode === "reassign" ? <button className="secondary" onClick={() => startSolve("reassign")}>이어 배정</button> : null}
-          {mode === "reassign" ? <button className="secondary" onClick={() => startSolve("reassign", { reassignMode: "unassigned-first" })}>미배정</button> : null}
-          <button className="secondary" type="button" onClick={showInputStatus}>수업 입력현황</button>
-          <button className="secondary" type="button" onClick={showSyncStatus}>동시수업 배당체크</button>
-          <button className="secondary" type="button" onClick={() => navigateWithTransition("/workspace/analysis")}>시간표 완성여부</button>
-          <button className="secondary" type="button" onClick={() => setAllocationEditorOpen(true)} disabled={!records}>수업 배당변경</button>
+          <button className="primary" onClick={() => startSolve(mode)}>{mode === "reassign" ? "조건 반영 후 다시 탐색" : "AI 자동 편성 시작"}</button>
+          {mode === "reassign" ? <button className="secondary" onClick={() => startSolve("reassign")}>현재안에서 다시 탐색</button> : null}
+          {mode === "reassign" ? <button className="secondary" onClick={() => startSolve("reassign", { reassignMode: "unassigned-first" })}>미편성 우선 편성</button> : null}
+          <button className="secondary" type="button" onClick={showInputStatus}>입력자료 요약</button>
+          <button className="secondary" type="button" onClick={showSyncStatus}>동시수업 배정 점검</button>
+          <button className="secondary" type="button" onClick={() => navigateWithTransition("/workspace/analysis")}>완성도 진단</button>
+          <button className="secondary" type="button" onClick={() => setAllocationEditorOpen(true)} disabled={!records}>수업 시수 조정</button>
         </div>
       </section>
     );
@@ -1929,12 +1939,12 @@ export default function OperationalApp({ initialSession, authConfigured, initial
         <section className="setup-card progress-card">
           <div className="spinner" />
           <h1>시간표를 만들고 있습니다</h1>
-          <p className="muted">미배정을 줄이는 후보를 비교하고, 선택한 우선순위대로 식사·안배·연강 조건을 함께 검토합니다.</p>
+          <p className="muted">미편성을 줄이는 후보를 비교하고, 선택한 우선순위대로 식사·요일 균형·연강 조건을 함께 검토합니다.</p>
           <div className="metrics">
-            <div className="metric"><b>{metric(bestSummary, "unassigned")}</b><span>미배정</span></div>
+            <div className="metric"><b>{metric(bestSummary, "unassigned")}</b><span>미편성</span></div>
             <div className="metric"><b>{metric(bestSummary, "lunchIssues")}</b><span>식사부족</span><small>{currentIssueCounts.lunch ? `${currentIssueCounts.lunch}명` : "0명"}</small></div>
             <div className="metric"><b>{metric(bestSummary, "consecutiveIssues")}</b><span>3연강</span><small>{currentIssueCounts.consecutive ? `${currentIssueCounts.consecutive}명` : "0명"}</small></div>
-            <div className="metric"><b>{metric(bestSummary, "balanceIssues")}</b><span>안배부족</span><small>{currentIssueCounts.balance ? `${currentIssueCounts.balance}명` : "0명"}</small></div>
+            <div className="metric"><b>{metric(bestSummary, "balanceIssues")}</b><span>요일 편중</span><small>{currentIssueCounts.balance ? `${currentIssueCounts.balance}명` : "0명"}</small></div>
           </div>
           <dl className="detail-grid">
             <dt>탐색 회차</dt><dd>{progress?.chunkCount || 0}</dd>
@@ -1943,16 +1953,16 @@ export default function OperationalApp({ initialSession, authConfigured, initial
             <dt>최선안 변경</dt><dd>{progress ? (progress.bestChanged ? "방금 개선됨" : "다른 후보 탐색 중") : (workerRunning || pendingSolve ? "엔진 준비 중" : "대기")}</dd>
             <dt>마지막 개선</dt><dd>{formatKst(progress?.bestChangedAt)}</dd>
             <dt>경과</dt><dd>{elapsedSeconds}초</dd>
-            <dt>목표 상태</dt><dd>{progress?.targetReached || softSummaryTargetReached(bestSummary) ? "도달" : `남음: 미배정 ${progress?.targetRemaining?.unassigned ?? metric(bestSummary, "unassigned")} · 오류 ${progress?.targetRemaining?.hardErrors ?? metric(bestSummary, "hardErrors")} · 식사 ${progress?.targetRemaining?.lunchIssues ?? Math.max(0, metric(bestSummary, "lunchIssues") - 19)} · 3연강 ${progress?.targetRemaining?.consecutiveIssues ?? Math.max(0, metric(bestSummary, "consecutiveIssues") - 19)}`}</dd>
+            <dt>목표 상태</dt><dd>{progress?.targetReached || softSummaryTargetReached(bestSummary) ? "도달" : `남음: 미편성 ${progress?.targetRemaining?.unassigned ?? metric(bestSummary, "unassigned")} · 필수조건 오류 ${progress?.targetRemaining?.hardErrors ?? metric(bestSummary, "hardErrors")} · 식사 ${progress?.targetRemaining?.lunchIssues ?? Math.max(0, metric(bestSummary, "lunchIssues") - 19)} · 3연강 ${progress?.targetRemaining?.consecutiveIssues ?? Math.max(0, metric(bestSummary, "consecutiveIssues") - 19)}`}</dd>
             {progress?.phase === "tabu-post-optimize" ? (
               <>
-                <dt>후처리 개선</dt><dd>{progress.postOptimizeImprovementCount || 0}회</dd>
-                <dt>soft 비용</dt><dd>{Math.round(progress.postOptimizeSoftPenalty || 0)}</dd>
-                <dt>soft 변화</dt><dd>{progress.postOptimizeSoftDelta ? `-${Math.round(progress.postOptimizeSoftDelta)}` : "-"}</dd>
+                <dt>품질 개선</dt><dd>{progress.postOptimizeImprovementCount || 0}회</dd>
+                <dt>품질 점수</dt><dd>{Math.round(progress.postOptimizeSoftPenalty || 0)}</dd>
+                <dt>점수 변화</dt><dd>{progress.postOptimizeSoftDelta ? `-${Math.round(progress.postOptimizeSoftDelta)}` : "-"}</dd>
               </>
             ) : null}
           </dl>
-          {progress?.unassignedReasons?.length ? <p className="notice">미배정 원인: {progress.unassignedReasons.join(" / ")}</p> : null}
+          {progress?.unassignedReasons?.length ? <p className="notice">미편성 원인: {progress.unassignedReasons.join(" / ")}</p> : null}
           <div className="actions">
             <button className="primary" onClick={acceptCurrentBest} disabled={!candidate}>현재 최선안 사용</button>
             <button className="secondary" onClick={stopSolve} disabled={!workerRunning}>중지</button>
@@ -1968,7 +1978,7 @@ export default function OperationalApp({ initialSession, authConfigured, initial
       ["teachers", "교사별", "/workspace/teachers"],
       ["analysis", "분석", "/workspace/analysis"],
       ["manual", "수동수정", "/workspace/manual"],
-      ["auto-assign", "추가 배정", "/workspace/auto-assign"],
+      ["auto-assign", "추가 탐색", "/workspace/auto-assign"],
       ["chat", "AI 대화", "/workspace/chat"],
       ["exports", "출력", "/workspace/exports"],
     ];
@@ -2043,38 +2053,38 @@ export default function OperationalApp({ initialSession, authConfigured, initial
         <section className="panel">
           <h2>요약</h2>
           <div className="metrics">
-            <div className="metric"><b>{metric(summary, "unassigned")}</b><span>미배정</span></div>
-            <div className="metric"><b>{metric(summary, "hardErrors")}</b><span>hard 오류</span></div>
+            <div className="metric"><b>{metric(summary, "unassigned")}</b><span>미편성</span></div>
+            <div className="metric"><b>{metric(summary, "hardErrors")}</b><span>필수조건 오류</span></div>
             <div className="metric"><b>{metric(summary, "lunchIssues")}</b><span>식사부족</span><small>{currentIssueCounts.lunch}명</small></div>
             <div className="metric"><b>{metric(summary, "consecutiveIssues")}</b><span>3연강</span><small>{currentIssueCounts.consecutive}명</small></div>
           </div>
         </section>
         {renderRepairTools("analysis")}
         <section className="panel">
-          <h2>미배정</h2>
-          {diagnostics?.unassigned.length ? <div className="issue-list">{diagnostics.unassigned.map((item, index) => <article key={`${item.loadId}-${index}`}><b>{item.teacherName} / {item.subjectName}</b><span>{item.className} · {item.hours}시간</span><small>{item.reason}</small></article>)}</div> : <p className="muted">미배정이 없습니다.</p>}
+          <h2>미편성 수업</h2>
+          {diagnostics?.unassigned.length ? <div className="issue-list">{diagnostics.unassigned.map((item, index) => <article key={`${item.loadId}-${index}`}><b>{item.teacherName} / {item.subjectName}</b><span>{item.className} · {item.hours}시간</span><small>{item.reason}</small></article>)}</div> : <p className="muted">미편성 수업이 없습니다.</p>}
         </section>
         <section className="panel">
-          <h2>배정불량교사</h2>
+          <h2>일정 개선 대상 교사</h2>
           {renderIssueFilterControls()}
-          {teacherIssues.length ? <div className="issue-list compact">{teacherIssues.map((item) => <article key={item.teacherCode}><b>{item.teacherName}</b><span>{item.hours}시간 · {item.issues.join(", ")}</span><small>{item.detail}</small></article>)}</div> : <p className="muted">조건에 맞는 배정불량교사가 없습니다.</p>}
+          {teacherIssues.length ? <div className="issue-list compact">{teacherIssues.map((item) => <article key={item.teacherCode}><b>{item.teacherName}</b><span>{item.hours}시간 · {displayIssueList(item.issues)}</span><small>{item.detail}</small></article>)}</div> : <p className="muted">조건에 맞는 개선 대상 교사가 없습니다.</p>}
         </section>
         <section className="panel">
           <h2>검증 오류</h2>
-          {[...hard, ...soft].length ? <div className="issue-list compact">{[...hard, ...soft].slice(0, 80).map((item, index) => <article key={`${item.type}-${index}`}><b>{item.severity === "hard" ? "hard" : "soft"} · {item.type}</b><small>{item.message}</small></article>)}</div> : <p className="muted">검증 오류가 없습니다.</p>}
+          {[...hard, ...soft].length ? <div className="issue-list compact">{[...hard, ...soft].slice(0, 80).map((item, index) => <article key={`${item.type}-${index}`}><b>{item.severity === "hard" ? "필수조건" : "품질조건"} · {item.type}</b><small>{item.message}</small></article>)}</div> : <p className="muted">검증 오류가 없습니다.</p>}
         </section>
         <section className="panel full">
-          <h2>동시그룹</h2>
+          <h2>동시수업 그룹</h2>
           <div className="table-wrap">
-            <table><thead><tr><th>그룹</th><th>배정</th><th>미배정</th><th>방식</th></tr></thead><tbody>{(diagnostics?.syncGroups || []).map((item) => <tr key={item.group}><td>{item.group}</td><td>{item.assigned}</td><td>{item.unassigned}</td><td>{item.method}</td></tr>)}</tbody></table>
+            <table><thead><tr><th>그룹</th><th>편성</th><th>미편성</th><th>처리 방식</th></tr></thead><tbody>{(diagnostics?.syncGroups || []).map((item) => <tr key={item.group}><td>{item.group}</td><td>{item.assigned}</td><td>{item.unassigned}</td><td>{item.method}</td></tr>)}</tbody></table>
           </div>
         </section>
         {diagnostics?.syncCohorts?.length ? (
           <section className="panel full">
-            <h2>동시그룹 코호트</h2>
+            <h2>동시수업 학급 묶음</h2>
             <div className="table-wrap">
               <table>
-                <thead><tr><th>코호트</th><th>그룹</th><th>학급</th><th>배정</th><th>미배정</th><th>공통 슬롯</th><th>원인</th></tr></thead>
+                <thead><tr><th>학급 묶음</th><th>그룹</th><th>학급</th><th>편성</th><th>미편성</th><th>공통 가능 시간</th><th>원인</th></tr></thead>
                 <tbody>{diagnostics.syncCohorts.map((item) => <tr key={item.cohort}><td>{item.cohort}</td><td>{item.groups}</td><td>{item.classCount}</td><td>{item.assigned}</td><td>{item.unassigned}</td><td>{item.possibleSlots}</td><td>{item.reason}</td></tr>)}</tbody>
               </table>
             </div>
@@ -2100,7 +2110,7 @@ export default function OperationalApp({ initialSession, authConfigured, initial
           <div className="teacher-list">
             {manualTeachers.map((teacher) => {
               const issue = diagnostics?.teacherIssues.find((item) => item.teacherCode === teacher.code);
-              return <button key={teacher.code} className={visibleManualTeacherCode === teacher.code ? "active" : ""} onClick={() => { setManualTeacherCode(teacher.code); setMoveOptions([]); setSelectedManualFrom(null); }}>{teacher.name}<span>{issue?.issues.join(", ") || ""}</span></button>;
+              return <button key={teacher.code} className={visibleManualTeacherCode === teacher.code ? "active" : ""} onClick={() => { setManualTeacherCode(teacher.code); setMoveOptions([]); setSelectedManualFrom(null); }}>{teacher.name}<span>{displayIssueList(issue?.issues)}</span></button>;
             })}
             {!manualTeachers.length ? <p className="muted">조건에 맞는 교사가 없습니다.</p> : null}
           </div>
@@ -2124,8 +2134,8 @@ export default function OperationalApp({ initialSession, authConfigured, initial
       <section className={`panel repair-panel ${compact ? "repair-compact" : ""}`}>
         <div className="panel-header-row">
           <div>
-            <h2>AI soft 보정</h2>
-            <p className="muted">로컬 solver가 안전 후보를 만들고, AI는 후보 순서만 추천합니다.</p>
+            <h2>AI 품질 보정</h2>
+            <p className="muted">내장 검증 엔진이 안전한 후보를 만들고, AI는 추천 순서를 정합니다.</p>
           </div>
           <button className="primary" onClick={() => runAiRepair(scope === "chat" ? "chat" : "manual")} disabled={repairLoading || !candidate}>
             {repairLoading ? "검토 중..." : "AI 보정안 찾기"}
@@ -2163,7 +2173,7 @@ export default function OperationalApp({ initialSession, authConfigured, initial
         </div>
         {full ? renderRepairTools("chat") : null}
         <form className="chat-form" onSubmit={sendChat}>
-          <input value={chatInput} onChange={(event) => setChatInput(event.target.value)} placeholder="예: 미배정 원인을 설명하고 줄이는 방법을 제안해줘" />
+          <input value={chatInput} onChange={(event) => setChatInput(event.target.value)} placeholder="예: 미편성 원인을 설명하고 줄이는 방법을 제안해줘" />
           <button className="primary" disabled={chatLoading}>{chatLoading ? "대기" : "전송"}</button>
         </form>
       </section>
@@ -2192,7 +2202,7 @@ export default function OperationalApp({ initialSession, authConfigured, initial
           </div>
           <div className="table-wrap">
             <table>
-              <thead><tr><th>이름</th><th>저장일</th><th>학급</th><th>교사</th><th>미배정</th><th>오류</th><th /></tr></thead>
+              <thead><tr><th>이름</th><th>저장일</th><th>학급</th><th>교사</th><th>미편성</th><th>오류</th><th /></tr></thead>
               <tbody>
                 {scenarioList.length ? scenarioList.map((item) => (
                   <tr key={`${item.source || scenarioSource}-${item.id}`}>
@@ -2218,7 +2228,7 @@ export default function OperationalApp({ initialSession, authConfigured, initial
       <div className="modal-backdrop">
         <section className="modal-panel allocation-modal">
           <div className="modal-header">
-            <div><h2>수업 배당변경</h2><p className="muted">현재 작업의 시수만 수정합니다. 원본 엑셀은 바뀌지 않으며, 수정 후 재배정이 필요합니다.</p></div>
+            <div><h2>수업 시수 조정</h2><p className="muted">현재 작업의 시수만 수정합니다. 원본 엑셀은 바뀌지 않으며, 수정 후 다시 탐색해야 합니다.</p></div>
             <button className="ghost" onClick={() => setAllocationEditorOpen(false)}>닫기</button>
           </div>
           <div className="table-wrap">
@@ -2239,7 +2249,7 @@ export default function OperationalApp({ initialSession, authConfigured, initial
             </table>
           </div>
           <div className="actions">
-            <button className="primary" onClick={() => { setAllocationEditorOpen(false); navigateWithTransition("/workspace/auto-assign"); }}>재배정 설정으로 이동</button>
+            <button className="primary" onClick={() => { setAllocationEditorOpen(false); navigateWithTransition("/workspace/auto-assign"); }}>추가 탐색 설정으로 이동</button>
             <button className="secondary" onClick={() => setAllocationEditorOpen(false)}>닫기</button>
           </div>
         </section>
