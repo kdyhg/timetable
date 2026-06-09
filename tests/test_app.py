@@ -79,6 +79,7 @@ class TimetableAppTests(unittest.TestCase):
         self.assertIn('id="solveOverlay"', html)
         self.assertIn('id="preferenceOrder"', html)
         self.assertIn('id="allowRelaxForUnassigned"', html)
+        self.assertIn('<input id="allowRelaxForUnassigned" type="checkbox" />', html)
         self.assertIn('id="quickEditStatus"', html)
         self.assertIn('id="quickMoveList"', html)
         self.assertIn('id="teacherIssuePanel"', html)
@@ -130,6 +131,10 @@ class TimetableAppTests(unittest.TestCase):
         self.assertIn(".analysis-card", styles)
         self.assertIn("requireCpSat", script)
         self.assertIn("function acceptBestSolveNow", script)
+        self.assertIn("function buildSolveReviewLines", script)
+        self.assertIn("function applyRelaxationPreset", script)
+        self.assertIn("원격 AI는 진행형 탐색 중에는 호출하지 않았습니다", script)
+        self.assertIn("실제 후보군이 아니라", script)
         self.assertIn("stagnationCount", script)
         self.assertIn("structuralBlockers", script)
         self.assertIn("solve-progress-details", styles)
@@ -414,9 +419,8 @@ class TimetableAppTests(unittest.TestCase):
         vercel_config = json.loads((app_module.ROOT / "vercel.json").read_text(encoding="utf-8"))
         self.assertIs(app_module.handler, app_module.AppHandler)
         self.assertIn("class handler(AppHandler)", api_index)
-        self.assertEqual(vercel_config["rewrites"][0]["destination"], "/api?__path=")
-        self.assertEqual(vercel_config["rewrites"][1]["destination"], "/api?__path=:path*")
-        self.assertNotIn("functions", vercel_config)
+        self.assertIn("api/index.py", vercel_config.get("functions", {}))
+        self.assertNotIn("rewrites", vercel_config)
         self.assertEqual(routed_request_path("/api?__path=api/health"), "/api/health")
         self.assertEqual(routed_request_path("/api?__path=templates/timetable-input.xlsx"), "/templates/timetable-input.xlsx")
         self.assertEqual(routed_request_path("/"), "/")
@@ -1122,6 +1126,7 @@ class TimetableAppTests(unittest.TestCase):
         set_config_value(workbook, "일일최대교시", "5")
         set_config_value(workbook, "점심시간후교시", "4")
         set_config_value(workbook, "점심시간보호", "Y")
+        set_config_value(workbook, "미배정방지조건완화", "Y")
         set_config_value(workbook, "최대연강허용", "4")
         append_named_row(workbook, "교사", {"교사명": "김교사"})
         append_named_row(workbook, "학급-계열", {
@@ -1155,6 +1160,36 @@ class TimetableAppTests(unittest.TestCase):
         serialized = json.dumps(result["candidates"], ensure_ascii=False)
         self.assertNotIn("미배정 방지를 위해", serialized)
         self.assertNotIn("완화했습니다", serialized)
+
+    def test_repair_candidates_respect_relaxation_opt_in(self):
+        workbook = create_template_workbook()
+        set_config_value(workbook, "수업요일", "월")
+        set_config_value(workbook, "일일최대교시", "5")
+        set_config_value(workbook, "점심시간후교시", "4")
+        set_config_value(workbook, "점심시간보호", "Y")
+        set_config_value(workbook, "미배정방지조건완화", "N")
+        set_config_value(workbook, "최대연강허용", "4")
+        append_named_row(workbook, "교사", {"교사명": "김교사"})
+        append_named_row(workbook, "학급-계열", {
+            "학급명": "1-1",
+            "학년": "1",
+            "계열": "공통",
+            "담임교사명": "김교사",
+            "요일별시수": "5",
+            "가상학급여부": "N",
+        })
+        append_named_row(workbook, "과목", {"과목명": "국어", "단축명": "국", "NEIS과목명": "국어"})
+        append_named_row(workbook, "교사별 시수표", {"교사명": "김교사", "과목명": "국어"})
+        load_sheet = workbook["교사별 시수표"]
+        class_start = len(SPECS_BY_NAME["교사별 시수표"]) + 1
+        load_sheet.cell(row=1, column=class_start).value = "1-1"
+        load_sheet.cell(row=load_sheet.max_row, column=class_start).value = 5
+
+        validation = validate_workbook(workbook)
+        result = solve_schedule(validation["records"], solve_options={"allowRelaxForUnassigned": "N", "iterations": 12})
+
+        self.assertEqual(result["repairSummary"]["repairCandidateCount"], 0)
+        self.assertTrue(all(not candidate.get("relaxations") for candidate in result["candidates"]))
 
     def test_unassigned_diagnostics_show_names_instead_of_codes(self):
         workbook = create_template_workbook()
@@ -1417,6 +1452,257 @@ class TimetableAppTests(unittest.TestCase):
         moved = move_schedule(validation["records"], selected["schedule"], {"from": source, "to": {"day": "일", "period": 1}})
         self.assertFalse(moved["ok"])
         self.assertNotIn("validation", moved)
+
+
+    def test_operational_next_rebuild_scaffold_exists(self):
+        package = json.loads((app_module.ROOT / "package.json").read_text(encoding="utf-8"))
+        self.assertIn("next", package["dependencies"])
+        self.assertIn("exceljs", package["dependencies"])
+        self.assertEqual(package["scripts"]["dev"], "next dev -p 8765")
+        required_files = [
+            "src/app/page.tsx",
+            "src/app/layout.tsx",
+            "src/components/OperationalApp.tsx",
+            "src/lib/auth.ts",
+            "src/lib/storage.ts",
+            "src/solver/types.ts",
+            "src/solver/workbook.ts",
+            "src/solver/core.ts",
+            "src/solver/aiClient.ts",
+            "src/workers/solver.worker.ts",
+            "src/app/api/imports/timetable-input/route.ts",
+            "src/app/api/solve/jobs/route.ts",
+            "src/app/api/solve/jobs/[id]/tick/route.ts",
+            "src/app/api/solve/jobs/[id]/accept/route.ts",
+            "src/app/api/ai/chat/route.ts",
+            "src/app/api/schedules/[id]/move-preview/route.ts",
+            "src/app/api/scenarios/[id]/route.ts",
+        ]
+        for relative in required_files:
+            self.assertTrue((app_module.ROOT / relative).exists(), relative)
+        page = (app_module.ROOT / "src/app/page.tsx").read_text(encoding="utf-8")
+        self.assertIn('dynamic = "force-dynamic"', page)
+
+    def test_operational_auth_and_internal_legacy_proxy_are_configured(self):
+        auth = (app_module.ROOT / "src/lib/auth.ts").read_text(encoding="utf-8")
+        proxy = (app_module.ROOT / "src/lib/legacyProxy.ts").read_text(encoding="utf-8")
+        source = (app_module.ROOT / "app.py").read_text(encoding="utf-8")
+        self.assertIn("ADMIN_EMAIL", auth)
+        self.assertIn("ADMIN_PASSWORD_HASH", auth)
+        self.assertIn("AUTH_SECRET", auth)
+        self.assertIn("X-Internal-Auth", proxy)
+        self.assertIn("legacy_internal_authorized", source)
+        self.assertIn("hmac.compare_digest", source)
+
+    def test_browser_solver_has_tabu_post_optimization(self):
+        core = (app_module.ROOT / "src/solver/core.ts").read_text(encoding="utf-8")
+        types = (app_module.ROOT / "src/solver/types.ts").read_text(encoding="utf-8")
+        ui = (app_module.ROOT / "src/components/OperationalApp.tsx").read_text(encoding="utf-8")
+        self.assertIn("postOptimizeCandidate", core)
+        self.assertIn("tabuKey", core)
+        self.assertIn("tabu-post-optimize", types)
+        self.assertIn("tabu-search", core)
+        self.assertIn("후처리 최적화", core)
+        self.assertIn("후처리 개선", ui)
+        self.assertIn("postOptimizeSoftPenalty", ui)
+
+    def test_browser_solver_has_chain_moves_continuous_patterns_and_day_limits(self):
+        core = (app_module.ROOT / "src/solver/core.ts").read_text(encoding="utf-8")
+        types = (app_module.ROOT / "src/solver/types.ts").read_text(encoding="utf-8")
+        workbook = (app_module.ROOT / "src/solver/workbook.ts").read_text(encoding="utf-8")
+        ui = (app_module.ROOT / "src/components/OperationalApp.tsx").read_text(encoding="utf-8")
+        styles = (app_module.ROOT / "src/app/globals.css").read_text(encoding="utf-8")
+        self.assertIn("chainMoveOptions", core)
+        self.assertIn("buildDisplacementChain", core)
+        self.assertIn("classMaxPeriodForDay", core)
+        self.assertIn("teacherDailyLoadRatio", core)
+        self.assertIn("continuous-block", core)
+        self.assertIn("continuousBlocks", types)
+        self.assertIn("ManualMoveStep", types)
+        self.assertIn("affectedTeachers", types)
+        self.assertIn("parseContinuousBlocks", workbook)
+        self.assertIn("연속패턴", workbook)
+        self.assertIn("selectedManualFrom", ui)
+        self.assertIn("수동수정 선택을 취소했습니다", ui)
+        self.assertIn("chain-badge", styles)
+        self.assertIn("no-class-time", styles)
+
+    def test_browser_solver_has_ai_soft_repair_and_atomic_sync_moves(self):
+        core = (app_module.ROOT / "src/solver/core.ts").read_text(encoding="utf-8")
+        types = (app_module.ROOT / "src/solver/types.ts").read_text(encoding="utf-8")
+        ui = (app_module.ROOT / "src/components/OperationalApp.tsx").read_text(encoding="utf-8")
+        worker = (app_module.ROOT / "src/workers/solver.worker.ts").read_text(encoding="utf-8")
+        styles = (app_module.ROOT / "src/app/globals.css").read_text(encoding="utf-8")
+        self.assertIn("MoveSubject", types)
+        self.assertIn("MoveProposal", types)
+        self.assertIn("AiRepairRecommendation", types)
+        self.assertIn("repairOptions", core)
+        self.assertIn("moveSubject", core)
+        self.assertIn("cell.syncOccurrenceId ? cell.classCode", core)
+        self.assertIn("repairApply", worker)
+        self.assertIn("AI 보정안 찾기", ui)
+        self.assertIn("maskedRepairPrompt", ui)
+        self.assertIn("parseAiRepairRecommendation", ui)
+        self.assertIn("autoRepairUsedRef", ui)
+        self.assertIn("동시수업 전체 이동", ui)
+        self.assertIn("repair-list", styles)
+
+    def test_browser_solver_prioritizes_sync_groups_with_matching_and_beam(self):
+        core = (app_module.ROOT / "src/solver/core.ts").read_text(encoding="utf-8")
+        ui = (app_module.ROOT / "src/components/OperationalApp.tsx").read_text(encoding="utf-8")
+        self.assertIn("pickSyncOccurrence", core)
+        self.assertIn("pickSyncOccurrenceVariants", core)
+        self.assertIn("solveSyncGroupOccurrences", core)
+        self.assertIn("syncCohortGroups", core)
+        self.assertIn("placeSyncCohorts", core)
+        self.assertIn("cohort sync pack", core)
+        self.assertIn("greedySyncOccurrence", core)
+        self.assertIn("placeSyncUnitsWithBeam", core)
+        self.assertIn("syncBeamWidth", core)
+        self.assertIn("tryRepairSyncUnit", core)
+        self.assertIn("syncForwardPenalty", core)
+        self.assertIn("sameSubjectSameDay: false", ui)
+        self.assertIn("sync-first beam + relocation", core)
+        self.assertIn("회차 내부 교사/특별실 중복", core)
+        self.assertIn("공통 슬롯 부족", core)
+        self.assertIn("공통 슬롯을 소진", core)
+
+    def test_browser_worker_ai_flow_does_not_store_api_keys(self):
+        storage = (app_module.ROOT / "src/lib/storage.ts").read_text(encoding="utf-8")
+        ui = (app_module.ROOT / "src/components/OperationalApp.tsx").read_text(encoding="utf-8")
+        worker = (app_module.ROOT / "src/workers/solver.worker.ts").read_text(encoding="utf-8")
+        ai_client = (app_module.ROOT / "src/solver/aiClient.ts").read_text(encoding="utf-8")
+        workbook = (app_module.ROOT / "src/solver/workbook.ts").read_text(encoding="utf-8")
+        solver_core = (app_module.ROOT / "src/solver/core.ts").read_text(encoding="utf-8")
+        solver_types = (app_module.ROOT / "src/solver/types.ts").read_text(encoding="utf-8")
+        scenario_route = (app_module.ROOT / "src/app/api/scenarios/route.ts").read_text(encoding="utf-8")
+        scenario_item_route = (app_module.ROOT / "src/app/api/scenarios/[id]/route.ts").read_text(encoding="utf-8")
+        storage = (app_module.ROOT / "src/lib/storage.ts").read_text(encoding="utf-8")
+        template_route = (app_module.ROOT / "src/app/api/templates/timetable-input/route.ts").read_text(encoding="utf-8")
+        start_route = (app_module.ROOT / "src/app/api/solve/jobs/route.ts").read_text(encoding="utf-8")
+        tick_route = (app_module.ROOT / "src/app/api/solve/jobs/[id]/tick/route.ts").read_text(encoding="utf-8")
+        self.assertIn("apikey", storage.lower())
+        self.assertIn("new Worker", ui)
+        self.assertIn("validateClientAiKey", ui)
+        self.assertIn("aiValidationLoading", ui)
+        self.assertIn("검증 중...", ui)
+        self.assertIn("ImportIssuesPanel", ui)
+        self.assertIn("파일 읽기 오류", ui)
+        self.assertIn("downloadTemplate", ui)
+        self.assertIn("handleWorkbookDrop", ui)
+        self.assertIn("handleWorkbookFile", ui)
+        self.assertIn("handleProjectFile", ui)
+        self.assertIn("handleProjectDrop", ui)
+        self.assertIn("PROJECT_FILE_FORMAT", ui)
+        self.assertIn(".aitimetable.json", ui)
+        self.assertIn("saveProjectFile", ui)
+        self.assertIn("generateAiText", ui)
+        self.assertIn("parseWorkbookBuffer", ui)
+        self.assertIn("selectWorkbookFile", ui)
+        self.assertIn("fileBuffer", ui)
+        self.assertIn("solveLoopActiveRef", ui)
+        self.assertIn("chunkInFlightRef", ui)
+        self.assertIn("scheduleNextSolveChunk", ui)
+        self.assertIn("candidateRef.current", ui)
+        self.assertIn("LOCAL_SCENARIOS_KEY", ui)
+        self.assertIn("saveScenario", ui)
+        self.assertIn("refreshScenarioList", ui)
+        self.assertIn("loadScenario", ui)
+        self.assertIn("새 작업 만들기", ui)
+        self.assertIn("저장된 시간표 불러오기", ui)
+        self.assertIn("저장 필요", ui)
+        self.assertNotIn("window.setInterval(() => workerRef.current?.postMessage", ui)
+        self.assertIn("postMessage", worker)
+        self.assertIn("acceptBest", worker)
+        self.assertIn("VALIDATION_TIMEOUT_MS = 15000", ai_client)
+        self.assertIn("AbortController", ai_client)
+        self.assertIn("friendlyHttpError", ai_client)
+        self.assertIn("maxConcurrent: 1", ai_client)
+        self.assertIn("minIntervalMs: 6000", ai_client)
+        self.assertIn("Retry-After", ai_client)
+        self.assertIn("makeBatches", ai_client)
+        self.assertIn("eachRow", workbook)
+        self.assertIn("parseWorkbookBuffer", workbook)
+        self.assertIn("buildWorkUnits", solver_core)
+        self.assertIn("forward-checking", solver_core)
+        self.assertIn("tryDisplaceClassCell", solver_core)
+        self.assertIn("tryDisplaceTeacherCell", solver_core)
+        self.assertIn("hard-safe-local-search", solver_core)
+        self.assertIn("teacher-conflict", solver_core)
+        self.assertIn("bottleneck-csp", solver_types)
+        self.assertIn("saveTimetableScenario", storage)
+        self.assertIn("listTimetableScenarios", storage)
+        self.assertIn("deleteTimetableScenario", storage)
+        self.assertIn("records jsonb", storage)
+        self.assertIn("server storage unavailable", scenario_route)
+        self.assertIn("saveTimetableScenario", scenario_route)
+        self.assertNotIn("proxyLegacyRequest", scenario_route)
+        self.assertIn("deleteTimetableScenario", scenario_item_route)
+        self.assertIn("getTimetableScenario", scenario_item_route)
+        self.assertIn("exceljs", template_route)
+        self.assertIn("Content-Disposition", template_route)
+        self.assertIn("작성 예시 영역", template_route)
+        self.assertIn('"비고"', template_route)
+        self.assertIn('spec.name === "기본설정"', template_route)
+        self.assertNotIn("proxyLegacyRequest", template_route)
+        self.assertIn("browser-worker", start_route)
+        self.assertIn("browser-worker", tick_route)
+        self.assertNotIn("proxyLegacyJson", start_route)
+        self.assertNotIn("proxyLegacyJson", tick_route)
+
+    def test_browser_solver_ai_approval_filters_and_same_day_scope(self):
+        core = (app_module.ROOT / "src/solver/core.ts").read_text(encoding="utf-8")
+        types = (app_module.ROOT / "src/solver/types.ts").read_text(encoding="utf-8")
+        ui = (app_module.ROOT / "src/components/OperationalApp.tsx").read_text(encoding="utf-8")
+        styles = (app_module.ROOT / "src/app/globals.css").read_text(encoding="utf-8")
+        self.assertIn('aiRepairApplyMode?: "approval"', types)
+        self.assertIn('lunchProtectionLevel?: "off" | "normal" | "high" | "hard"', types)
+        self.assertIn('consecutiveStrictMode?: "off" | "three-plus" | "over-max"', types)
+        self.assertIn("subjectSameDayScope(cell.syncGroup)", core)
+        self.assertIn("wouldCreateHardConsecutive", core)
+        self.assertIn("wouldCreateHardLunch", core)
+        self.assertIn("consecutiveRuns(periods, warnThreshold)", core)
+        self.assertIn("current.length >= threshold", core)
+        self.assertIn("lunchProtectionLevel === \"hard\"", core)
+        self.assertIn("isRepairExecutionIntent", ui)
+        self.assertIn("runAiRepair(\"chat\", candidate)", ui)
+        self.assertIn("openRepairPreview(best)", ui)
+        self.assertIn("renderIssueFilterControls", ui)
+        self.assertIn("filteredTeacherIssues", ui)
+        self.assertIn("visibleManualTeacherCode", ui)
+        self.assertIn("점심시간 확보 강도", ui)
+        self.assertIn("3연강 처리", ui)
+        self.assertIn("연쇄수정 최대 깊이", ui)
+        self.assertIn("AI 수정 적용", ui)
+        self.assertIn("cellLabel(cell)", ui)
+        self.assertIn("탐색이 중지되었습니다", ui)
+        self.assertIn(".filter-row", styles)
+
+    def test_vercel_config_uses_exact_python_function_without_catch_all_rewrite(self):
+        config = json.loads((app_module.ROOT / "vercel.json").read_text(encoding="utf-8"))
+        self.assertIn("api/index.py", config.get("functions", {}))
+        rewrites = json.dumps(config.get("rewrites", []), ensure_ascii=False)
+        self.assertNotIn("/:path*", rewrites)
+
+    def test_operational_ui_exposes_relaxation_as_explicit_opt_in_and_kst(self):
+        ui = (app_module.ROOT / "src/components/OperationalApp.tsx").read_text(encoding="utf-8")
+        login_route = (app_module.ROOT / "src/app/api/auth/login/route.ts").read_text(encoding="utf-8")
+        ai_route = (app_module.ROOT / "src/app/api/ai/chat/route.ts").read_text(encoding="utf-8")
+        self.assertIn("Asia/Seoul", ui)
+        self.assertIn("allowRelaxation", ui)
+        self.assertIn("allowRelaxForUnassigned", ui)
+        self.assertIn("allowRelaxation ? \"Y\"", ui)
+        self.assertIn("조건 완화 미리보기", ui)
+        self.assertIn("API 키는 브라우저 메모리에만 보관", ui)
+        self.assertIn("Vercel 서버는 계산하지 않습니다", ui)
+        self.assertIn("429", ui)
+        self.assertIn('method="post"', ui)
+        self.assertIn('action="/api/auth/login"', ui)
+        self.assertIn('name="email"', ui)
+        self.assertIn('name="password"', ui)
+        self.assertIn("browser-direct-ai", ai_route)
+        self.assertIn("application/x-www-form-urlencoded", login_route)
+        self.assertIn("Response.redirect", login_route)
 
 
 if __name__ == "__main__":

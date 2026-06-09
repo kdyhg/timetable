@@ -1,0 +1,30 @@
+{
+  "name": "ai-school-timetable",
+  "version": "0.2.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -p 8765",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "legacy": "python app.py",
+    "hash:admin": "node scripts/hash-admin-password.mjs"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^1.0.2",
+    "@vercel/blob": "^2.4.0",
+    "exceljs": "^4.4.0",
+    "next": "^16.1.6",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^19.2.7",
+    "@types/react-dom": "^19.2.3",
+    "typescript": "^5.7.2"
+  },
+  "overrides": {
+    "postcss": "^8.5.15"
+  }
+}

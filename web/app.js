@@ -913,20 +913,52 @@ function renderRelaxationSimulator(rows = []) {
     return;
   }
   els.relaxationSimulator.innerHTML = `
+    <div class="analysis-note">아래 결과는 실제 후보군이 아니라, 해당 조건을 임시 적용했을 때의 빠른 미리보기입니다. 적용하려면 오른쪽 버튼으로 선호도에 반영한 뒤 다시 자동배정하세요.</div>
     <table class="analysis-table">
-      <thead><tr><th>조건</th><th>미배정</th><th>변화</th><th>오류</th></tr></thead>
+      <thead><tr><th>조건</th><th>미배정</th><th>변화</th><th>오류</th><th>설정</th></tr></thead>
       <tbody>
-        ${rows.map((row) => `
+        ${rows.map((row, index) => `
           <tr>
             <td>${escapeHtml(row.label)}</td>
             <td>${escapeHtml(row.unassigned ?? "-")}</td>
             <td>${escapeHtml(row.delta > 0 ? `+${row.delta}` : row.delta ?? "-")}</td>
             <td>${escapeHtml(row.errors ?? row.error ?? "-")}</td>
+            <td>${Object.keys(row.updates || {}).length ? `<button class="mini-button ghost" type="button" data-relax-index="${index}">선호도 반영</button>` : "기준"}</td>
           </tr>
         `).join("")}
       </tbody>
     </table>
   `;
+}
+
+function applyRelaxationPreset(index) {
+  const row = state.insights?.relaxationSimulations?.[Number(index)];
+  if (!row) return;
+  const updates = row.updates || {};
+  if (!Object.keys(updates).length) return;
+  const label = row.label || "";
+  if (els.allowRelaxForUnassigned) els.allowRelaxForUnassigned.checked = true;
+  for (const [key, value] of Object.entries(updates)) {
+    if (key.includes("점심") || label.includes("점심")) {
+      if (els.protectLunch) els.protectLunch.checked = String(value).toUpperCase() !== "N" ? true : false;
+    }
+    if (key.includes("연강") && els.maxConsecutive) {
+      els.maxConsecutive.value = value;
+    }
+    if ((key.includes("균등") || key.includes("안배")) && els.balanceStrength) {
+      els.balanceStrength.value = String(value || "off");
+    }
+    if (key.includes("요일최대") && els.teacherDayMaxEnabled) {
+      els.teacherDayMaxEnabled.checked = String(value).toUpperCase() !== "N";
+    }
+  }
+  if (label.includes("종합")) {
+    if (els.protectLunch) els.protectLunch.checked = false;
+    if (els.balanceStrength) els.balanceStrength.value = "off";
+  }
+  updateSolveAvailability();
+  log(`${row.label} 설정을 자동배정 선호도에 반영했습니다. AI 자동배정을 다시 실행하세요.`);
+  openSolvePreferences("workspace");
 }
 
 function renderCandidateComparison(rows = []) {
@@ -936,8 +968,9 @@ function renderCandidateComparison(rows = []) {
     return;
   }
   els.candidateComparison.innerHTML = `
+    <div class="analysis-note">이 표는 실제 자동배정 후보군입니다. 조건 완화가 적용된 후보는 완화 칸에 표시됩니다.</div>
     <table class="analysis-table">
-      <thead><tr><th>후보</th><th>미배정</th><th>오류</th><th>연강</th><th>식사</th><th>안배</th></tr></thead>
+      <thead><tr><th>후보</th><th>미배정</th><th>오류</th><th>연강</th><th>식사</th><th>안배</th><th>완화</th></tr></thead>
       <tbody>
         ${rows.map((row) => `
           <tr>
@@ -947,6 +980,7 @@ function renderCandidateComparison(rows = []) {
             <td>${escapeHtml(row.consecutive)}</td>
             <td>${escapeHtml(row.lunchShortage)}</td>
             <td>${escapeHtml(row.imbalance)}</td>
+            <td>${(row.relaxations || []).length ? row.relaxations.map((item) => `<span class="solve-profile-chip warn">${escapeHtml(item)}</span>`).join(" ") : "없음"}</td>
           </tr>
         `).join("")}
       </tbody>
@@ -1202,6 +1236,47 @@ function progressSummaryText(summary = {}) {
   return `미배정 ${summary.unassigned ?? "-"} / 오류 ${summary.errors ?? "-"}`;
 }
 
+function issueTagsText(issues = [], limit = 5) {
+  return (issues || [])
+    .slice(0, limit)
+    .map((item) => `${item.teacherName || item.teacherCode || "-"}(${(item.issues || []).join(", ")})`)
+    .join(" · ");
+}
+
+function unassignedText(items = [], limit = 5) {
+  return (items || [])
+    .slice(0, limit)
+    .map((item) => `${item.teacherName || item.teacherCode || "-"} / ${item.subjectName || item.subjectCode || "-"} / ${item.className || item.classCode || "-"}`)
+    .join(" · ");
+}
+
+function buildSolveReviewLines(result = {}, advice = {}, remote = {}) {
+  const selected = result.selected || state.selectedCandidate || {};
+  const validation = selected.validation || {};
+  const violations = validation.violations || [];
+  const errorCount = violations.filter((item) => item.severity === "error").length;
+  const teacherIssues = selected.teacherIssues || [];
+  const lines = [];
+  if (remote.ok) {
+    lines.push(`[원격 AI 응답] ${remote.provider || "AI"} ${remote.model || ""}`.trim());
+    if (advice.summary) lines.push(advice.summary);
+  } else if (remote.status === "not-run") {
+    lines.push("원격 AI는 진행형 탐색 중에는 호출하지 않았습니다. API 연결 실패가 아니라, 배정 엔진이 현재 최선안을 먼저 계산한 상태입니다.");
+  } else if (getAiConfig().apiKey) {
+    lines.push(`[원격 AI 실패] ${remote.provider || providerLabel()} ${remote.status || ""}: ${remote.message || "응답을 받지 못했습니다."}`);
+  }
+  lines.push(`현재 결과: 미배정 ${selected.unassigned?.length || 0}건 · hard 오류 ${errorCount}건 · 배정불량교사 ${teacherIssues.length}명`);
+  lines.push(`적용된 조건 완화: ${(selected.relaxations || []).length ? selected.relaxations.join(" · ") : "없음"}`);
+  const unassigned = unassignedText(selected.unassigned || []);
+  if (unassigned) lines.push(`우선 확인할 미배정: ${unassigned}`);
+  const issueText = issueTagsText(teacherIssues);
+  if (issueText) lines.push(`배정불량 주요 항목: ${issueText}`);
+  if (!remote.ok && selected.unassigned?.length) {
+    lines.push("분석 탭의 미배정 원인과 조건 완화 미리보기를 확인한 뒤, 필요한 완화만 직접 켜고 다시 자동배정하세요.");
+  }
+  return lines;
+}
+
 function formatProgressTime(value) {
   if (!value) return "-";
   const text = String(value);
@@ -1378,15 +1453,7 @@ async function solveSchedule(context = "workspace") {
     if (result.aiAdvisor?.advice) {
       const advice = result.aiAdvisor.advice;
       const remote = result.aiAdvisor.remote || {};
-      const lines = [];
-      if (remote.ok) {
-        lines.push(`[원격 AI 응답] ${remote.provider || "AI"} ${remote.model || ""}`.trim());
-      } else if (getAiConfig().apiKey) {
-        lines.push(`[원격 AI 실패] ${remote.provider || providerLabel()} ${remote.status || ""}: ${remote.message || "응답을 받지 못했습니다."}`);
-        lines.push("[보조 진단]");
-      }
-      lines.push(advice.summary);
-      lines.push(...(advice.suggestions || []).map((item) => `${item.title}: ${(item.steps || []).join(" → ") || item.explanation}`));
+      const lines = buildSolveReviewLines(result, advice, remote);
       appendChat("assistant", `AI 자동배정 검토\n${lines.filter(Boolean).join("\n")}`, remote.ok ? { responseId: remote.responseId, model: remote.model } : null);
     }
     return true;
@@ -2516,6 +2583,11 @@ function wireEvents() {
   els.recentLogsButton?.addEventListener("click", loadRecentLogs);
   els.refreshInsightsButton?.addEventListener("click", () => loadInsights(true).catch((error) => log(error.message)));
   els.saveScenarioButton?.addEventListener("click", () => saveCurrentScenario().catch((error) => log(error.message)));
+  els.relaxationSimulator?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-relax-index]");
+    if (!button) return;
+    applyRelaxationPreset(button.dataset.relaxIndex);
+  });
   els.scenarioList?.addEventListener("click", (event) => {
     const button = event.target.closest("[data-load-scenario]");
     if (!button) return;

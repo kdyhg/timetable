@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import csv
 import hashlib
+import hmac
 import io
 import itertools
 import json
@@ -2257,7 +2258,7 @@ def constraint_settings(records: dict) -> dict:
         "assignmentMethod": as_text(config.get("배정방법")) or "fixed-first",
         "preferenceOrder": as_text(config.get("선호도순서")) or "안배>연강>식사시간",
         "metaIterations": min(parse_positive_int(config.get("배정횟수")) or 60, 240),
-        "allowRelaxForUnassigned": truthy_config(config.get("미배정방지조건완화", "Y")),
+        "allowRelaxForUnassigned": truthy_config(config.get("미배정방지조건완화", "N")),
         "teacherDayMaxEnabled": truthy_config(config.get("교사요일최대적용", "N")),
         "teacherDayMax": day_max,
     }
@@ -3291,6 +3292,8 @@ def generate_ai_repair_candidates(records: dict, strict_candidates: list[dict]) 
         return []
     days, max_period = schedule_dimensions(records)
     settings = constraint_settings(records)
+    if not settings.get("allowRelaxForUnassigned"):
+        return []
     base_config = records.get("config", {})
     profiles = []
     if settings.get("balanceStrength") != "off":
@@ -6477,19 +6480,18 @@ def candidate_comparison(result: dict, selected: dict) -> list[dict]:
     rows = []
     selected_signature = candidate_signature(selected) if selected else ""
     for index, candidate in enumerate(result.get("candidates", []) or [], start=1):
-        validation = candidate.get("validation", {})
-        violations = validation.get("violations", [])
-        teacher_issues = candidate.get("teacherIssues", [])
+        summary = solve_best_summary({"selected": candidate})
         rows.append({
             "index": index,
             "strategy": candidate.get("strategy", ""),
             "selected": candidate_signature(candidate) == selected_signature,
             "score": candidate.get("score", 0),
-            "unassigned": len(candidate.get("unassigned", [])),
-            "errors": len([item for item in violations if item.get("severity") == "error"]),
-            "lunchShortage": len([item for item in violations if item.get("type") == "lunch_protection"]),
-            "consecutive": len([item for item in violations if item.get("type") == "max_consecutive"]),
-            "imbalance": len([item for item in teacher_issues if any("안배" in as_text(tag) for tag in item.get("issues", []))]),
+            "unassigned": summary.get("unassigned", 0),
+            "errors": summary.get("errors", 0),
+            "lunchShortage": summary.get("lunchShortage", 0),
+            "consecutive": summary.get("consecutive", 0),
+            "imbalance": summary.get("imbalance", 0),
+            "teacherIssueCount": summary.get("teacherIssueCount", 0),
             "relaxations": candidate.get("relaxations", []),
         })
     return rows
@@ -6622,6 +6624,14 @@ def routed_request_path(raw_path: str) -> str:
     return parsed.path
 
 
+def legacy_internal_authorized(headers) -> bool:
+    secret = os.environ.get("AUTH_SECRET", "")
+    if not secret:
+        return True
+    provided = headers.get("X-Internal-Auth", "")
+    return hmac.compare_digest(provided, secret)
+
+
 class AppHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         safe_log("[%s] %s" % (self.log_date_time_string(), fmt % args))
@@ -6647,6 +6657,9 @@ class AppHandler(BaseHTTPRequestHandler):
         path = routed_request_path(self.path)
         if path == "/api/health":
             self.send_json({"ok": True, "time": now_iso(), "storage": storage_mode()})
+            return
+        if not legacy_internal_authorized(self.headers):
+            self.send_json({"error": "Legacy API requires internal Next.js proxy authentication."}, status=401)
             return
         if path == "/templates/timetable-input.xlsx":
             self.send_bytes(make_workbook_bytes(create_template_workbook()), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "timetable-input.xlsx")
@@ -6696,6 +6709,9 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = routed_request_path(self.path)
+        if not legacy_internal_authorized(self.headers):
+            self.send_json({"error": "Legacy API requires internal Next.js proxy authentication."}, status=401)
+            return
         try:
             if path == "/imports/timetable-input":
                 file_name, payload = parse_multipart_file(self)

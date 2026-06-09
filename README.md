@@ -1,76 +1,93 @@
-# AI 공동작성 학교 시간표 웹앱
+# AI 학교 시간표 운영 콘솔
 
-압핀/컴시간 주간시간표의 업무 흐름을 바탕으로 만든 웹앱 프로토타입입니다. 통합 엑셀 양식 다운로드, 작성 파일 업로드, 구조/참조 검증, 오류 리포트 생성, 간단한 자동배정, 결과 엑셀/NEIS CSV 출력, 마스킹 기반 AI 제안 API를 포함합니다.
+학교 시간표 자동배정 웹앱입니다. 운영 방향은 하이브리드입니다.
+
+- 자동배정, 분석, 수동수정 계산: 사용자 PC의 브라우저 Web Worker
+- 로그인, 시나리오 저장, 선택적 파일 저장: Next.js API
+- AI 호출: 브라우저 직접 호출
+- API 키: 서버, DB, 로그, Blob에 저장하지 않음
+
+이 구조에서는 Vercel 서버 함수가 무거운 시간표 계산을 하지 않습니다. 사용자가 1명이어도 100명이어도 각자의 PC에서 계산하므로 Vercel 함수 실행시간과 Redis 작업 큐 비용을 피할 수 있습니다.
 
 ## 실행
 
 ```powershell
-cd 'C:\Users\user\Documents\Codex\2026-06-03\files-mentioned-by-the-user-9'
-python -m pip install -r requirements.txt
-.\run.ps1
+npm install
+npm run dev
 ```
 
-브라우저에서 `http://127.0.0.1:8765`로 접속합니다.
+로컬 기본 주소는 `http://127.0.0.1:8765`입니다.
 
-또는 다음처럼 직접 실행할 수 있습니다.
+관리자 비밀번호 해시는 다음 명령으로 만들 수 있습니다.
 
 ```powershell
-python app.py
+npm run hash:admin -- "관리자비밀번호"
 ```
 
-## Vercel 배포
+`.env.local` 예시:
 
-이 저장소는 Vercel Python Functions용 `api/index.py`와 `vercel.json`을 포함합니다. Vercel은 로컬처럼 `python app.py`로 장시간 실행되는 서버를 띄우지 않고, 요청마다 Python 함수의 `handler`를 호출합니다.
+```env
+ADMIN_EMAIL=admin@example.com
+ADMIN_PASSWORD_HASH=pbkdf2$...
+AUTH_SECRET=충분히긴랜덤문자열
+
+# 선택 저장 기능을 쓸 때만 필요
+DATABASE_URL=...
+BLOB_READ_WRITE_TOKEN=...
+```
+
+## Web Worker 자동배정
+
+브라우저에서 엑셀을 읽고 검증한 뒤, 정규화된 자료를 `src/workers/solver.worker.ts`로 전달합니다.
+
+Worker 메시지:
+
+- `init`: 정규화 자료와 배정 옵션 전달
+- `start`, `continue`: chunk 단위 탐색
+- `acceptBest`: 현재 최선안 확정
+- `stop`: 탐색 중지
+- `movePreview`, `moveApply`: 수동수정 미리보기와 승인 적용
+
+진행 화면은 탐색 회차, 후보 수, 미배정, hard 오류, 연강, 식사부족, 안배부족, 마지막 개선 시각을 Worker 메시지로 표시합니다.
+
+## AI 429 대응
+
+AI API는 서버 프록시를 거치지 않고 브라우저에서 직접 호출합니다.
+
+- Gemini: `maxConcurrent=1`, `minIntervalMs=6000`, `maxRetries=3`
+- OpenAI/Custom: `maxConcurrent=2`, `minIntervalMs=1500`, `maxRetries=3`
+- 429 응답은 `Retry-After` 헤더를 우선 사용하고, 없으면 `10s -> 20s -> 40s` backoff를 적용합니다.
+- 자동배정 반복 탐색 중에는 원격 AI를 계속 호출하지 않습니다.
+- AI는 자연어 제약 구조화, 미배정 원인 요약, 채팅 변경안 제안에만 사용합니다.
+
+Gemini 429가 계속 뜨면 모델을 flash/lite 계열로 바꾸거나 Google Cloud Console에서 Generative Language API 할당량을 확인하세요.
+
+## API
+
+유지되는 가벼운 API:
+
+- `POST /api/auth/login`
+- `POST /api/auth/logout`
+- `GET /api/auth/session`
+- `GET /api/templates/timetable-input`
+- `POST /api/scenarios`
+- `GET /api/scenarios`
+- 선택적 저장/로그 API
+
+비활성화된 서버 계산/AI 프록시:
+
+- `/api/solve/jobs*`
+- `/api/ai/validate-key`
+- `/api/ai/chat`
+
+위 경로는 410 응답을 반환합니다. 자동배정과 AI 채팅은 브라우저 코드에서 처리됩니다.
+
+## 검증
 
 ```powershell
-vercel
+npm run typecheck
+npm run build
+python -m unittest discover -s tests -v
 ```
 
-GitHub 연동 배포라면 커밋을 푸쉬한 뒤 Vercel에서 다시 배포하면 됩니다.
-
-주의: Vercel 서버리스 환경에서는 `data/` 같은 로컬 파일 저장소가 영구 보관되지 않습니다. 이 프로토타입은 Vercel에서 런타임 임시 디렉터리를 사용하므로 업로드 이력과 마지막 시간표는 함수 인스턴스가 바뀌면 사라질 수 있습니다. 실제 운영 배포에서는 Vercel Blob, Postgres, Redis 같은 외부 저장소를 붙이는 것이 안전합니다.
-
-### 운영 저장소 환경변수
-
-Vercel Storage에서 리소스를 만든 뒤 프로젝트에 연결하면 아래 환경변수가 자동 또는 수동으로 들어갑니다.
-
-- Blob: `BLOB_READ_WRITE_TOKEN`
-- Postgres/Neon: `POSTGRES_URL` 또는 `DATABASE_URL`
-- Redis/Upstash: `KV_REST_API_URL` + `KV_REST_API_TOKEN`, 또는 `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN`
-
-저장 우선순위는 `Postgres + Blob`, `Redis + Blob`, `로컬 파일` 순서입니다. Postgres가 있으면 업로드 메타데이터, 검증 records, 마지막 시간표를 Postgres에 저장하고, Blob이 있으면 업로드 원본과 오류 리포트 엑셀을 Blob에 저장합니다. Redis만 있으면 메타데이터와 마지막 시간표를 Redis REST API에 저장합니다.
-
-배포 후 `/api/health`의 `storage` 값을 보면 현재 저장소 모드를 확인할 수 있습니다. 예: `postgres+redis+blob`, `postgres+blob`, `redis+blob`, `local`.
-
-## 주요 API
-
-- `GET /templates/timetable-input.xlsx`: 통합 입력 엑셀 양식 다운로드
-- `POST /imports/timetable-input`: 작성된 엑셀 업로드 및 검증
-- `GET /imports/{id}/report.xlsx`: 업로드 오류 리포트 다운로드
-- `POST /schedules/solve`: 자동 시간표 생성
-- `POST /schedules/validate`: 현재 시간표 검증
-- `POST /schedules/move`: 수동 이동/빈칸 이동/맞교환 적용
-- `POST /ai/validate-key`: AI 제공자별 API 키 검증
-- `POST /ai/chat`: 마스킹 기반 AI 제안 생성
-- `GET /exports/excel`: 선택된 시간표 엑셀 출력
-- `GET /exports/neis`: NEIS 입력용 CSV 출력
-
-## 현재 범위
-
-- 자동배정 엔진은 제약 최적화 엔진의 초기 대체 구현으로, 탐욕형 후보 3개를 생성합니다.
-- AI API 키는 왼쪽 시작 패널에서 먼저 검증합니다. OpenAI, Gemini, Custom OpenAI-compatible 제공자를 선택할 수 있고, 검증된 키가 있으면 서버가 마스킹된 payload, 현재 시간표 검증 결과, 미배정 진단을 보내 구조화된 제안을 요청합니다. 호출 실패 또는 키 미검증 상태에서는 로컬 진단 fallback을 사용합니다.
-- API 키는 서버 저장 파일, 업로드 이력, 결과 시간표, 오류 리포트에 저장하지 않습니다. Git에 올릴 때도 `.env`, `data/`, `outputs/` 등 생성 파일은 제외합니다.
-- 미배정이나 hard 검증 오류가 있으면 strict 후보 3개 외에 AI 개선 후보를 추가 생성합니다. 개선 후보는 `점심시간보호 완화`, `최대연강허용 완화`처럼 어떤 조건을 양보했는지 후보 카드와 결과 엑셀 요약에 표시합니다.
-- 실제 학교 자료가 준비되면 동시수업, 복수교사, 특별실, 연속수업의 고급 제약을 더 강하게 반영하도록 엔진을 확장하면 됩니다.
-- Excel 시트명에는 `/`를 쓸 수 없어 `학급-계열`, `동시-합반-분반`, `배정금지-희망조건`처럼 하이픈을 사용합니다.
-- 통합 엑셀 양식은 왼쪽 노란색 영역이 실제 입력 영역이고, 오른쪽 파란색 영역은 작성 예시입니다. 오른쪽 예시는 업로드 검증에서 무시됩니다.
-- 사용자는 교사명, 학급명, 과목명, 특별실명처럼 이름으로 입력합니다. 내부 코드는 업로드 때 자동 생성되며 AI에는 코드화된 데이터만 전달됩니다.
-- `학급-계열` 시트의 `요일별시수`는 기본설정의 수업요일 순서대로 해석합니다. 월~금 기준 `7,7,6,7,7`은 수요일만 6교시이고 금요일은 7교시입니다.
-- `기본설정`에서 `최대연강허용`, `점심시간보호`, `균등분배강도`를 설정합니다. 점심시간보호가 `Y`이면 점심 전후 교시에 같은 교사를 동시에 배정하지 않습니다.
-- `배정금지-희망조건`의 `우선순위`는 1~10으로 입력하며, hard 조건은 차단 조건으로, soft/희망/비선호 조건은 후보 점수에 반영됩니다.
-- `고정 일과` 시트에는 교시는 있지만 교과 시수가 아닌 HR, 자습, 창체, 행사 등을 입력합니다. 대상유형은 `전체`, `학년`, `계열`, `학급` 중에서 고르고, 대상명/교시를 쓴 뒤 해당 요일 칸에 시간표에 보일 표시명을 적습니다.
-- 고정 일과는 자동배정 전에 시간표 칸을 먼저 차지하므로 일반 수업이 그 시간에 들어가지 않습니다. 임장교사명은 선택 사항이고, 입력해도 교과 시수로 계산하지 않습니다.
-- 교사별 시수표는 교사명/과목명을 한 번 쓰고 오른쪽 학급명 열 아래에 주당 시수 숫자만 넣는 방식입니다. 예: `김하늘 / 국어` 행에서 `1-1`, `1-2`, `1-3` 칸에 각각 `4`를 넣으면 세 학급 수업으로 자동 변환됩니다.
-- 교사별 시수표의 학급명 열은 시간표가 나온 뒤의 칸이 아니라 수업 대상 반입니다. 예: `1-1`, `1-2`, `2기계1`. 이동수업/분반용 임시 반은 `학급-계열` 시트에 가상학급으로 먼저 추가합니다.
-- 이미 입력한 교사명/학급명/과목명/특별실명은 관련 시트에서 드롭다운으로 선택할 수 있습니다.
-- 웹 화면에서는 엑셀 파일 드래그-드롭 업로드, API 키 검증 후 AI 자동배정, 학급별/교사별 시간표 보기, 자동 이동/빈칸 이동/맞교환 방식의 수동 수정을 지원합니다.
+기존 Python solver는 비교 기준과 레거시 템플릿/검증 참고 구현으로 남겨두고, 운영 계산의 기본 경로는 TypeScript Web Worker입니다.

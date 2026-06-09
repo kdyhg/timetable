@@ -4,5 +4,11 @@ work/
 __pycache__/
 *.pyc
 .env
+.env.local
+.env.*.local
+node_modules/
+.next/
+.npm-cache/
+*.tsbuildinfo
 *.tmp
 ~$*.xlsx

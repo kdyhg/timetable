@@ -1265,6 +1265,13 @@ body.setup-complete .start-panel {
   background: #fbfcfc;
 }
 
+.analysis-note {
+  margin-bottom: 10px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .analysis-stat {
   min-height: 74px;
   padding: 12px;
