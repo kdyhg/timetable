@@ -209,7 +209,7 @@ class TimetableAppTests(unittest.TestCase):
         self.assertRegex(app_module.now_iso(), r"\+09:00$")
 
     def test_cp_sat_dependency_and_missing_status_are_declared(self):
-        requirements = (app_module.ROOT / "requirements.txt").read_text(encoding="utf-8")
+        requirements = (app_module.ROOT / "legacy" / "requirements.txt").read_text(encoding="utf-8")
         self.assertIn("ortools", requirements)
         candidate, stats = app_module.solve_cp_sat_candidate({"classes": {}, "loads": [], "config": {}})
         if app_module.cp_sat_available():

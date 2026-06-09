@@ -1,0 +1,10 @@
+legacy/
+tests/
+web/
+api/
+data/
+outputs/
+work/
+__pycache__/
+*.pyc
+*.tsbuildinfo
