@@ -87,7 +87,6 @@ Gemini 429가 계속 뜨면 모델을 flash/lite 계열로 바꾸거나 Google C
 ```powershell
 npm run typecheck
 npm run build
-python -m unittest discover -s tests -v
 ```
 
-기존 Python solver는 비교 기준과 레거시 템플릿/검증 참고 구현으로 남겨두고, 운영 계산의 기본 경로는 TypeScript Web Worker입니다.
+운영 계산과 Vercel 배포 경로는 TypeScript Web Worker입니다. Python legacy 파일은 Vercel의 Python 런타임 오감지를 막기 위해 배포 브랜치에서 제거했습니다.
