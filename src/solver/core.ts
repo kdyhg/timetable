@@ -68,6 +68,12 @@ type WorkUnit = {
   grade: string;
 };
 
+type ChainSearchBudget = {
+  deadline: number;
+  nodes: number;
+  maxNodes: number;
+};
+
 type ScheduleCache = {
   cells: ScheduleCell[];
   teacherCells: Map<string, ScheduleCell[]>;
@@ -274,14 +280,21 @@ function subjectSameDayScope(syncGroup?: string) {
   return syncGroup ? `sync:${syncGroup}` : "single";
 }
 
+function subjectDayUsageKeys(records: NormalizedRecords, options: Required<SolveOptions>, load: Pick<LoadUnit, "classCode" | "subjectCode" | "syncGroup">, day: DayKey) {
+  const scope = subjectSameDayScope(load.syncGroup);
+  const keys = [`exact:${load.classCode}:${day}:${scope}:${load.subjectCode}`];
+  if (options.sameSubjectSameDay) keys.push(`similar:${load.classCode}:${day}:${scope}:${subjectSimilarKey(records, load.subjectCode)}`);
+  return keys;
+}
+
 function sameContinuousSubjectBlock(a?: string, b?: string) {
   return Boolean(a && b && a === b);
 }
 
-function wouldCreateSimilarSubjectSameDay(records: NormalizedRecords, schedule: Schedule, loads: LoadUnit[], day: DayKey) {
+function wouldCreateSubjectSameDay(records: NormalizedRecords, schedule: Schedule, loads: LoadUnit[], day: DayKey, includeSimilar: boolean) {
   const byClass = new Map<string, SubjectDayEntry[]>();
   for (const load of loads) {
-    const key = subjectSimilarKey(records, load.subjectCode);
+    const key = includeSimilar ? subjectSimilarKey(records, load.subjectCode) : load.subjectCode;
     if (!key) continue;
     const list = byClass.get(load.classCode) || [];
     list.push({ key, scope: subjectSameDayScope(load.syncGroup), subjectCode: load.subjectCode, blockId: load.blockId });
@@ -291,7 +304,7 @@ function wouldCreateSimilarSubjectSameDay(records: NormalizedRecords, schedule: 
   for (const [classCode, additions] of byClass) {
     const existing: SubjectDayEntry[] = Object.values(schedule.classes[classCode]?.grid[day] || {})
       .filter((cell): cell is ScheduleCell => Boolean(cell?.subjectCode))
-      .map((cell) => ({ key: subjectSimilarKey(records, cell.subjectCode), scope: subjectSameDayScope(cell.syncGroup), subjectCode: cell.subjectCode, blockId: cell.blockId }));
+      .map((cell) => ({ key: includeSimilar ? subjectSimilarKey(records, cell.subjectCode) : cell.subjectCode || "", scope: subjectSameDayScope(cell.syncGroup), subjectCode: cell.subjectCode || "", blockId: cell.blockId }));
     const combined: SubjectDayEntry[] = [...existing, ...additions];
     for (let i = 0; i < combined.length; i += 1) {
       for (let j = i + 1; j < combined.length; j += 1) {
@@ -305,15 +318,20 @@ function wouldCreateSimilarSubjectSameDay(records: NormalizedRecords, schedule: 
   return false;
 }
 
-function similarSubjectSameDayViolations(records: NormalizedRecords, schedule: Schedule) {
+function wouldCreateForbiddenSubjectSameDay(records: NormalizedRecords, schedule: Schedule, loads: LoadUnit[], day: DayKey, options: Required<SolveOptions>) {
+  if (wouldCreateSubjectSameDay(records, schedule, loads, day, false)) return true;
+  return options.sameSubjectSameDay && wouldCreateSubjectSameDay(records, schedule, loads, day, true);
+}
+
+function similarSubjectSameDayViolations(records: NormalizedRecords, schedule: Schedule, includeSimilar: boolean) {
   const violations: Array<{ className: string; day: DayKey; subjectName: string; similar: boolean }> = [];
   for (const [classCode, table] of Object.entries(schedule.classes)) {
     for (const day of schedule.days) {
       const cells = Object.values(table.grid[day] || {}).filter((cell): cell is ScheduleCell => Boolean(cell?.subjectCode));
       for (let i = 0; i < cells.length; i += 1) {
         for (let j = i + 1; j < cells.length; j += 1) {
-          const firstKey = subjectSimilarKey(records, cells[i].subjectCode);
-          const secondKey = subjectSimilarKey(records, cells[j].subjectCode);
+          const firstKey = includeSimilar ? subjectSimilarKey(records, cells[i].subjectCode) : cells[i].subjectCode || "";
+          const secondKey = includeSimilar ? subjectSimilarKey(records, cells[j].subjectCode) : cells[j].subjectCode || "";
           if (!firstKey || firstKey !== secondKey) continue;
           if (subjectSameDayScope(cells[i].syncGroup) !== subjectSameDayScope(cells[j].syncGroup)) continue;
           if (sameContinuousSubjectBlock(cells[i].blockId, cells[j].blockId)) continue;
@@ -595,7 +613,7 @@ function slotScore(schedule: Schedule, records: NormalizedRecords, options: Requ
     if (options.balanceStrength !== "off") score += softWeight(options, "balance") * Math.max(0, spread - 0.32) * (options.strictBalance ? 14 : 8);
     const dayMax = teacherDayMaxFor(options, day);
     if (dayMax && teacherGeneralDailyCount(schedule, load.teacherCode, day) + 1 > dayMax) score += options.teacherDayMaxStrict ? 999 : 8;
-    if (options.sameSubjectSameDay && wouldCreateSimilarSubjectSameDay(records, schedule, [load], day)) score += 999;
+    if (wouldCreateForbiddenSubjectSameDay(records, schedule, [load], day, options)) score += 999;
     if (records.config.days.indexOf(day) === records.config.days.length - 1 && period >= records.config.maxPeriod - 1) score += 0.2;
   }
   return score;
@@ -631,7 +649,7 @@ function availableSlots(schedule: Schedule, records: NormalizedRecords, options:
       if (options.teacherDayMaxStrict && wouldExceedTeacherDayMax(schedule, options, loads, day)) continue;
       if (wouldCreateHardConsecutive(records, schedule, options, loads, day, period)) continue;
       if (wouldCreateHardLunch(records, schedule, options, loads, day, period)) continue;
-      if (options.sameSubjectSameDay && wouldCreateSimilarSubjectSameDay(records, schedule, loads, day)) continue;
+      if (wouldCreateForbiddenSubjectSameDay(records, schedule, loads, day, options)) continue;
       slots.push({ day, period, score: continuous ? continuousSlotScore(schedule, records, options, loads, day, period, random) : slotScore(schedule, records, options, loads, day, period, random) });
     }
   }
@@ -1029,17 +1047,21 @@ function tryDisplaceClassCell(schedule: Schedule, records: NormalizedRecords, op
   for (const targetCell of occupied) {
     const displaced = cellToLoad(targetCell);
     if (!displaced) continue;
-    clearCell(schedule, targetCell);
-    if (canPlace(schedule, records, load, targetCell.day, targetCell.period)) {
-      const alternative = firstSlotForLoad(schedule, records, options, displaced, random, { day: targetCell.day, period: targetCell.period });
-      if (alternative) {
-        schedule.classes[displaced.classCode].grid[alternative.day][String(alternative.period)] = makeCell(displaced, alternative.day, alternative.period);
-        schedule.classes[load.classCode].grid[targetCell.day][String(targetCell.period)] = makeCell(load, targetCell.day, targetCell.period);
-        invalidateScheduleCache(schedule);
-        return true;
-      }
-    }
-    restoreCell(schedule, targetCell);
+    const branch = cloneSchedule(schedule);
+    const branchTarget = branch.classes[targetCell.classCode]?.grid[targetCell.day]?.[String(targetCell.period)] || null;
+    if (!branchTarget) continue;
+    clearCell(branch, branchTarget);
+    if (!canPlaceSingleWithOptions(branch, records, options, load, targetCell.day, targetCell.period)) continue;
+    const alternative = firstSlotForLoad(branch, records, options, displaced, random, { day: targetCell.day, period: targetCell.period });
+    if (!alternative) continue;
+    branch.classes[displaced.classCode].grid[alternative.day][String(alternative.period)] = makeCell(displaced, alternative.day, alternative.period);
+    invalidateScheduleCache(branch);
+    if (!canPlaceSingleWithOptions(branch, records, options, load, targetCell.day, targetCell.period)) continue;
+    branch.classes[load.classCode].grid[targetCell.day][String(targetCell.period)] = makeCell(load, targetCell.day, targetCell.period);
+    invalidateScheduleCache(branch);
+    schedule.classes = branch.classes;
+    invalidateScheduleCache(schedule);
+    return true;
   }
   return false;
 }
@@ -1053,17 +1075,21 @@ function tryDisplaceTeacherCell(schedule: Schedule, records: NormalizedRecords, 
   for (const targetCell of occupied) {
     const displaced = cellToLoad(targetCell);
     if (!displaced) continue;
-    clearCell(schedule, targetCell);
-    if (canPlace(schedule, records, load, targetCell.day, targetCell.period)) {
-      const alternative = firstSlotForLoad(schedule, records, options, displaced, random, { day: targetCell.day, period: targetCell.period });
-      if (alternative) {
-        schedule.classes[displaced.classCode].grid[alternative.day][String(alternative.period)] = makeCell(displaced, alternative.day, alternative.period);
-        schedule.classes[load.classCode].grid[targetCell.day][String(targetCell.period)] = makeCell(load, targetCell.day, targetCell.period);
-        invalidateScheduleCache(schedule);
-        return true;
-      }
-    }
-    restoreCell(schedule, targetCell);
+    const branch = cloneSchedule(schedule);
+    const branchTarget = branch.classes[targetCell.classCode]?.grid[targetCell.day]?.[String(targetCell.period)] || null;
+    if (!branchTarget) continue;
+    clearCell(branch, branchTarget);
+    if (!canPlaceSingleWithOptions(branch, records, options, load, targetCell.day, targetCell.period)) continue;
+    const alternative = firstSlotForLoad(branch, records, options, displaced, random, { day: targetCell.day, period: targetCell.period });
+    if (!alternative) continue;
+    branch.classes[displaced.classCode].grid[alternative.day][String(alternative.period)] = makeCell(displaced, alternative.day, alternative.period);
+    invalidateScheduleCache(branch);
+    if (!canPlaceSingleWithOptions(branch, records, options, load, targetCell.day, targetCell.period)) continue;
+    branch.classes[load.classCode].grid[targetCell.day][String(targetCell.period)] = makeCell(load, targetCell.day, targetCell.period);
+    invalidateScheduleCache(branch);
+    schedule.classes = branch.classes;
+    invalidateScheduleCache(schedule);
+    return true;
   }
   return false;
 }
@@ -1086,7 +1112,7 @@ function canPlaceSingleWithOptions(schedule: Schedule, records: NormalizedRecord
   if (options.teacherDayMaxStrict && wouldExceedTeacherDayMax(schedule, options, [load], day)) return false;
   if (wouldCreateHardConsecutive(records, schedule, options, [load], day, period)) return false;
   if (wouldCreateHardLunch(records, schedule, options, [load], day, period)) return false;
-  if (options.sameSubjectSameDay && wouldCreateSimilarSubjectSameDay(records, schedule, [load], day)) return false;
+  if (wouldCreateForbiddenSubjectSameDay(records, schedule, [load], day, options)) return false;
   return true;
 }
 
@@ -1114,10 +1140,8 @@ function canPlaceSingleWithOptionsAfterClearing(schedule: Schedule, records: Nor
   if (options.consecutiveStrictMode === "three-plus" && projectedRun >= Math.max(3, options.consecutiveWarnThreshold || 3)) return false;
   if (options.consecutiveStrictMode === "over-max" && projectedRun > options.maxConsecutive) return false;
   if (options.lunchProtectionLevel === "hard" && hasLunchBoundaryIssue(records, projectedPeriods)) return false;
-  if (options.sameSubjectSameDay) {
-    const next = afterCleared(schedule, except);
-    if (wouldCreateSimilarSubjectSameDay(records, next, [load], day)) return false;
-  }
+  const next = afterCleared(schedule, except);
+  if (wouldCreateForbiddenSubjectSameDay(records, next, [load], day, options)) return false;
   return true;
 }
 
@@ -1126,22 +1150,34 @@ function tryChainPlaceUnit(schedule: Schedule, records: NormalizedRecords, optio
   const depth = Math.max(0, Math.min(5, Math.max(options.manualChainDepth || 4, options.searchStrength === "strong" ? 5 : 4)));
   if (depth < 2) return false;
   const next = cloneSchedule(schedule);
-  if (!tryChainPlaceLoad(next, records, options, unit.loads[0], random, depth, new Set())) return false;
+  const budget: ChainSearchBudget = {
+    deadline: Date.now() + (options.searchStrength === "strong" ? 45 : 25),
+    nodes: 0,
+    maxNodes: options.searchStrength === "strong" ? 1800 : 800,
+  };
+  if (!tryChainPlaceLoad(next, records, options, unit.loads[0], random, depth, new Set(), budget)) return false;
   schedule.classes = next.classes;
   invalidateScheduleCache(schedule);
   return true;
 }
 
-function tryDeepChainPlaceUnit(schedule: Schedule, records: NormalizedRecords, options: Required<SolveOptions>, unit: WorkUnit, random: () => number) {
+function tryDeepChainPlaceUnit(schedule: Schedule, records: NormalizedRecords, options: Required<SolveOptions>, unit: WorkUnit, random: () => number, maxMs = 90, maxNodes = 5000) {
   if (unit.loads.length !== 1) return false;
   const next = cloneSchedule(schedule);
-  if (!tryChainPlaceLoad(next, records, options, unit.loads[0], random, 7, new Set())) return false;
+  const budget: ChainSearchBudget = {
+    deadline: Date.now() + (options.searchStrength === "strong" ? maxMs : Math.min(maxMs, 50)),
+    nodes: 0,
+    maxNodes: options.searchStrength === "strong" ? maxNodes : Math.min(maxNodes, 2200),
+  };
+  if (!tryChainPlaceLoad(next, records, options, unit.loads[0], random, 6, new Set(), budget)) return false;
   schedule.classes = next.classes;
   invalidateScheduleCache(schedule);
   return true;
 }
 
-function tryChainPlaceLoad(schedule: Schedule, records: NormalizedRecords, options: Required<SolveOptions>, load: LoadUnit, random: () => number, depth: number, visited: Set<string>): boolean {
+function tryChainPlaceLoad(schedule: Schedule, records: NormalizedRecords, options: Required<SolveOptions>, load: LoadUnit, random: () => number, depth: number, visited: Set<string>, budget: ChainSearchBudget): boolean {
+  budget.nodes += 1;
+  if (budget.nodes > budget.maxNodes || Date.now() > budget.deadline) return false;
   const direct = availableSlots(schedule, records, options, [load], random)[0];
   if (direct) {
     schedule.classes[load.classCode].grid[direct.day][String(direct.period)] = makeCell(load, direct.day, direct.period);
@@ -1171,6 +1207,7 @@ function tryChainPlaceLoad(schedule: Schedule, records: NormalizedRecords, optio
     .slice(0, options.searchStrength === "strong" ? 12 : 10);
 
   for (const target of teacherConflictTargets) {
+    if (budget.nodes > budget.maxNodes || Date.now() > budget.deadline) return false;
     const key = `${load.id}->teacher:${target.cell.classCode}:${target.cell.day}:${target.cell.period}`;
     if (visited.has(key)) continue;
     const displaced = cellToLoad(target.cell);
@@ -1184,7 +1221,7 @@ function tryChainPlaceLoad(schedule: Schedule, records: NormalizedRecords, optio
     invalidateScheduleCache(branch);
     const nextVisited = new Set(visited);
     nextVisited.add(key);
-    if (tryChainPlaceLoad(branch, records, options, displaced, random, depth - 1, nextVisited)) {
+    if (tryChainPlaceLoad(branch, records, options, displaced, random, depth - 1, nextVisited, budget)) {
       schedule.classes = branch.classes;
       invalidateScheduleCache(schedule);
       return true;
@@ -1209,6 +1246,7 @@ function tryChainPlaceLoad(schedule: Schedule, records: NormalizedRecords, optio
     .slice(0, options.searchStrength === "strong" ? 8 : 4);
 
   for (const target of groupedTeacherConflictTargets) {
+    if (budget.nodes > budget.maxNodes || Date.now() > budget.deadline) return false;
     const group = blockCells(schedule, target.cell);
     if (!group.length || group.length > 16 || group.some((cell) => cell.fixed)) continue;
     const key = `${load.id}->teacher-group:${group.map((cell) => `${cell.classCode}:${cell.day}:${cell.period}`).join("|")}`;
@@ -1221,6 +1259,40 @@ function tryChainPlaceLoad(schedule: Schedule, records: NormalizedRecords, optio
     for (const cell of branchGroup) clearCell(branch, cell);
     if (!canPlaceSingleWithOptions(branch, records, options, load, target.target.day, target.target.period)) continue;
     branch.classes[load.classCode].grid[target.target.day][String(target.target.period)] = makeCell(load, target.target.day, target.target.period);
+    invalidateScheduleCache(branch);
+    const nextVisited = new Set(visited);
+    nextVisited.add(key);
+    if (tryRelocateCellGroup(branch, records, options, branchGroup, random)) {
+      schedule.classes = branch.classes;
+      invalidateScheduleCache(schedule);
+      return true;
+    }
+  }
+
+  const groupedClassTargets = records.config.days
+    .flatMap((day) => Object.values(classGrid[day] || {}).filter(Boolean) as ScheduleCell[])
+    .filter((cell) => !cell.fixed && Boolean(cell.syncOccurrenceId || (cell.blockId && (cell.blockSize || 1) > 1)))
+    .map((cell) => ({
+      cell,
+      score: slotScore(schedule, records, options, [load], cell.day, cell.period, random),
+    }))
+    .sort((a, b) => a.score - b.score)
+    .slice(0, options.searchStrength === "strong" ? 8 : 4);
+
+  for (const target of groupedClassTargets) {
+    if (budget.nodes > budget.maxNodes || Date.now() > budget.deadline) return false;
+    const group = blockCells(schedule, target.cell);
+    if (!group.length || group.length > 16 || group.some((cell) => cell.fixed)) continue;
+    const key = `${load.id}->class-group:${group.map((cell) => `${cell.classCode}:${cell.day}:${cell.period}`).join("|")}`;
+    if (visited.has(key)) continue;
+    const branch = cloneSchedule(schedule);
+    const branchGroup = group
+      .map((cell) => branch.classes[cell.classCode]?.grid[cell.day]?.[String(cell.period)] || null)
+      .filter((cell): cell is ScheduleCell => Boolean(cell));
+    if (branchGroup.length !== group.length) continue;
+    for (const cell of branchGroup) clearCell(branch, cell);
+    if (!canPlaceSingleWithOptions(branch, records, options, load, target.cell.day, target.cell.period)) continue;
+    branch.classes[load.classCode].grid[target.cell.day][String(target.cell.period)] = makeCell(load, target.cell.day, target.cell.period);
     invalidateScheduleCache(branch);
     const nextVisited = new Set(visited);
     nextVisited.add(key);
@@ -1248,6 +1320,7 @@ function tryChainPlaceLoad(schedule: Schedule, records: NormalizedRecords, optio
     .map((item) => item.cell);
 
   for (const target of occupied) {
+    if (budget.nodes > budget.maxNodes || Date.now() > budget.deadline) return false;
     const key = `${load.id}->${target.classCode}:${target.day}:${target.period}`;
     if (visited.has(key)) continue;
     const displaced = cellToLoad(target);
@@ -1261,7 +1334,7 @@ function tryChainPlaceLoad(schedule: Schedule, records: NormalizedRecords, optio
     invalidateScheduleCache(branch);
     const nextVisited = new Set(visited);
     nextVisited.add(key);
-    if (tryChainPlaceLoad(branch, records, options, displaced, random, depth - 1, nextVisited)) {
+    if (tryChainPlaceLoad(branch, records, options, displaced, random, depth - 1, nextVisited, budget)) {
       schedule.classes = branch.classes;
       invalidateScheduleCache(schedule);
       return true;
@@ -1337,13 +1410,33 @@ function placeSyncCohort(initialSchedule: Schedule, records: NormalizedRecords, 
   for (const unit of ordered) domains.set(unit.id, availableSlots(initialSchedule, records, options, unit.loads, random).slice(0, slotLimit));
 
   const teacherPeriods = new Map<string, Map<DayKey, Set<number>>>();
+  const subjectDayUsage = new Map<string, Map<string, number>>();
+  const addSubjectUsage = (key: string, token: string) => {
+    const tokens = subjectDayUsage.get(key) || new Map<string, number>();
+    tokens.set(token, (tokens.get(token) || 0) + 1);
+    subjectDayUsage.set(key, tokens);
+  };
+  const removeSubjectUsage = (key: string, token: string) => {
+    const tokens = subjectDayUsage.get(key);
+    if (!tokens) return;
+    const next = (tokens.get(token) || 0) - 1;
+    if (next > 0) tokens.set(token, next);
+    else tokens.delete(token);
+    if (!tokens.size) subjectDayUsage.delete(key);
+  };
+  const usageToken = (item: Pick<LoadUnit, "id" | "blockId"> | Pick<ScheduleCell, "id" | "blockId">) => item.blockId ? `block:${item.blockId}` : `item:${item.id}`;
   for (const cell of allCells(initialSchedule)) {
-    if (!cell.teacherCode || cell.fixed) continue;
-    const byDay = teacherPeriods.get(cell.teacherCode) || new Map<DayKey, Set<number>>();
-    const periods = byDay.get(cell.day) || new Set<number>();
-    periods.add(cell.period);
-    byDay.set(cell.day, periods);
-    teacherPeriods.set(cell.teacherCode, byDay);
+    if (cell.teacherCode && !cell.fixed) {
+      const byDay = teacherPeriods.get(cell.teacherCode) || new Map<DayKey, Set<number>>();
+      const periods = byDay.get(cell.day) || new Set<number>();
+      periods.add(cell.period);
+      byDay.set(cell.day, periods);
+      teacherPeriods.set(cell.teacherCode, byDay);
+    }
+    if (cell.subjectCode) {
+      const load = { classCode: cell.classCode, subjectCode: cell.subjectCode, syncGroup: cell.syncGroup };
+      for (const key of subjectDayUsageKeys(records, options, load, cell.day)) addSubjectUsage(key, usageToken(cell));
+    }
   }
 
   const usedSlots = new Set<string>();
@@ -1356,6 +1449,7 @@ function placeSyncCohort(initialSchedule: Schedule, records: NormalizedRecords, 
 
   const slotAllowed = (unit: WorkUnit, slot: Slot) => {
     if (usedSlots.has(syncSlotKey(slot))) return false;
+    const pendingSubjectUsage = new Map<string, string>();
     for (const load of unit.loads) {
       const byDay = teacherPeriods.get(load.teacherCode);
       const periods = [...(byDay?.get(slot.day) || new Set<number>())];
@@ -1364,24 +1458,34 @@ function placeSyncCohort(initialSchedule: Schedule, records: NormalizedRecords, 
       if (options.consecutiveStrictMode === "three-plus" && run >= Math.max(3, options.consecutiveWarnThreshold || 3)) return false;
       if (options.consecutiveStrictMode === "over-max" && run > options.maxConsecutive) return false;
       if (options.lunchProtectionLevel === "hard" && hasLunchBoundaryIssue(records, projected)) return false;
+      const token = usageToken(load);
+      for (const key of subjectDayUsageKeys(records, options, load, slot.day)) {
+        const existing = subjectDayUsage.get(key);
+        if (existing?.size && !(load.blockId && existing.size === 1 && existing.has(token))) return false;
+        const pendingToken = pendingSubjectUsage.get(key);
+        if (pendingToken && pendingToken !== token) return false;
+        pendingSubjectUsage.set(key, token);
+      }
     }
     return true;
   };
 
-  const applyTeacherPeriods = (unit: WorkUnit, slot: Slot) => {
+  const applyUsage = (unit: WorkUnit, slot: Slot) => {
     for (const load of unit.loads) {
       const byDay = teacherPeriods.get(load.teacherCode) || new Map<DayKey, Set<number>>();
       const periods = byDay.get(slot.day) || new Set<number>();
       periods.add(slot.period);
       byDay.set(slot.day, periods);
       teacherPeriods.set(load.teacherCode, byDay);
+      for (const key of subjectDayUsageKeys(records, options, load, slot.day)) addSubjectUsage(key, usageToken(load));
     }
   };
 
-  const removeTeacherPeriods = (unit: WorkUnit, slot: Slot) => {
+  const removeUsage = (unit: WorkUnit, slot: Slot) => {
     for (const load of unit.loads) {
       const periods = teacherPeriods.get(load.teacherCode)?.get(slot.day);
       periods?.delete(slot.period);
+      for (const key of subjectDayUsageKeys(records, options, load, slot.day)) removeSubjectUsage(key, usageToken(load));
     }
   };
 
@@ -1409,9 +1513,9 @@ function placeSyncCohort(initialSchedule: Schedule, records: NormalizedRecords, 
       if (nodes > nodeLimit || Date.now() - startedAt > timeLimitMs) break;
       usedSlots.add(syncSlotKey(slot));
       assigned.set(chosen.unit.id, slot);
-      applyTeacherPeriods(chosen.unit, slot);
+      applyUsage(chosen.unit, slot);
       dfs(rest, score + (slot.score || 0));
-      removeTeacherPeriods(chosen.unit, slot);
+      removeUsage(chosen.unit, slot);
       assigned.delete(chosen.unit.id);
       usedSlots.delete(syncSlotKey(slot));
     }
@@ -1464,7 +1568,7 @@ function availableSlotCountFast(schedule: Schedule, records: NormalizedRecords, 
       if (options.teacherDayMaxStrict && wouldExceedTeacherDayMax(schedule, options, loads, day)) continue;
       if (wouldCreateHardConsecutive(records, schedule, options, loads, day, period)) continue;
       if (wouldCreateHardLunch(records, schedule, options, loads, day, period)) continue;
-      if (options.sameSubjectSameDay && wouldCreateSimilarSubjectSameDay(records, schedule, loads, day)) continue;
+      if (wouldCreateForbiddenSubjectSameDay(records, schedule, loads, day, options)) continue;
       count += 1;
       if (count >= limit) return count;
     }
@@ -1557,6 +1661,10 @@ function tryRepairSyncUnit(schedule: Schedule, records: NormalizedRecords, optio
     const next = cloneSchedule(schedule);
     for (const group of blockerGroups) for (const cell of group) clearCell(next, cell);
     if (!canPlaceSync(next, records, unit.loads, slot.day, slot.period)) continue;
+    if (wouldCreateForbiddenSubjectSameDay(records, next, unit.loads, slot.day, options)) continue;
+    if (options.teacherDayMaxStrict && wouldExceedTeacherDayMax(next, options, unit.loads, slot.day)) continue;
+    if (wouldCreateHardConsecutive(records, next, options, unit.loads, slot.day, slot.period)) continue;
+    if (wouldCreateHardLunch(records, next, options, unit.loads, slot.day, slot.period)) continue;
     placeAt(next, unit, slot);
     let relocated = true;
     for (const group of blockerGroups.sort((a, b) => b.length - a.length)) {
@@ -1568,6 +1676,220 @@ function tryRepairSyncUnit(schedule: Schedule, records: NormalizedRecords, optio
     if (relocated) return next;
   }
   return null;
+}
+
+function tryRepairSingleUnitByEjection(schedule: Schedule, records: NormalizedRecords, options: Required<SolveOptions>, unit: WorkUnit, random: () => number, maxMs = 180) {
+  if (unit.loads.length !== 1) return false;
+  const load = unit.loads[0];
+  const startedAt = Date.now();
+  const slots = records.config.days
+    .flatMap((day) => schedule.periods.map((period) => ({ day, period, score: slotScore(schedule, records, options, [load], day, period, random) })))
+    .filter((slot) => !isBeyondClassDayLimit(records, load.classCode, slot.day, slot.period) && !violatesHardConstraint(records, load, slot.day, slot.period))
+    .sort((a, b) => (a.score || 0) - (b.score || 0))
+    .slice(0, options.searchStrength === "strong" ? 24 : 14);
+
+  for (const slot of slots) {
+    if (Date.now() - startedAt > maxMs) break;
+    const blockers = syncBlockingCells(schedule, unit, slot.day, slot.period);
+    if (!blockers.length) continue;
+    const blockerGroups: ScheduleCell[][] = [];
+    const seen = new Set<string>();
+    let blocked = false;
+    for (const blocker of blockers) {
+      const group = blockCells(schedule, blocker);
+      if (!group.length || group.some((cell) => cell.fixed)) {
+        blocked = true;
+        break;
+      }
+      const key = group.map((cell) => `${cell.classCode}:${cell.day}:${cell.period}`).sort().join("|");
+      if (seen.has(key)) continue;
+      seen.add(key);
+      blockerGroups.push(group);
+    }
+    if (blocked || blockerGroups.length > 3 || blockerGroups.reduce((sum, group) => sum + group.length, 0) > 20) continue;
+
+    const next = cloneSchedule(schedule);
+    const nextGroups = blockerGroups.map((group) => group
+      .map((cell) => next.classes[cell.classCode]?.grid[cell.day]?.[String(cell.period)] || null)
+      .filter((cell): cell is ScheduleCell => Boolean(cell)));
+    if (nextGroups.some((group, index) => group.length !== blockerGroups[index].length)) continue;
+    for (const group of nextGroups) for (const cell of group) clearCell(next, cell);
+    if (!canPlaceSingleWithOptions(next, records, options, load, slot.day, slot.period)) continue;
+    next.classes[load.classCode].grid[slot.day][String(slot.period)] = makeCell(load, slot.day, slot.period);
+    invalidateScheduleCache(next);
+
+    let relocated = true;
+    for (const group of [...nextGroups].sort((a, b) => b.length - a.length)) {
+      if (Date.now() - startedAt > maxMs) {
+        relocated = false;
+        break;
+      }
+      if (group.length === 1 && !isAtomicCell(group[0])) {
+        const displaced = cellToLoad(group[0]);
+        const budget: ChainSearchBudget = {
+          deadline: startedAt + maxMs,
+          nodes: 0,
+          maxNodes: options.searchStrength === "strong" ? 9000 : 3500,
+        };
+        if (!displaced || !tryChainPlaceLoad(next, records, options, displaced, random, 5, new Set(), budget)) {
+          relocated = false;
+          break;
+        }
+      } else if (!tryRelocateCellGroup(next, records, options, group, random)) {
+        relocated = false;
+        break;
+      }
+    }
+    if (!relocated) continue;
+    const validation = validateSchedule(records, next, options);
+    if (validation.hardErrors) continue;
+    schedule.classes = next.classes;
+    invalidateScheduleCache(schedule);
+    return true;
+  }
+  return false;
+}
+
+function tryRepairContinuousUnitByEjection(schedule: Schedule, records: NormalizedRecords, options: Required<SolveOptions>, unit: WorkUnit, random: () => number, maxMs = 260) {
+  if (!isContinuousLoads(unit.loads)) return false;
+  const startedAt = Date.now();
+  const orderedLoads = [...unit.loads].sort((a, b) => (a.blockPart || 0) - (b.blockPart || 0));
+  const slots = records.config.days
+    .flatMap((day) => schedule.periods.map((period) => ({ day, period, score: continuousSlotScore(schedule, records, options, orderedLoads, day, period, random) })))
+    .filter((slot) => orderedLoads.every((load, index) => !isBeyondClassDayLimit(records, load.classCode, slot.day, slot.period + index) && !violatesHardConstraint(records, load, slot.day, slot.period + index)))
+    .sort((a, b) => (a.score || 0) - (b.score || 0))
+    .slice(0, options.searchStrength === "strong" ? 20 : 12);
+
+  for (const slot of slots) {
+    if (Date.now() - startedAt > maxMs) break;
+    const blockers = uniqueCells(orderedLoads.flatMap((load, index) => syncBlockingCells(schedule, { ...unit, loads: [load] }, slot.day, slot.period + index)));
+    if (!blockers.length) continue;
+    const blockerGroups: ScheduleCell[][] = [];
+    const seen = new Set<string>();
+    let blocked = false;
+    for (const blocker of blockers) {
+      const group = blockCells(schedule, blocker);
+      if (!group.length || group.some((cell) => cell.fixed)) {
+        blocked = true;
+        break;
+      }
+      const key = group.map((cell) => `${cell.classCode}:${cell.day}:${cell.period}`).sort().join("|");
+      if (seen.has(key)) continue;
+      seen.add(key);
+      blockerGroups.push(group);
+    }
+    if (blocked || blockerGroups.length > 4 || blockerGroups.reduce((sum, group) => sum + group.length, 0) > 24) continue;
+    const next = cloneSchedule(schedule);
+    const nextGroups = blockerGroups.map((group) => group
+      .map((cell) => next.classes[cell.classCode]?.grid[cell.day]?.[String(cell.period)] || null)
+      .filter((cell): cell is ScheduleCell => Boolean(cell)));
+    if (nextGroups.some((group, index) => group.length !== blockerGroups[index].length)) continue;
+    for (const group of nextGroups) for (const cell of group) clearCell(next, cell);
+    const targetAvailable = availableSlots(next, records, options, orderedLoads, random)
+      .some((candidateSlot) => candidateSlot.day === slot.day && candidateSlot.period === slot.period);
+    if (!targetAvailable) continue;
+    placeAt(next, unit, slot);
+    let relocated = true;
+    for (const group of [...nextGroups].sort((a, b) => b.length - a.length)) {
+      if (Date.now() - startedAt > maxMs) {
+        relocated = false;
+        break;
+      }
+      if (group.length === 1 && !isAtomicCell(group[0])) {
+        const displaced = cellToLoad(group[0]);
+        const budget: ChainSearchBudget = {
+          deadline: startedAt + maxMs,
+          nodes: 0,
+          maxNodes: options.searchStrength === "strong" ? 10000 : 4000,
+        };
+        if (!displaced || !tryChainPlaceLoad(next, records, options, displaced, random, 5, new Set(), budget)) {
+          relocated = false;
+          break;
+        }
+      } else if (!tryRelocateCellGroup(next, records, options, group, random)) {
+        relocated = false;
+        break;
+      }
+    }
+    if (!relocated) continue;
+    const validation = validateSchedule(records, next, options);
+    if (validation.hardErrors) continue;
+    schedule.classes = next.classes;
+    invalidateScheduleCache(schedule);
+    return true;
+  }
+  return false;
+}
+
+function tryRebuildTeacherForUnits(schedule: Schedule, records: NormalizedRecords, options: Required<SolveOptions>, units: WorkUnit[], random: () => number, maxMs = 500) {
+  if (!units.length || units.some((unit) => unit.loads.some((load) => load.syncGroup))) return false;
+  const teacherCode = units[0].loads[0]?.teacherCode;
+  if (!teacherCode || units.some((unit) => unit.loads.some((load) => load.teacherCode !== teacherCode))) return false;
+  const teacherCells = cellsByTeacher(schedule, teacherCode)
+    .filter((cell) => !cell.fixed && !cell.syncOccurrenceId);
+  if (!teacherCells.length) return false;
+  const groupedCells = new Map<string, ScheduleCell[]>();
+  for (const cell of teacherCells) {
+    const key = cell.blockId && (cell.blockSize || 1) > 1 ? `block:${cell.blockId}` : `cell:${cell.id}:${cell.classCode}:${cell.day}:${cell.period}`;
+    const list = groupedCells.get(key) || [];
+    list.push(cell);
+    groupedCells.set(key, list);
+  }
+  const scheduledUnits = [...groupedCells.values()].map((cells) => {
+    const loads = cells
+      .sort((a, b) => (a.blockPart || 1) - (b.blockPart || 1))
+      .map((cell) => cellToLoad(cell))
+      .filter((load): load is LoadUnit => Boolean(load));
+    if (loads.length !== cells.length) return null;
+    return makeWorkUnit(schedule, records, options, loads, random, isContinuousLoads(loads) ? "continuous" : "normal");
+  }).filter((unit): unit is WorkUnit => Boolean(unit));
+  if (scheduledUnits.length !== groupedCells.size) return false;
+  const pendingUnits = [...scheduledUnits, ...units];
+  const pendingLoadIds = pendingUnits.flatMap((unit) => unit.loads.map((load) => load.id));
+  if (new Set(pendingLoadIds).size !== pendingLoadIds.length) return false;
+  const base = cloneSchedule(schedule);
+  for (const cell of teacherCells) {
+    const baseCell = base.classes[cell.classCode]?.grid[cell.day]?.[String(cell.period)] || null;
+    if (baseCell) clearCell(base, baseCell);
+  }
+  const startedAt = Date.now();
+  let trial = 0;
+  const trialLimit = options.searchStrength === "strong" ? 20 : 10;
+  while (Date.now() - startedAt < maxMs && trial < trialLimit) {
+    trial += 1;
+    const branch = cloneSchedule(base);
+    const remaining = [...pendingUnits];
+    let failed = false;
+    while (remaining.length) {
+      if (Date.now() - startedAt >= maxMs) {
+        failed = true;
+        break;
+      }
+      const ranked = remaining
+        .map((unit) => ({ unit, slots: availableSlots(branch, records, options, unit.loads, random) }))
+        .sort((a, b) => a.slots.length - b.slots.length || b.unit.pressure - a.unit.pressure);
+      const chosen = ranked[0];
+      if (!chosen.slots.length) {
+        failed = true;
+        break;
+      }
+      const choiceWidth = Math.min(chosen.slots.length, trial <= 2 ? 1 : trial <= 5 ? 2 : 3);
+      const slot = chosen.slots[Math.floor(random() * choiceWidth)];
+      placeAt(branch, chosen.unit, slot);
+      remaining.splice(remaining.indexOf(chosen.unit), 1);
+    }
+    if (failed) continue;
+    const validation = validateSchedule(records, branch, options);
+    if (validation.hardErrors) continue;
+    schedule.classes = branch.classes;
+    invalidateScheduleCache(schedule);
+    return true;
+  }
+  return false;
+}
+
+function tryRebuildTeacherForUnit(schedule: Schedule, records: NormalizedRecords, options: Required<SolveOptions>, unit: WorkUnit, random: () => number, maxMs = 500) {
+  return tryRebuildTeacherForUnits(schedule, records, options, [unit], random, maxMs);
 }
 
 function placeSyncUnitsWithBeam(initialSchedule: Schedule, records: NormalizedRecords, options: Required<SolveOptions>, syncUnits: WorkUnit[], random: () => number, profile: string) {
@@ -1667,7 +1989,7 @@ function softIssuePenalty(summary: SolveSummary, options: Required<SolveOptions>
 
 const SOFT_ISSUE_TEACHER_TARGET = 10;
 const SOFT_ISSUE_COUNT_TARGET = 20;
-const POST_OPTIMIZE_CHUNK_MS = 140;
+const POST_OPTIMIZE_CHUNK_MS = 900;
 
 function teacherIssueTypeCount(candidate: Candidate, issue: "3연강" | "식사" | "안배") {
   return candidate.teacherIssues.filter((item) => item.issues.includes(issue)).length;
@@ -1949,6 +2271,18 @@ function postOptimizationTargetSlots(records: NormalizedRecords, options: Requir
     .sort((a, b) => a.score - b.score);
 }
 
+function diversePostOptimizationSlots(slots: Array<{ day: DayKey; period: number; score: number }>, random: () => number, limit: number) {
+  if (slots.length <= limit) return slots;
+  const topCount = Math.max(4, Math.ceil(limit * 0.65));
+  const selected = slots.slice(0, topCount);
+  const tail = slots.slice(topCount);
+  while (selected.length < limit && tail.length) {
+    const index = Math.floor(random() * tail.length);
+    selected.push(tail.splice(index, 1)[0]);
+  }
+  return selected;
+}
+
 function postOptimizationGoalScore(records: NormalizedRecords, options: Required<SolveOptions>, candidate: Candidate) {
   const remaining = targetRemaining(candidate.summary);
   const stats = postOptimizationStats(records, options, candidate);
@@ -2035,6 +2369,64 @@ function goalVectorBetter(a: Candidate, b: Candidate) {
   return false;
 }
 
+function postOptimizationTeacherRebuildPass(records: NormalizedRecords, options: Required<SolveOptions>, candidate: Candidate, random: () => number, startedAt: number, maxMs: number) {
+  let current = candidate;
+  let improvements = 0;
+  const teacherCodes = Object.keys(records.teachers)
+    .map((teacherCode) => ({ teacherCode, score: teacherPostIssueScore(records, options, current, teacherCode) }))
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 14)
+    .map((item) => item.teacherCode);
+
+  for (const teacherCode of teacherCodes) {
+    if (Date.now() - startedAt >= maxMs || targetReached(current.summary)) break;
+    const movable = cellsByTeacher(current.schedule, teacherCode).filter((cell) => !cell.fixed && !isAtomicCell(cell));
+    if (movable.length < 2) continue;
+    const loads = movable.map((cell) => cellToLoad(cell)).filter((load): load is LoadUnit => Boolean(load));
+    if (loads.length !== movable.length || new Set(loads.map((load) => load.id)).size !== loads.length) continue;
+    const base = cloneSchedule(current.schedule);
+    for (const cell of movable) {
+      const baseCell = base.classes[cell.classCode]?.grid[cell.day]?.[String(cell.period)] || null;
+      if (baseCell) clearCell(base, baseCell);
+    }
+    let bestForTeacher = current;
+    for (let trial = 0; trial < 10 && Date.now() - startedAt < maxMs; trial += 1) {
+      const branch = cloneSchedule(base);
+      const remaining = [...loads];
+      let failed = false;
+      while (remaining.length) {
+        if (Date.now() - startedAt >= maxMs) {
+          failed = true;
+          break;
+        }
+        const ranked = remaining
+          .map((load) => ({ load, slots: availableSlots(branch, records, options, [load], random) }))
+          .sort((a, b) => a.slots.length - b.slots.length || b.load.pressure - a.load.pressure);
+        const chosen = ranked[0];
+        if (!chosen.slots.length) {
+          failed = true;
+          break;
+        }
+        const width = Math.min(chosen.slots.length, trial < 2 ? 1 : trial < 6 ? 3 : 5);
+        const slot = chosen.slots[Math.floor(random() * width)];
+        branch.classes[chosen.load.classCode].grid[slot.day][String(slot.period)] = makeCell(chosen.load, slot.day, slot.period);
+        invalidateScheduleCache(branch);
+        remaining.splice(remaining.indexOf(chosen.load), 1);
+      }
+      if (failed) continue;
+      const next = makeCandidate(records, options, branch, current.unassigned, Date.now() + trial);
+      if (next.summary.unassigned || next.summary.hardErrors) continue;
+      if (goalVectorBetter(next, bestForTeacher)) bestForTeacher = next;
+    }
+    if (bestForTeacher.signature !== current.signature && goalVectorBetter(bestForTeacher, current)) {
+      current = bestForTeacher;
+      improvements += 1;
+    }
+  }
+  return { candidate: current, improvements };
+}
+
 function postOptimizationTargetedPass(records: NormalizedRecords, options: Required<SolveOptions>, candidate: Candidate, random: () => number, startedAt: number, maxMs: number) {
   let current = candidate;
   let improvements = 0;
@@ -2053,7 +2445,7 @@ function postOptimizationTargetedPass(records: NormalizedRecords, options: Requi
       for (const cell of cells) {
         if (Date.now() - startedAt > maxMs) break;
         const from = { classCode: cell.classCode, day: cell.day, period: cell.period };
-        for (const slot of postOptimizationTargetSlots(records, options, current, cell, random).slice(0, focusKind ? 14 : 20)) {
+        for (const slot of diversePostOptimizationSlots(postOptimizationTargetSlots(records, options, current, cell, random), random, focusKind ? 16 : 22)) {
           if (Date.now() - startedAt > maxMs) break;
           const next = applyMove(records, current, { from, to: { classCode: cell.classCode, day: slot.day, period: slot.period } }, options);
           if (next.signature === current.signature) continue;
@@ -2179,6 +2571,14 @@ function postOptimizeCandidate(records: NormalizedRecords, options: Required<Sol
     ? (options.searchStrength === "strong" ? 18 : 10)
     : (options.searchStrength === "strong" ? (initialOverTarget ? 90 : 60) : (initialOverTarget ? 50 : 35));
   if (initialOverTarget) {
+    const rebuilt = postOptimizationTeacherRebuildPass(records, options, current, random, startedAt, POST_OPTIMIZE_CHUNK_MS * 2);
+    if (rebuilt.candidate.signature !== current.signature) {
+      current = rebuilt.candidate;
+      best = rebuilt.candidate;
+      currentCost = postOptimizationStats(records, options, current).cost;
+      bestCost = currentCost;
+      improvements += rebuilt.improvements;
+    }
     const targeted = postOptimizationTargetedPass(records, options, current, random, startedAt, POST_OPTIMIZE_CHUNK_MS * 3);
     if (targeted.candidate.signature !== current.signature) {
       current = targeted.candidate;
@@ -2187,12 +2587,14 @@ function postOptimizeCandidate(records: NormalizedRecords, options: Required<Sol
       bestCost = currentCost;
       improvements += targeted.improvements;
       const stats = postOptimizationStats(records, options, best);
-      return {
-        candidate: { ...best, id: `${best.id}_tabu_${seed}`, name: "브라우저 CSP + 타부 후처리 후보" },
-        improvements,
-        beforeCost: beforeStats.cost,
-        afterCost: stats.cost,
-      };
+      if (stats.lunch < SOFT_ISSUE_COUNT_TARGET && stats.consecutive < SOFT_ISSUE_COUNT_TARGET) {
+        return {
+          candidate: { ...best, id: `${best.id}_tabu_${seed}`, name: "브라우저 CSP + 타부 후처리 후보" },
+          improvements,
+          beforeCost: beforeStats.cost,
+          afterCost: stats.cost,
+        };
+      }
     }
     if (Date.now() - startedAt < POST_OPTIMIZE_CHUNK_MS * 6) {
       const movePass = postOptimizationMoveOptionsPass(records, options, current, random, startedAt, POST_OPTIMIZE_CHUNK_MS * 6);
@@ -2228,7 +2630,7 @@ function postOptimizeCandidate(records: NormalizedRecords, options: Required<Sol
     for (const cell of cells) {
       if (Date.now() - startedAt > POST_OPTIMIZE_CHUNK_MS) break;
       const from = { classCode: cell.classCode, day: cell.day, period: cell.period };
-      for (const slot of postOptimizationTargetSlots(records, options, current, cell, random).slice(0, overTarget ? 16 : 12)) {
+      for (const slot of diversePostOptimizationSlots(postOptimizationTargetSlots(records, options, current, cell, random), random, overTarget ? 20 : 14)) {
         if (Date.now() - startedAt > POST_OPTIMIZE_CHUNK_MS) break;
         const move: ManualMove = { from, to: { classCode: cell.classCode, day: slot.day, period: slot.period } };
         const key = tabuKey(move, cell);
@@ -2460,7 +2862,12 @@ function solveAttempt(records: NormalizedRecords, options: Required<SolveOptions
   if (failedUnits.length) {
     const pending: WorkUnit[] = [];
     for (const unit of orderedUnits(failedUnits, random, "repair")) {
-      if (!tryDeepChainPlaceUnit(schedule, records, options, unit, random)) pending.push(unit);
+      if (
+        !tryRepairContinuousUnitByEjection(schedule, records, options, unit, random, 300) &&
+        !tryRebuildTeacherForUnit(schedule, records, options, unit, random, 260) &&
+        !tryRepairSingleUnitByEjection(schedule, records, options, unit, random, 140) &&
+        !tryDeepChainPlaceUnit(schedule, records, options, unit, random)
+      ) pending.push(unit);
     }
     failedUnits = pending;
   }
@@ -2487,13 +2894,62 @@ function solveAttempt(records: NormalizedRecords, options: Required<SolveOptions
   return profile === "quality" || profile === "repair" ? improveQuality(records, options, candidate, random, seed) : candidate;
 }
 
+function repairUnassignedCandidate(records: NormalizedRecords, options: Required<SolveOptions>, candidate: Candidate, random: () => number, seed: number, maxMs: number) {
+  if (!candidate.unassigned.length || candidate.summary.hardErrors) return candidate;
+  const startedAt = Date.now();
+  const schedule = cloneSchedule(candidate.schedule);
+  const units = buildWorkUnits(schedule, records, options, random);
+  const unitByLoadId = new Map<string, WorkUnit>();
+  for (const unit of units) for (const load of unit.loads) unitByLoadId.set(load.id, unit);
+  const targetUnits = [...new Set(candidate.unassigned.map((item) => unitByLoadId.get(item.loadId)).filter((unit): unit is WorkUnit => Boolean(unit)))]
+    .sort((a, b) => b.pressure - a.pressure || a.possibleSlots - b.possibleSlots);
+  const placedLoadIds = new Set<string>();
+
+  const byTeacher = new Map<string, WorkUnit[]>();
+  for (const unit of targetUnits) {
+    if (unit.loads.length !== 1) continue;
+    const list = byTeacher.get(unit.loads[0].teacherCode) || [];
+    list.push(unit);
+    byTeacher.set(unit.loads[0].teacherCode, list);
+  }
+  for (const teacherUnits of [...byTeacher.values()].sort((a, b) => b.length - a.length)) {
+    if (Date.now() - startedAt >= maxMs) break;
+    const remainingMs = Math.max(80, maxMs - (Date.now() - startedAt));
+    if (tryRebuildTeacherForUnits(schedule, records, options, teacherUnits, random, Math.min(700, remainingMs))) {
+      for (const teacherUnit of teacherUnits) for (const load of teacherUnit.loads) placedLoadIds.add(load.id);
+    }
+  }
+
+  for (const unit of targetUnits) {
+    if (unit.loads.every((load) => placedLoadIds.has(load.id))) continue;
+    if (Date.now() - startedAt >= maxMs) break;
+    const remainingMs = Math.max(50, maxMs - (Date.now() - startedAt));
+    const placed = placeWithRepair(schedule, records, options, unit, random, "repair") ||
+      (Date.now() - startedAt < maxMs && tryRepairContinuousUnitByEjection(schedule, records, options, unit, random, Math.min(500, remainingMs))) ||
+      (Date.now() - startedAt < maxMs && tryRebuildTeacherForUnit(schedule, records, options, unit, random, Math.min(500, remainingMs))) ||
+      (Date.now() - startedAt < maxMs && tryRepairSingleUnitByEjection(schedule, records, options, unit, random, Math.min(360, remainingMs))) ||
+      (Date.now() - startedAt < maxMs && tryDeepChainPlaceUnit(schedule, records, options, unit, random, Math.min(300, remainingMs), 14000));
+    if (placed) for (const load of unit.loads) placedLoadIds.add(load.id);
+  }
+  if (!placedLoadIds.size) return candidate;
+  const remaining = candidate.unassigned.filter((item) => !placedLoadIds.has(item.loadId));
+  const next = makeCandidate(records, options, schedule, remaining, seed);
+  if (next.summary.hardErrors || next.summary.unassigned >= candidate.summary.unassigned) return candidate;
+  return next;
+}
+
 function summarize(unassignedItems: UnassignedItem[], validation: ValidationResult): SolveSummary {
+  const affectedTeacherCount = (type: string) => new Set(
+    validation.violations
+      .filter((item) => item.type === type && item.teacherCode)
+      .map((item) => item.teacherCode as string),
+  ).size;
   return {
     unassigned: unassignedItems.reduce((sum, item) => sum + item.hours, 0),
     hardErrors: validation.hardErrors,
-    lunchIssues: validation.lunchIssues,
-    consecutiveIssues: validation.consecutiveIssues,
-    balanceIssues: validation.balanceIssues,
+    lunchIssues: affectedTeacherCount("lunch"),
+    consecutiveIssues: affectedTeacherCount("consecutive"),
+    balanceIssues: affectedTeacherCount("balance"),
   };
 }
 
@@ -2572,6 +3028,19 @@ export function runChunk(runtime: Runtime) {
   if (runtime.stopped) return runtime.best;
   runtime.chunkCount += 1;
   const start = Date.now();
+  let changed = false;
+  if (runtime.best?.summary.unassigned && runtime.best.summary.hardErrors === 0) {
+    const seed = Date.now() + runtime.chunkCount * 15485863;
+    const repairBudget = runtime.best.summary.unassigned <= 4 ? 2200 : 850;
+    const repaired = repairUnassignedCandidate(runtime.records, runtime.options, runtime.best, seededRandom(seed), seed, repairBudget);
+    if (betterThan(repaired, runtime.best, runtime.options)) {
+      runtime.best = repaired;
+      runtime.lastResult = repaired;
+      runtime.bestChangedAt = nowKst();
+      runtime.lastReasons = [...new Set(repaired.unassigned.map((item) => item.reason))].slice(0, 5);
+      changed = true;
+    }
+  }
   const softPolishMode = needsSoftPostOptimization(runtime.best);
   const targetDebt = runtime.best
     ? targetRemaining(runtime.best.summary).lunchIssues + targetRemaining(runtime.best.summary).consecutiveIssues
@@ -2587,12 +3056,13 @@ export function runChunk(runtime: Runtime) {
     runtime.softStagnation = 0;
     runtime.lastTargetDebt = Number.POSITIVE_INFINITY;
   }
-  const exploreFreshCandidate = !softPolishMode || runtime.chunkCount % (targetDebt > 0 ? 3 : 12) === 0 || (targetDebt > 0 && runtime.softStagnation >= 5);
+  const exploreFreshCandidate = !softPolishMode ||
+    (targetDebt > 0 && runtime.softStagnation >= 4 && runtime.chunkCount % 3 === 0) ||
+    (targetDebt <= 0 && runtime.chunkCount % 12 === 0);
   const attempts = exploreFreshCandidate
     ? (softPolishMode ? (runtime.softStagnation >= 8 ? 2 : 1) : Math.max(1, Math.min(8, Math.ceil((runtime.options.minAssignmentIterations || 20) / 20) * (runtime.options.placementLevel || 1))))
     : 0;
   const profile = softPolishMode && runtime.softStagnation >= 5 ? "repair" : profileForChunk(runtime.chunkCount);
-  let changed = false;
   for (let i = 0; i < attempts; i += 1) {
     runtime.attemptCount += 1;
     const seed = Date.now() + runtime.attemptCount * 7919 + Math.floor(Math.random() * 100000);
@@ -2607,6 +3077,10 @@ export function runChunk(runtime: Runtime) {
       primaryMode = "lunch-hard";
     }
     let candidate = solveAttempt(runtime.records, runtime.options, seed, profile, primaryMode);
+    if (candidate.summary.unassigned > 0 && candidate.summary.hardErrors === 0) {
+      const repairBudget = candidate.summary.unassigned <= 4 ? 2200 : 1000;
+      candidate = repairUnassignedCandidate(runtime.records, runtime.options, candidate, seededRandom(seed ^ 0xc2b2ae35), seed ^ 0x27d4eb2f, repairBudget);
+    }
     if (candidate.summary.unassigned === 0 && candidate.summary.hardErrors === 0 && (candidate.summary.lunchIssues || candidate.summary.consecutiveIssues || candidate.summary.balanceIssues)) {
       const optimized = postOptimizeCandidate(runtime.records, runtime.options, candidate, seededRandom(seed ^ 0x9e3779b9), seed);
       candidate = optimized.candidate;
@@ -2861,8 +3335,16 @@ export function validateSchedule(records: NormalizedRecords, schedule: Schedule,
       violations.push({ type: "continuous-block", severity: "hard", message: `${blockId} 연속수업 묶음이 분리되었습니다.` });
     }
   }
+  for (const item of similarSubjectSameDayViolations(records, schedule, false)) {
+    hardErrors += 1;
+    violations.push({
+      type: "same-subject-same-day",
+      severity: "hard",
+      message: `${item.className} ${item.day} 같은 과목 같은 날 중복: ${item.subjectName}`,
+    });
+  }
   if (options.sameSubjectSameDay) {
-    for (const item of similarSubjectSameDayViolations(records, schedule)) {
+    for (const item of similarSubjectSameDayViolations(records, schedule, true).filter((entry) => entry.similar)) {
       hardErrors += 1;
       violations.push({
         type: "similar-subject-same-day",
@@ -3084,6 +3566,7 @@ function hardFailureReason(validation: ValidationResult) {
   if (!hard) return "";
   if (hard.type === "class-day-limit") return "요일별시수 초과";
   if (hard.type === "similar-subject-same-day") return "유사과목 같은 날 중복";
+  if (hard.type === "same-subject-same-day") return "같은 과목 같은 날 중복";
   if (hard.type === "sync") return "동시수업 묶음 분리";
   if (hard.type === "continuous-block") return "연속수업 묶음 분리";
   if (hard.type === "teacher-conflict") return "교사 시간 중복";

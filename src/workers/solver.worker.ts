@@ -33,10 +33,10 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
       const result = runChunk(runtime);
       if (!result || !("candidate" in result) || !result.candidate) return;
       const currentProgress = progress(runtime, result.changed);
-      send({ type: "progress", progress: currentProgress });
       if (result.changed) {
         send({ type: "bestChanged", candidate: result.candidate, progress: currentProgress, diagnostics: diagnostics(runtime.records, result.candidate) });
       }
+      send({ type: "progress", progress: currentProgress });
       return;
     }
     if (message.type === "acceptBest") {

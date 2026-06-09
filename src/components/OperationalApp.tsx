@@ -766,7 +766,7 @@ export default function OperationalApp({ initialSession, authConfigured, initial
       chunkInFlightRef.current = false;
       setProgress(message.progress);
       const current = candidateRef.current;
-      if (softTargetReached(current) || (message.progress.targetReached && current)) {
+      if (softTargetReached(current)) {
         stopSolveLoop();
         clearSolveWatchdog();
         workerRef.current?.terminate();
