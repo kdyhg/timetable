@@ -4,8 +4,8 @@ import unittest
 from collections import defaultdict
 from unittest.mock import patch
 
-import app as app_module
-from app import SPECS_BY_NAME, ai_chat, append_operation_log, create_template_workbook, move_preview, move_schedule, operation_logs_text, parse_days, quick_move_options, routed_request_path, save_moved_schedule_result, solve_schedule, teacher_balance_penalty, teacher_issue_summary, validate_ai_key, validate_schedule, validate_workbook
+from legacy import legacy_app as app_module
+from legacy.legacy_app import SPECS_BY_NAME, ai_chat, append_operation_log, create_template_workbook, move_preview, move_schedule, operation_logs_text, parse_days, quick_move_options, routed_request_path, save_moved_schedule_result, solve_schedule, teacher_balance_penalty, teacher_issue_summary, validate_ai_key, validate_schedule, validate_workbook
 
 
 def append_named_row(workbook, sheet_name, values):
@@ -414,12 +414,12 @@ class TimetableAppTests(unittest.TestCase):
         self.assertIn("동시그룹", json.dumps(validation["issues"], ensure_ascii=False))
         self.assertIn("학급별", json.dumps(validation["issues"], ensure_ascii=False))
 
-    def test_vercel_python_entrypoints_are_declared(self):
-        api_index = (app_module.ROOT / "api" / "index.py").read_text(encoding="utf-8")
+    def test_legacy_python_entrypoint_is_not_exposed_to_vercel(self):
         vercel_config = json.loads((app_module.ROOT / "vercel.json").read_text(encoding="utf-8"))
+        self.assertFalse((app_module.ROOT / "app.py").exists())
+        self.assertTrue((app_module.ROOT / "legacy" / "legacy_app.py").exists())
         self.assertIs(app_module.handler, app_module.AppHandler)
-        self.assertIn("class handler(AppHandler)", api_index)
-        self.assertIn("api/index.py", vercel_config.get("functions", {}))
+        self.assertNotIn("functions", vercel_config)
         self.assertNotIn("rewrites", vercel_config)
         self.assertEqual(routed_request_path("/api?__path=api/health"), "/api/health")
         self.assertEqual(routed_request_path("/api?__path=templates/timetable-input.xlsx"), "/templates/timetable-input.xlsx")
@@ -1486,7 +1486,7 @@ class TimetableAppTests(unittest.TestCase):
     def test_operational_auth_and_internal_legacy_proxy_are_configured(self):
         auth = (app_module.ROOT / "src/lib/auth.ts").read_text(encoding="utf-8")
         proxy = (app_module.ROOT / "src/lib/legacyProxy.ts").read_text(encoding="utf-8")
-        source = (app_module.ROOT / "app.py").read_text(encoding="utf-8")
+        source = (app_module.ROOT / "legacy/legacy_app.py").read_text(encoding="utf-8")
         self.assertIn("ADMIN_EMAIL", auth)
         self.assertIn("ADMIN_PASSWORD_HASH", auth)
         self.assertIn("AUTH_SECRET", auth)
@@ -1678,9 +1678,10 @@ class TimetableAppTests(unittest.TestCase):
         self.assertIn("탐색이 중지되었습니다", ui)
         self.assertIn(".filter-row", styles)
 
-    def test_vercel_config_uses_exact_python_function_without_catch_all_rewrite(self):
+    def test_vercel_config_uses_next_without_python_function_detection(self):
         config = json.loads((app_module.ROOT / "vercel.json").read_text(encoding="utf-8"))
-        self.assertIn("api/index.py", config.get("functions", {}))
+        self.assertNotIn("functions", config)
+        self.assertFalse((app_module.ROOT / "api" / "index.py").exists())
         rewrites = json.dumps(config.get("rewrites", []), ensure_ascii=False)
         self.assertNotIn("/:path*", rewrites)
 

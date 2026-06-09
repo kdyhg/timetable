@@ -36,7 +36,7 @@ except Exception:  # pragma: no cover - exercised when optional dependency is ab
     cp_model = None
 
 
-ROOT = Path(__file__).parent.resolve()
+ROOT = Path(__file__).resolve().parents[1]
 WEB_DIR = ROOT / "web"
 VERCEL_RUNTIME = bool(os.environ.get("VERCEL"))
 RUNTIME_DATA_DIR = os.environ.get("TIMETABLE_DATA_DIR")
